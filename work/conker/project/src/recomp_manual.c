@@ -1,11 +1,12 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-#include <windows.h>
 
 #define RECOMP_GENERATED_CODE
 #include "recomp_types.h"
+#include "conker_host.h"
 
 static void conker_sub_0047C29B(void);
 
@@ -35,6 +36,53 @@ void recomp_icall_fail_log(uint32_t xbox_va)
     }
 }
 
+/* An indirect call whose target is not code (null or wild pointer). Skipped,
+ * but reported at the 1st, 10th, 100th... hit per address so a skip inside a
+ * spin loop reads as the hang it causes. Same as the toolkit template. */
+void recomp_icall_not_code_log(uint32_t va)
+{
+    enum { SLOTS = 16 };
+    static uint32_t seen[SLOTS];
+    static uint64_t hits[SLOTS];
+    static int count;
+    uint64_t n;
+    int i;
+
+    for (i = 0; i < count; i++)
+        if (seen[i] == va)
+            break;
+    if (i == count) {
+        if (count == SLOTS)
+            return;
+        seen[count] = va;
+        hits[count] = 0;
+        count++;
+    }
+    n = ++hits[i];
+    while (n >= 10 && n % 10 == 0)
+        n /= 10;
+    if (n != 1)
+        return;
+    fprintf(stderr, "[CONKER][ICALL] target %08X is not code -- skipped %llu time(s)\n",
+            va, (unsigned long long)hits[i]);
+}
+
+/* The lifter emits RECOMP_UNIMPL(text, va) for instructions it cannot
+ * translate; they stay no-ops. RECOMP_UNIMPL_TRAP=1 aborts at the first. */
+void recomp_unimpl(const char *text, uint32_t va)
+{
+    static int printed;
+    const char *trap = getenv("RECOMP_UNIMPL_TRAP");
+    int stop = trap && *trap && *trap != '0';
+
+    if (printed < 50 || stop) {
+        printed++;
+        fprintf(stderr, "[CONKER][UNIMPL] `%s` at %08X reached (no-op)\n", text, va);
+    }
+    if (stop)
+        abort();
+}
+
 void conker_debug_string(uint32_t xbox_va)
 {
     const char *message = (const char *)((uintptr_t)xbox_va + g_xbox_mem_offset);
@@ -61,15 +109,7 @@ void conker_trace_point(uint32_t xbox_va)
         malloc_calls++;
     if ((xbox_va == 0x004718C5 || xbox_va == 0x00431E6A) &&
         malloc_calls == 50 && !captured_malloc_stack) {
-        void *frames[62];
-        USHORT count;
-        uintptr_t base = (uintptr_t)GetModuleHandleW(NULL);
-        USHORT i;
         captured_malloc_stack = 1;
-        count = CaptureStackBackTrace(0, 62, frames, NULL);
-        fprintf(stderr, "[CONKER][NATIVE_STACK]");
-        for (i = 0; i < count; ++i)
-            fprintf(stderr, " %llX", (unsigned long long)((uintptr_t)frames[i] - base));
-        fprintf(stderr, "\n");
+        conker_host_print_native_stack("[CONKER][NATIVE_STACK]", 62);
     }
 }

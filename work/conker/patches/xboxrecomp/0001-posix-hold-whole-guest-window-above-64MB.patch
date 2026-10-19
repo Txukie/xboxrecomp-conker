@@ -1,0 +1,23 @@
+diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
+index b723a92..4d3223b 100644
+--- a/src/kernel/xbox_memory_layout.c
++++ b/src/kernel/xbox_memory_layout.c
+@@ -2619,8 +2619,16 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
+          * GUEST_VMEM_TOP pushed the contiguous window onto the neighbour
+          * instead. Each fixed window is carved out of the span as it is
+          * mapped, and guest_vmem's range is handed over just before
+-         * guest_vmem_init. Off by default; the stock span is unchanged. */
+-        if (ext_vma_span(g_span_size)) {
++         * guest_vmem_init. Off by default; the stock span is unchanged.
++         *
++         * RAM above 64 MB needs the whole window too, switch or not: at
++         * 128 MB the mirrors reach past GUEST_VMEM_TOP (so ext_vma_span says
++         * 0) while the span stops at XBOX_CONTIG_BASE, which places guest
++         * 0x80000000 exactly at the end of a top-down mapping -- on the next
++         * mapping up (EEXIST). Conker's first MmAllocateContiguousMemory then
++         * faulted at guest 0x80001000. */
++        if (ext_vma_span(g_span_size)
++                || g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS) > XBOX_CONTIG_BASE) {
+             g_span_size = (size_t)1 << 32;
+             g_span_whole_window = 1;
+         }

@@ -1,0 +1,47 @@
+diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
+index 10d00f4..e1f177c 100644
+--- a/src/kernel/kernel_bridge.c
++++ b/src/kernel/kernel_bridge.c
+@@ -1399,14 +1399,25 @@ static void bridge_NtQueryVirtualMemory(void)
+         }
+     }
+ 
++    /* The Xbox kernel answers only for the user range (MM_HIGHEST_USER_ADDRESS
++     * 0x7FFEFFFF) and fails above it, and that failure is what ends a caller's
++     * walk over its address space. Answering "free" up to 0xFFFFFFFF instead
++     * let Conker's walk wrap and run forever (770M queries in 30 s). */
++    if (base_va > 0x7FFEFFFFu) {
++        g_eax = 0xC000000Du;               /* STATUS_INVALID_PARAMETER */
++        return;
++    }
++
+     BRIDGE_MEM32(info_va + 0x00) = page_base;          /* BaseAddress */
+     BRIDGE_MEM32(info_va + 0x04) = page_base;          /* AllocationBase */
+     BRIDGE_MEM32(info_va + 0x08) = 0x04;               /* PAGE_READWRITE */
+     BRIDGE_MEM32(info_va + 0x14) = 0x04;               /* Protect */
+     BRIDGE_MEM32(info_va + 0x18) = 0x20000;            /* MEM_PRIVATE */
+ 
+-    if (page_base >= g_xbox_code_lo && page_base < XBOX_TOTAL_RAM) {
+-        BRIDGE_MEM32(info_va + 0x0C) = XBOX_TOTAL_RAM - page_base; /* RegionSize */
++    /* RAM size as mapped for this run (xbox_SetTotalRam), not the 64 MB
++     * compile-time default. */
++    if (page_base >= g_xbox_code_lo && page_base < (uint32_t)g_xbox_total_ram) {
++        BRIDGE_MEM32(info_va + 0x0C) = (uint32_t)g_xbox_total_ram - page_base; /* RegionSize */
+         BRIDGE_MEM32(info_va + 0x10) = 0x1000;         /* MEM_COMMIT */
+     } else {
+         /* Free to the next boundary, not one page. A caller enumerating free
+@@ -1425,7 +1436,13 @@ static void bridge_NtQueryVirtualMemory(void)
+             if (page_base < g_xbox_code_lo)
+                 end = g_xbox_code_lo;
+             else if (page_base >= GUEST_VMEM_TOP)
+-                end = 0xFFFFFFFFu;
++                end = 0x7FFF0000u;
++            if (end > page_base)
++                region = end - page_base;
++        } else {
++            /* Without the tracker nothing is allocated between RAM and the
++             * top of the user range, so it is one free region. */
++            uint32_t end = page_base < g_xbox_code_lo ? g_xbox_code_lo : 0x7FFF0000u;
+             if (end > page_base)
+                 region = end - page_base;
+         }

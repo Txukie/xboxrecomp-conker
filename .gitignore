@@ -40,6 +40,14 @@ work/conker/saves/
 work/conker/*.log
 xbox_kernel.log
 
-# Local game locations and optical-disc material
+# Local game locations and optical-disc material: the disc image dropped in
+# the repo root and everything extracted from it (work/conker/game_files).
+/Conker*.iso
 work/conker/game_files/
 *.xgd
+
+# xboxrecomp pipeline output written into this project
+work/conker/pipeline/
+
+# Python virtualenv for the xboxrecomp tools
+work/conker/.venv/
