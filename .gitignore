@@ -24,8 +24,9 @@ game_files/
 Thumbs.db
 .DS_Store
 
-# Build
+# Build (any CMake build directory: build/, build-release/, ...)
 build/
+build-*/
 bin/
 *.obj
 *.exe

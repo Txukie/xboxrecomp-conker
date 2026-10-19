@@ -83,6 +83,37 @@ void recomp_unimpl(const char *text, uint32_t va)
         abort();
 }
 
+/* ── D3D8LTCG GPU progress ────────────────────────────────────────────────
+ *
+ * sub_0053C190 is D3D_BlockOnTime(fence, flags): it returns once the GPU
+ * semaphore (*[device+0x30]) has passed `fence`, kicking off the pushbuffer
+ * first when the fence is the newest one (device+0x2C), and otherwise spins
+ * on the semaphore at 0x0053C2C0. The pushbuffer executor writes semaphore
+ * releases (method 0x1D70) only where the title registers, so without this
+ * the spin never ends -- it hung right after D3D's first flip.
+ *
+ * An entry hook (the recompiler calls it at the top of the generated body,
+ * from every caller) so the original wait, kickoff and make-space logic all
+ * stay generated and simply see real progress. Re-checked on every call:
+ * D3D rewrites device+0x30 when the device is reset. */
+#include "nv2a_backend.h"
+
+#define CONKER_D3D_DEVICE_PTR 0x005499E8u   /* D3D's g_pDevice */
+
+void sub_0053C190_enter(void)
+{
+    static uint32_t s_semaphore;
+    const uint32_t device = MEM32(CONKER_D3D_DEVICE_PTR);
+    const uint32_t semaphore = device ? MEM32(device + 0x30) : 0;
+
+    if (semaphore && semaphore != s_semaphore) {
+        s_semaphore = semaphore;
+        nv2a_pb_set_semaphore_target(semaphore);
+        fprintf(stderr, "[CONKER][D3D] GPU semaphore at 0x%08X (device 0x%08X)\n",
+                semaphore, device);
+    }
+}
+
 void conker_debug_string(uint32_t xbox_va)
 {
     const char *message = (const char *)((uintptr_t)xbox_va + g_xbox_mem_offset);

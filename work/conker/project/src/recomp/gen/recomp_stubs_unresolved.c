@@ -213,7 +213,7 @@ loc_0045E100: ;
     _fb = (uint32_t)(0x10) & 0xFFFFFFFFu; _fbs = (int32_t)(int32_t)(_fb); /* sub source, before the write */
     ecx = ecx - 0x10;
     _fa = (uint32_t)(ecx) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* sub result */
-    if (CMP_L((uint32_t)_fa + (uint32_t)_fb, (uint32_t)_fb)) { g_seh_ebp = ebp; sub_0045E0F0(); return; } /* jl: less (signed <) */
+    if (CMP_L((uint32_t)((uint32_t)_fa + (uint32_t)_fb), (uint32_t)_fb)) { g_seh_ebp = ebp; sub_0045E0F0(); return; } /* jl: less (signed <) */
 
 loc_0045E108: ;
     MMX_STORE(eax, mm0); /* movntq */
@@ -244,7 +244,7 @@ loc_0045E126: ;
     _fb = (uint32_t)(0x20) & 0xFFFFFFFFu; _fbs = (int32_t)(int32_t)(_fb); /* sub source, before the write */
     ecx = ecx - 0x20;
     _fa = (uint32_t)(ecx) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* sub result */
-    if (CMP_L((uint32_t)_fa + (uint32_t)_fb, (uint32_t)_fb)) goto loc_0045E118; /* jl: less (signed <) */
+    if (CMP_L((uint32_t)((uint32_t)_fa + (uint32_t)_fb), (uint32_t)_fb)) goto loc_0045E118; /* jl: less (signed <) */
 
 loc_0045E12D: ;
     MMX_STORE(eax, mm0); /* movntq */
@@ -260,7 +260,7 @@ loc_0045E13E: ;
     ecx = ecx - 4;
     _fa = (uint32_t)(ecx) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* sub result */
     mm1 = mm0; /* movq */
-    if (CMP_L((uint32_t)_fa + (uint32_t)_fb, (uint32_t)_fb)) goto loc_0045E179; /* jl: less (signed <) */
+    if (CMP_L((uint32_t)((uint32_t)_fa + (uint32_t)_fb), (uint32_t)_fb)) goto loc_0045E179; /* jl: less (signed <) */
 
 loc_0045E148: ;
     MEM32(eax) = mm0.ud[0]; /* movd */
@@ -324,7 +324,7 @@ loc_0045E1B7: ;
     _fb = (uint32_t)(0x40) & 0xFFFFFFFFu; _fbs = (int32_t)(int32_t)(_fb); /* sub source, before the write */
     ecx = ecx - 0x40;
     _fa = (uint32_t)(ecx) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* sub result */
-    if (CMP_GE((uint32_t)_fa + (uint32_t)_fb, (uint32_t)_fb)) goto loc_0045E1B7; /* jge: greater or equal (signed >=) */
+    if (CMP_GE((uint32_t)((uint32_t)_fa + (uint32_t)_fb), (uint32_t)_fb)) goto loc_0045E1B7; /* jge: greater or equal (signed >=) */
 
 loc_0045E1DE: ;
     _fb = (uint32_t)(0x40) & 0xFFFFFFFFu; _fbs = (int32_t)(int32_t)(_fb); /* add source, before the write */
@@ -367,7 +367,7 @@ loc_0045E218: ;
     _fb = (uint32_t)(0x10) & 0xFFFFFFFFu; _fbs = (int32_t)(int32_t)(_fb); /* sub source, before the write */
     ecx = ecx - 0x10;
     _fa = (uint32_t)(ecx) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* sub result */
-    if (CMP_L((uint32_t)_fa + (uint32_t)_fb, (uint32_t)_fb)) goto loc_0045E200; /* jl: less (signed <) */
+    if (CMP_L((uint32_t)((uint32_t)_fa + (uint32_t)_fb), (uint32_t)_fb)) goto loc_0045E200; /* jl: less (signed <) */
 
 loc_0045E220: ;
     MMX_STORE(eax, mm0); /* movntq */
@@ -399,7 +399,7 @@ loc_0045E240: ;
     _fb = (uint32_t)(0x20) & 0xFFFFFFFFu; _fbs = (int32_t)(int32_t)(_fb); /* sub source, before the write */
     ecx = ecx - 0x20;
     _fa = (uint32_t)(ecx) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* sub result */
-    if (CMP_L((uint32_t)_fa + (uint32_t)_fb, (uint32_t)_fb)) goto loc_0045E230; /* jl: less (signed <) */
+    if (CMP_L((uint32_t)((uint32_t)_fa + (uint32_t)_fb), (uint32_t)_fb)) goto loc_0045E230; /* jl: less (signed <) */
 
 loc_0045E245: ;
     MMX_STORE(eax, mm0); /* movntq */
@@ -416,7 +416,7 @@ loc_0045E258: ;
     ecx = ecx - 8;
     _fa = (uint32_t)(ecx) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* sub result */
     mm1 = mm0; /* movq */
-    if (CMP_L((uint32_t)_fa + (uint32_t)_fb, (uint32_t)_fb)) goto loc_0045E291; /* jl: less (signed <) */
+    if (CMP_L((uint32_t)((uint32_t)_fa + (uint32_t)_fb), (uint32_t)_fb)) goto loc_0045E291; /* jl: less (signed <) */
 
 loc_0045E260: ;
     MMX_STORE(eax, mm0); /* movq */
@@ -480,7 +480,7 @@ loc_0045E2C8: ;
     _fb = (uint32_t)(0x40) & 0xFFFFFFFFu; _fbs = (int32_t)(int32_t)(_fb); /* sub source, before the write */
     ecx = ecx - 0x40;
     _fa = (uint32_t)(ecx) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* sub result */
-    if (CMP_GE((uint32_t)_fa + (uint32_t)_fb, (uint32_t)_fb)) goto loc_0045E2C8; /* jge: greater or equal (signed >=) */
+    if (CMP_GE((uint32_t)((uint32_t)_fa + (uint32_t)_fb), (uint32_t)_fb)) goto loc_0045E2C8; /* jge: greater or equal (signed >=) */
 
 loc_0045E2EF: ;
     _fb = (uint32_t)(0x40) & 0xFFFFFFFFu; _fbs = (int32_t)(int32_t)(_fb); /* add source, before the write */
@@ -500,7 +500,7 @@ loc_0045E300: ;
     _fb = (uint32_t)(0x10) & 0xFFFFFFFFu; _fbs = (int32_t)(int32_t)(_fb); /* sub source, before the write */
     ecx = ecx - 0x10;
     _fa = (uint32_t)(ecx) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* sub result */
-    if (CMP_L((uint32_t)_fa + (uint32_t)_fb, (uint32_t)_fb)) goto loc_0045E38A; /* jl: less (signed <) */
+    if (CMP_L((uint32_t)((uint32_t)_fa + (uint32_t)_fb), (uint32_t)_fb)) goto loc_0045E38A; /* jl: less (signed <) */
 
 loc_0045E30C: ;
     MMX_STORE(eax, mm0); /* movntq */
@@ -526,7 +526,7 @@ loc_0045E328: ;
     _fb = (uint32_t)(0x20) & 0xFFFFFFFFu; _fbs = (int32_t)(int32_t)(_fb); /* sub source, before the write */
     ecx = ecx - 0x20;
     _fa = (uint32_t)(ecx) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* sub result */
-    if (CMP_L((uint32_t)_fa + (uint32_t)_fb, (uint32_t)_fb)) goto loc_0045E318; /* jl: less (signed <) */
+    if (CMP_L((uint32_t)((uint32_t)_fa + (uint32_t)_fb), (uint32_t)_fb)) goto loc_0045E318; /* jl: less (signed <) */
 
 loc_0045E32D: ;
     MMX_STORE(eax, mm0); /* movntq */
@@ -542,7 +542,7 @@ loc_0045E340: ;
     _fb = (uint32_t)(0x10) & 0xFFFFFFFFu; _fbs = (int32_t)(int32_t)(_fb); /* sub source, before the write */
     ecx = ecx - 0x10;
     _fa = (uint32_t)(ecx) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* sub result */
-    if (CMP_L((uint32_t)_fa + (uint32_t)_fb, (uint32_t)_fb)) goto loc_0045E38A; /* jl: less (signed <) */
+    if (CMP_L((uint32_t)((uint32_t)_fa + (uint32_t)_fb), (uint32_t)_fb)) goto loc_0045E38A; /* jl: less (signed <) */
 
 loc_0045E345: ;
     MMX_STORE(eax, mm0); /* movq */

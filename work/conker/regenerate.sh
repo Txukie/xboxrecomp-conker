@@ -95,7 +95,11 @@ if run_from recomp; then
     # --entry-stubs: a call into the middle of a function runs a copy of
     # that function entered at the target, instead of an empty stub. This is
     # what the hand-made recomp_single_* continuations used to provide.
+    # --exclude-manual: functions defined in recomp_manual.c are not
+    # generated, and sub_X_enter hooks there are called at the top of the
+    # generated sub_X (e.g. the D3D semaphore registration).
     "$py" -m tools.recomp "$xbe" --all --split 250 --game-name "Conker" --entry-stubs \
+        --exclude-manual "$here/project/src/recomp_manual.c" \
         --gen-dir "$gen_out" > "$stage_dir/recomp.log" 2>&1
 fi
 

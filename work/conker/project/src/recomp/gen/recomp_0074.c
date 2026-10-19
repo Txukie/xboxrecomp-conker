@@ -5384,7 +5384,7 @@ loc_004E661B: ;
     ebx = ebx - ecx;
     _fa = (uint32_t)(ebx) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* sub result */
     POP32(esp, ecx);
-    if (CMP_G((uint32_t)_fa + (uint32_t)_fb, (uint32_t)_fb)) goto loc_004E6628; /* jg: greater (signed >) */
+    if (CMP_G((uint32_t)((uint32_t)_fa + (uint32_t)_fb), (uint32_t)_fb)) goto loc_004E6628; /* jg: greater (signed >) */
 
 loc_004E6620: ;
     edx = MEM32(edi);

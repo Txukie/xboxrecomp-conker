@@ -3403,6 +3403,8 @@ loc_0053C181: ;
  */
 void sub_0053C190(void)
 {
+    extern void sub_0053C190_enter(void);
+    sub_0053C190_enter();
     uint32_t ebp = 0;
     ebp = g_ebp;  /* frameless: caller's frame */
     int _flags = 0; /* fallback flag var */
@@ -25736,14 +25738,14 @@ loc_0054AB23: ;
     _cf = (int)((uint32_t)(HI8(ecx)) < (uint32_t)(LO8(ecx)));
     SET_HI8(ecx, HI8(ecx) - LO8(ecx));
     _fa = (uint32_t)(HI8(ecx)) & 0xFFu; _fas = (int32_t)(int8_t)(_fa); /* sub result */
-    if (CMP_L((uint32_t)_fa + (uint32_t)_fb, (uint32_t)_fb)) goto loc_0054AB81; /* jl: less (signed <) */
+    if (CMP_L((uint8_t)((uint32_t)_fa + (uint32_t)_fb), (uint8_t)_fb)) goto loc_0054AB81; /* jl: less (signed <) */
 
 loc_0054AB2E: ;
     _fb = (uint32_t)(0x100) & 0xFFFFFFFFu; _fbs = (int32_t)(int32_t)(_fb); /* sub source, before the write */
     _cf = (int)((uint32_t)(eax) < (uint32_t)(0x100));
     eax = eax - 0x100;
     _fa = (uint32_t)(eax) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* sub result */
-    if (CMP_L((uint32_t)_fa + (uint32_t)_fb, (uint32_t)_fb)) goto loc_0054AB10; /* jl: less (signed <) */
+    if (CMP_L((uint32_t)((uint32_t)_fa + (uint32_t)_fb), (uint32_t)_fb)) goto loc_0054AB10; /* jl: less (signed <) */
 
 loc_0054AB35: ;
     goto loc_0054ABB1;
@@ -25774,14 +25776,14 @@ loc_0054AB47: ;
     _cf = (int)((uint32_t)(HI8(ecx)) < (uint32_t)(LO8(ecx)));
     SET_HI8(ecx, HI8(ecx) - LO8(ecx));
     _fa = (uint32_t)(HI8(ecx)) & 0xFFu; _fas = (int32_t)(int8_t)(_fa); /* sub result */
-    if (CMP_L((uint32_t)_fa + (uint32_t)_fb, (uint32_t)_fb)) goto loc_0054AB81; /* jl: less (signed <) */
+    if (CMP_L((uint8_t)((uint32_t)_fa + (uint32_t)_fb), (uint8_t)_fb)) goto loc_0054AB81; /* jl: less (signed <) */
 
 loc_0054AB52: ;
     _fb = (uint32_t)(0x100) & 0xFFFFFFFFu; _fbs = (int32_t)(int32_t)(_fb); /* sub source, before the write */
     _cf = (int)((uint32_t)(eax) < (uint32_t)(0x100));
     eax = eax - 0x100;
     _fa = (uint32_t)(eax) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* sub result */
-    if (CMP_L((uint32_t)_fa + (uint32_t)_fb, (uint32_t)_fb)) goto loc_0054AB10; /* jl: less (signed <) */
+    if (CMP_L((uint32_t)((uint32_t)_fa + (uint32_t)_fb), (uint32_t)_fb)) goto loc_0054AB10; /* jl: less (signed <) */
 
 loc_0054AB59: ;
     goto loc_0054ABB1;
@@ -25815,14 +25817,14 @@ loc_0054AB6F: ;
     _cf = (int)((uint32_t)(HI8(ecx)) < (uint32_t)(LO8(ecx)));
     SET_HI8(ecx, HI8(ecx) - LO8(ecx));
     _fa = (uint32_t)(HI8(ecx)) & 0xFFu; _fas = (int32_t)(int8_t)(_fa); /* sub result */
-    if (CMP_L((uint32_t)_fa + (uint32_t)_fb, (uint32_t)_fb)) goto loc_0054AB81; /* jl: less (signed <) */
+    if (CMP_L((uint8_t)((uint32_t)_fa + (uint32_t)_fb), (uint8_t)_fb)) goto loc_0054AB81; /* jl: less (signed <) */
 
 loc_0054AB78: ;
     _fb = (uint32_t)(0x100) & 0xFFFFFFFFu; _fbs = (int32_t)(int32_t)(_fb); /* sub source, before the write */
     _cf = (int)((uint32_t)(eax) < (uint32_t)(0x100));
     eax = eax - 0x100;
     _fa = (uint32_t)(eax) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* sub result */
-    if (CMP_L((uint32_t)_fa + (uint32_t)_fb, (uint32_t)_fb)) goto loc_0054AB10; /* jl: less (signed <) */
+    if (CMP_L((uint32_t)((uint32_t)_fa + (uint32_t)_fb), (uint32_t)_fb)) goto loc_0054AB10; /* jl: less (signed <) */
 
 loc_0054AB7F: ;
     goto loc_0054ABB1;
@@ -25867,7 +25869,7 @@ loc_0054AB93: ;
     _cf = (int)((uint32_t)(eax) < (uint32_t)(0x100));
     eax = eax - 0x100;
     _fa = (uint32_t)(eax) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* sub result */
-    if (CMP_L((uint32_t)_fa + (uint32_t)_fb, (uint32_t)_fb)) goto loc_0054AB10; /* jl: less (signed <) */
+    if (CMP_L((uint32_t)((uint32_t)_fa + (uint32_t)_fb), (uint32_t)_fb)) goto loc_0054AB10; /* jl: less (signed <) */
 
 loc_0054ABB1: ;
     SET_LO8(ecx, LO8(eax));
@@ -26126,14 +26128,14 @@ loc_0054ACEC: ;
     _cf = (int)((uint32_t)(HI8(ecx)) < (uint32_t)(LO8(ecx)));
     SET_HI8(ecx, HI8(ecx) - LO8(ecx));
     _fa = (uint32_t)(HI8(ecx)) & 0xFFu; _fas = (int32_t)(int8_t)(_fa); /* sub result */
-    if (CMP_L((uint32_t)_fa + (uint32_t)_fb, (uint32_t)_fb)) goto loc_0054AD4A; /* jl: less (signed <) */
+    if (CMP_L((uint8_t)((uint32_t)_fa + (uint32_t)_fb), (uint8_t)_fb)) goto loc_0054AD4A; /* jl: less (signed <) */
 
 loc_0054ACF7: ;
     _fb = (uint32_t)(0x100) & 0xFFFFFFFFu; _fbs = (int32_t)(int32_t)(_fb); /* sub source, before the write */
     _cf = (int)((uint32_t)(eax) < (uint32_t)(0x100));
     eax = eax - 0x100;
     _fa = (uint32_t)(eax) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* sub result */
-    if (CMP_L((uint32_t)_fa + (uint32_t)_fb, (uint32_t)_fb)) goto loc_0054ACD0; /* jl: less (signed <) */
+    if (CMP_L((uint32_t)((uint32_t)_fa + (uint32_t)_fb), (uint32_t)_fb)) goto loc_0054ACD0; /* jl: less (signed <) */
 
 loc_0054ACFE: ;
     goto loc_0054AD71;
@@ -26164,14 +26166,14 @@ loc_0054AD10: ;
     _cf = (int)((uint32_t)(HI8(ecx)) < (uint32_t)(LO8(ecx)));
     SET_HI8(ecx, HI8(ecx) - LO8(ecx));
     _fa = (uint32_t)(HI8(ecx)) & 0xFFu; _fas = (int32_t)(int8_t)(_fa); /* sub result */
-    if (CMP_L((uint32_t)_fa + (uint32_t)_fb, (uint32_t)_fb)) goto loc_0054AD4A; /* jl: less (signed <) */
+    if (CMP_L((uint8_t)((uint32_t)_fa + (uint32_t)_fb), (uint8_t)_fb)) goto loc_0054AD4A; /* jl: less (signed <) */
 
 loc_0054AD1B: ;
     _fb = (uint32_t)(0x100) & 0xFFFFFFFFu; _fbs = (int32_t)(int32_t)(_fb); /* sub source, before the write */
     _cf = (int)((uint32_t)(eax) < (uint32_t)(0x100));
     eax = eax - 0x100;
     _fa = (uint32_t)(eax) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* sub result */
-    if (CMP_L((uint32_t)_fa + (uint32_t)_fb, (uint32_t)_fb)) goto loc_0054ACD0; /* jl: less (signed <) */
+    if (CMP_L((uint32_t)((uint32_t)_fa + (uint32_t)_fb), (uint32_t)_fb)) goto loc_0054ACD0; /* jl: less (signed <) */
 
 loc_0054AD22: ;
     goto loc_0054AD71;
@@ -26205,14 +26207,14 @@ loc_0054AD38: ;
     _cf = (int)((uint32_t)(HI8(ecx)) < (uint32_t)(LO8(ecx)));
     SET_HI8(ecx, HI8(ecx) - LO8(ecx));
     _fa = (uint32_t)(HI8(ecx)) & 0xFFu; _fas = (int32_t)(int8_t)(_fa); /* sub result */
-    if (CMP_L((uint32_t)_fa + (uint32_t)_fb, (uint32_t)_fb)) goto loc_0054AD4A; /* jl: less (signed <) */
+    if (CMP_L((uint8_t)((uint32_t)_fa + (uint32_t)_fb), (uint8_t)_fb)) goto loc_0054AD4A; /* jl: less (signed <) */
 
 loc_0054AD41: ;
     _fb = (uint32_t)(0x100) & 0xFFFFFFFFu; _fbs = (int32_t)(int32_t)(_fb); /* sub source, before the write */
     _cf = (int)((uint32_t)(eax) < (uint32_t)(0x100));
     eax = eax - 0x100;
     _fa = (uint32_t)(eax) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* sub result */
-    if (CMP_L((uint32_t)_fa + (uint32_t)_fb, (uint32_t)_fb)) goto loc_0054ACD0; /* jl: less (signed <) */
+    if (CMP_L((uint32_t)((uint32_t)_fa + (uint32_t)_fb), (uint32_t)_fb)) goto loc_0054ACD0; /* jl: less (signed <) */
 
 loc_0054AD48: ;
     goto loc_0054AD71;
@@ -26251,7 +26253,7 @@ loc_0054AD53: ;
     _cf = (int)((uint32_t)(eax) < (uint32_t)(0x100));
     eax = eax - 0x100;
     _fa = (uint32_t)(eax) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* sub result */
-    if (CMP_L((uint32_t)_fa + (uint32_t)_fb, (uint32_t)_fb)) goto loc_0054ACD0; /* jl: less (signed <) */
+    if (CMP_L((uint32_t)((uint32_t)_fa + (uint32_t)_fb), (uint32_t)_fb)) goto loc_0054ACD0; /* jl: less (signed <) */
 
 loc_0054AD71: ;
     _fa = (uint32_t)(edi) & 0xFFFFFFFFu; _fb = (uint32_t)(MEM32(ebp + 0xC)) & 0xFFFFFFFFu;

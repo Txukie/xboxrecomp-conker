@@ -1,0 +1,113 @@
+diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
+index 25970d2..72a056f 100644
+--- a/tools/recomp/lifter.py
++++ b/tools/recomp/lifter.py
+@@ -815,13 +815,21 @@ def _make_condition(jcc, flag_setter, flag_ops):
+             return f"({slhs} < 0)", desc
+         if jcc == "jns":
+             return f"({slhs} >= 0)", desc
+-        # Ordered: reconstruct original a = result + b
++        # Ordered: reconstruct original a = result + b, wrapped at the
++        # operand width. In 32 bits the sum wraps by itself; for `sub ch, cl`
++        # it does not (0xFB + 0x15 = 0x110, not 0x10), and handed to CMP_L as
++        # a uint32_t the comparison ran at 32 bits: 16 - 21 looked
++        # non-negative, and Conker's Huffman decoder (0x0054AB2A) never
++        # refilled its bit buffer and ran off its output.
+         if cmp_macro and rhs:
+-            return f"{cmp_macro}((uint32_t){lhs} + (uint32_t){rhs}, (uint32_t){rhs})", desc
++            return (f"{cmp_macro}(({_sf_utype})((uint32_t){lhs} + (uint32_t){rhs}), "
++                    f"({_sf_utype}){rhs})"), desc
+         if jcc in ("jb", "jnae"):
+-            return f"((uint32_t){lhs} + (uint32_t){rhs} < (uint32_t){rhs})", desc
++            return (f"(({_sf_utype})((uint32_t){lhs} + (uint32_t){rhs}) < "
++                    f"({_sf_utype}){rhs})"), desc
+         if jcc in ("jae", "jnb"):
+-            return f"((uint32_t){lhs} + (uint32_t){rhs} >= (uint32_t){rhs})", desc
++            return (f"(({_sf_utype})((uint32_t){lhs} + (uint32_t){rhs}) >= "
++                    f"({_sf_utype}){rhs})"), desc
+         if jcc in ("jl", "jnge"):
+             return f"({slhs} < 0)", desc
+         if jcc in ("jge", "jnl"):
+diff --git a/tools/recomp/test_sub_narrow_ordered.py b/tools/recomp/test_sub_narrow_ordered.py
+new file mode 100644
+index 0000000..bc42e4e
+--- /dev/null
++++ b/tools/recomp/test_sub_narrow_ordered.py
+@@ -0,0 +1,77 @@
++"""
++Self-check for ordered branches after a narrow (8/16-bit) sub.
++
++Run: py -3 tools/recomp/test_sub_narrow_ordered.py
++
++Regression guard for jl/jb/jae after `sub ch, cl` and the like. The condition
++rebuilds the original destination as result + source; at 32 bits that sum
++wraps by itself, but for a byte it does not (0xFB + 0x15 = 0x110), and passed
++as a uint32_t the width-aware CMP_L compared at 32 bits. 16 - 21 then looked
++non-negative, so Conker: Live and Reloaded's Huffman decoder (0x0054AB2A,
++`sub ch, cl; jl refill`) never refilled its bit buffer and wrote past its
++output until the title hung.
++
++The reconstruction is now truncated to the operand's width, so CMP_L/CMP_B see
++a uint8_t/uint16_t and compare at that width; 32-bit output is unchanged.
++"""
++
++import os
++import sys
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
++
++from tools.recomp.lifter import _make_condition  # noqa: E402
++
++
++class _Op:
++    def __init__(self, text, reg, type="reg"):
++        self.text = text
++        self.type = type
++        self.reg = reg
++        self.size = 4
++        self.mem_size = None
++        self.imm = 0
++        self.mem_base = None
++        self.mem_index = None
++        self.mem_scale = 1
++        self.mem_disp = 0
++        self.segment = None
++
++
++CH, CL = _Op("ch", "ch"), _Op("cl", "cl")
++AX, BX = _Op("ax", "ax"), _Op("bx", "bx")
++EAX, EBX = _Op("eax", "eax"), _Op("ebx", "ebx")
++
++
++def test_byte_sub_compares_at_byte_width():
++    cond, _ = _make_condition("jl", "sub", [CH, CL])
++    assert "(uint8_t)((uint32_t)_fa + (uint32_t)_fb)" in cond, cond
++    assert cond.startswith("CMP_L("), cond
++    # Carry conditions come from the tracked _cf, which is already right at
++    # any width.
++    cond, _ = _make_condition("jb", "sub", [CH, CL])
++    assert cond == "_cf", cond
++
++
++def test_word_sub_compares_at_word_width():
++    cond, _ = _make_condition("jge", "sub", [AX, BX])
++    assert "(uint16_t)((uint32_t)_fa + (uint32_t)_fb)" in cond, cond
++
++
++def test_dword_sub_unchanged():
++    cond, _ = _make_condition("jl", "sub", [EAX, EBX])
++    assert "uint8_t" not in cond and "uint16_t" not in cond, cond
++
++
++if __name__ == "__main__":
++    failures = 0
++    for name, fn in sorted(globals().items()):
++        if not name.startswith("test_"):
++            continue
++        try:
++            fn()
++            print(f"ok   {name}")
++        except AssertionError as e:
++            failures += 1
++            print(f"FAIL {name}: {e}")
++    sys.exit(1 if failures else 0)
