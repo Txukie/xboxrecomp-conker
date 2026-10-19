@@ -112,10 +112,14 @@ int main(int argc, char **argv)
     /* Toolkit switches Conker needs; any can be overridden from outside.
      *   RECOMP_PB_EXEC       D3D8LTCG frames only exist as push buffers
      *   RECOMP_TITLE_KEVENTS D3D waits on a KEVENT it builds itself (0x5492FC)
-     *   RECOMP_VBLANK        its GPU ISR (vector 3) needs vblank interrupts */
+     *   RECOMP_VBLANK        its GPU ISR (vector 3) needs vblank interrupts
+     *   RECOMP_AC97_READY    DirectSound resets the AC'97 bus master and the
+     *                        codec, and talks to the APU directly: this arms
+     *                        the AC'97 write trap and the emulated APU */
     conker_host_setenv_default("RECOMP_PB_EXEC", "1");
     conker_host_setenv_default("RECOMP_TITLE_KEVENTS", "1");
     conker_host_setenv_default("RECOMP_VBLANK", "paced");
+    conker_host_setenv_default("RECOMP_AC97_READY", "1");
 
     if (!game_dir || !*game_dir)
         game_dir = CONKER_DEFAULT_GAME_DIR;

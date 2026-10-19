@@ -18,14 +18,16 @@ en `external/xboxrecomp` y fijado a una versión publicada (ahora v0.15.0).
   están soportados por el runtime, pero este proyecto aún no se ha compilado
   en ellos; ver [docs/technical/porting.md](../../docs/technical/porting.md).
 - Arranque: TLS, heap, archivos de guardado, memoria contigua, la ISR de la
-  GPU (vector 3) recibe vblanks, D3D8LTCG configura una superficie 640×480 de
-  32 bits en `0x001B0000` y hace el primer flip.
-- Bloqueo actual: después del primer flip, D3D espera en un bucle a que la
-  GPU avance (fence/semáforo). Falta indicar al ejecutor dónde está el
-  semáforo de D3D (`nv2a_pb_set_semaphore_target`, puntero en device+0x30) y
-  probablemente el espejo de fences.
-- Dos correcciones del runtime que upstream aún no tiene están en
-  `patches/xboxrecomp/`; CMake las aplica al submódulo.
+  GPU recibe vblanks, D3D8LTCG dibuja el logo y la pantalla de carga completa
+  (rasterizador por CPU del ejecutor), la caché `Z:` se llena desde el DVD y
+  DirectSound arranca con el APU emulado (audio por SDL2).
+- Bloqueo actual: la pantalla de carga llega al final de la barra y el motor
+  XACT queda esperando lecturas asíncronas (`GetOverlappedResult` en
+  `0x0042C319`), aunque `NtReadFile` las completa al momento.
+- Seis correcciones del runtime que upstream aún no tiene están en
+  `patches/xboxrecomp/` (ventana del invitado, `NtQueryVirtualMemory`, saltos
+  tras `sub` de 8/16 bits, `PATH_NOT_FOUND`, mayúsculas/minúsculas en POSIX,
+  decodificador MMIO x86-64 en POSIX); CMake las aplica al submódulo.
 
 ## Preparar el juego
 
@@ -67,8 +69,11 @@ Vulkan SDK y SDL2; sin ellos se desactiva solo.
 Variables útiles al ejecutar (todas del toolkit salvo la primera):
 
 `main.c` activa por defecto `RECOMP_PB_EXEC=1`, `RECOMP_TITLE_KEVENTS=1`
-(D3D espera en un KEVENT que construye él mismo) y `RECOMP_VBLANK=paced` (su
-ISR necesita vblanks); cualquiera se puede sobrescribir desde fuera.
+(D3D espera en un KEVENT que construye él mismo), `RECOMP_VBLANK=paced` (su
+ISR necesita vblanks) y `RECOMP_AC97_READY=1` (APU emulado y reset del
+AC'97); cualquiera se puede sobrescribir desde fuera. Para ver el juego:
+`RECOMP_FB_WINDOW=1`. Usa el build optimizado
+(`-DCMAKE_BUILD_TYPE=Release`): sin optimizar es demasiado lento.
 
 | Variable | Efecto |
 |---|---|

@@ -1,0 +1,89 @@
+diff --git a/src/kernel/kernel_path.c b/src/kernel/kernel_path.c
+index 2f1edbb..d3e7941 100644
+--- a/src/kernel/kernel_path.c
++++ b/src/kernel/kernel_path.c
+@@ -669,6 +669,8 @@ translate:
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ #include <errno.h>
++#include <dirent.h>
++#include <strings.h>
+ #include <fcntl.h>
+ 
+ static char s_game_dir[MAX_PATH];
+@@ -816,6 +818,66 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
+              s_game_dir, s_save_dir, s_user_dir);
+ }
+ 
++/* FATX and the DVD's file system ignore case; a POSIX host does not. Conker
++ * asks for D:\dvddata\audio\dsp\dspimage.bin, which the disc spells
++ * Audio\dsp, and the open failed with "path not found".
++ *
++ * So when the translated path does not exist, walk it below `fixed` (the
++ * host base, which is left alone) one component at a time and take the
++ * directory entry that matches ignoring case. An exact match always wins,
++ * and the first component with no match ends the walk: the rest stays as
++ * the title wrote it, so creating something new still works. Costs nothing
++ * on a hit, one readdir per wrong-case component on a miss. */
++static void fold_path_case(char *path, size_t fixed)
++{
++    struct stat st;
++    char *p = path + fixed;
++
++    if (stat(path, &st) == 0)
++        return;
++    while (*p == '/')
++        p++;
++    while (*p) {
++        char *end = strchr(p, '/');
++        size_t len = end ? (size_t)(end - p) : strlen(p);
++        char saved = end ? *end : '\0';
++        int exists;
++
++        if (end)
++            *end = '\0';
++        exists = stat(path, &st) == 0;
++        if (!exists) {
++            /* p[-1] is the '/' before this component. */
++            DIR *d;
++            struct dirent *de;
++            int found = 0;
++
++            p[-1] = '\0';
++            d = opendir(p - 1 == path ? "/" : path);
++            p[-1] = '/';
++            if (d) {
++                while ((de = readdir(d)) != NULL) {
++                    if (strlen(de->d_name) == len && strncasecmp(de->d_name, p, len) == 0) {
++                        memcpy(p, de->d_name, len);
++                        found = 1;
++                        break;
++                    }
++                }
++                closedir(d);
++            }
++            if (!found) {
++                if (end)
++                    *end = saved;
++                return;
++            }
++        }
++        if (!end)
++            return;
++        *end = saved;
++        p = end + 1;
++    }
++}
++
+ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size)
+ {
+     const char* remainder = NULL;
+@@ -891,6 +953,8 @@ translate:
+                 host_path_buf[--n] = '\0';
+         }
+ 
++        fold_path_case(host_path_buf, strlen(base_dir) + (sub_dir ? strlen(sub_dir) : 0));
++
+         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
+         /* As the Win32 backend does: the bridge reads back the host path
+          * the call it just made translated (the missing-file report, the
