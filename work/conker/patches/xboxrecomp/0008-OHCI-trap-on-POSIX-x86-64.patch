@@ -1,0 +1,122 @@
+diff --git a/src/usb/ohci.c b/src/usb/ohci.c
+index efa5046..c2c40e0 100644
+--- a/src/usb/ohci.c
++++ b/src/usb/ohci.c
+@@ -21,12 +21,15 @@
+ 
+ /* Where the registers can be trapped. They are answered by faulting on the
+  * aperture and decoding the instruction that touched it: the x86-64 decoder
+- * under a Win32 VEH, or the A64 decoder under a POSIX SIGBUS/SIGSEGV
+- * handler. A host with neither leaves the model off (see xbox_OhciInit). */
++ * under a Win32 VEH or a POSIX SIGBUS/SIGSEGV handler, or the A64 decoder
++ * under a POSIX handler. A host with none leaves the model off (see
++ * xbox_OhciInit). */
+ #if defined(_WIN32)
+ #  define OHCI_TRAP_WIN32 1
+ #elif defined(__aarch64__)
+ #  define OHCI_TRAP_POSIX_A64 1
++#elif defined(__x86_64__)
++#  define OHCI_TRAP_POSIX_X64 1
+ #endif
+ 
+ /* The runtime maps guest memory at a fixed host offset. */
+@@ -1356,7 +1359,8 @@ void xbox_OhciInit(void)
+         if ((unsigned)s_npads > s_ndp)
+             s_ndp = (unsigned)s_npads;      /* a port for every pad */
+     }
+-#if !defined(OHCI_TRAP_WIN32) && !defined(OHCI_TRAP_POSIX_A64)
++#if !defined(OHCI_TRAP_WIN32) && !defined(OHCI_TRAP_POSIX_A64) \
++    && !defined(OHCI_TRAP_POSIX_X64)
+     /* No decoder for this host's instructions, so a trapped access could not
+      * be answered. Leave the aperture as plain memory -- the title then sees
+      * no controller, exactly as with RECOMP_USB unset -- and say so. */
+@@ -1432,7 +1436,8 @@ int xbox_OhciOwnsAddress(uint32_t xbox_va)
+     return hc_for(xbox_va) != NULL;
+ }
+ 
+-#if defined(OHCI_TRAP_POSIX_A64) || defined(OHCI_TRAP_WIN32)
++#if defined(OHCI_TRAP_POSIX_A64) || defined(OHCI_TRAP_WIN32) \
++    || defined(OHCI_TRAP_POSIX_X64)
+ /* Both decoders hand over 8-byte accesses whole (ldr/str x or a d register
+  * on A64, a REX.W mov on x86-64); the registers are 32-bit, so an 8-byte
+  * access is two of them. */
+@@ -1473,16 +1478,17 @@ int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
+         fflush(stderr);
+     }
+     return ok;
+-#elif defined(OHCI_TRAP_WIN32)
++#elif defined(OHCI_TRAP_WIN32) || defined(OHCI_TRAP_POSIX_X64)
++    /* ctx is the Win32 CONTEXT or the POSIX ucontext_t (mmio_ctx_t). */
+     OhciController *hc = hc_for(xbox_va);
+     int ok;
+ 
+     if (!hc)
+         return 0;
+-    ok = mmio_emulate((PCONTEXT)ctx, xbox_va - hc->base, hc,
++    ok = mmio_emulate((mmio_ctx_t)ctx, xbox_va - hc->base, hc,
+                       ohci_read_split, ohci_write_split);
+     if (!ok && hc->decode_fail++ < 20) {
+-        const uint8_t *ip = (const uint8_t *)((PCONTEXT)ctx)->Rip;
++        const uint8_t *ip = (const uint8_t *)(uintptr_t)MMIO_RIP((mmio_ctx_t)ctx);
+         fprintf(stderr, "  [OHCI%d] undecoded access at +0x%03X: "
+                         "%02X %02X %02X %02X %02X %02X\n",
+                 hc->index, xbox_va - hc->base,
+diff --git a/src/usb/ohci.h b/src/usb/ohci.h
+index 8aa0b35..8a8cf73 100644
+--- a/src/usb/ohci.h
++++ b/src/usb/ohci.h
+@@ -33,9 +33,10 @@
+  * RECOMP_USB is set, so a title that was working without a controller keeps
+  * behaving exactly as it did. Call it after the guest memory is mapped.
+  *
+- * The registers are trapped on Windows x86-64 and on POSIX arm64 hosts. On
+- * any other host the model stays off, with a one-line notice, and the title
+- * sees the aperture as plain memory, as it does with RECOMP_USB unset. */
++ * The registers are trapped on Windows x86-64 and on POSIX arm64 and x86-64
++ * hosts. On any other host the model stays off, with a one-line notice, and
++ * the title sees the aperture as plain memory, as it does with RECOMP_USB
++ * unset. */
+ void xbox_OhciInit(void);
+ 
+ /* 1 if the address is inside a controller this model owns. */
+diff --git a/tests/usb_ohci_posix/CMakeLists.txt b/tests/usb_ohci_posix/CMakeLists.txt
+index a383b11..0c05e16 100644
+--- a/tests/usb_ohci_posix/CMakeLists.txt
++++ b/tests/usb_ohci_posix/CMakeLists.txt
+@@ -1,8 +1,9 @@
+ cmake_minimum_required(VERSION 3.20)
+ project(usb_ohci_posix_test C)
+ # The OHCI register model behind a real POSIX fault: a PROT_NONE aperture, a
+-# SIGBUS/SIGSEGV handler and the A64 decoder. Needs a POSIX arm64 host;
+-# elsewhere the model stays off by design and the test exits 77 (skipped).
++# SIGBUS/SIGSEGV handler and the A64 or x86-64 decoder. Needs a POSIX arm64
++# or x86-64 host; elsewhere the model stays off by design and the test exits
++# 77 (skipped).
+ if(WIN32)
+     message(FATAL_ERROR "This regression covers the POSIX trap path")
+ endif()
+diff --git a/tests/usb_ohci_posix/test_main.c b/tests/usb_ohci_posix/test_main.c
+index e9adc61..d703550 100644
+--- a/tests/usb_ohci_posix/test_main.c
++++ b/tests/usb_ohci_posix/test_main.c
+@@ -8,8 +8,9 @@
+  * aperture stayed plain zeroed memory and xbox_OhciHandleMmio returned 0, so
+  * a title's USB driver found no controller and no pad.
+  *
+- * A host without a trapped-MMIO decoder (anything but arm64 here) keeps the
+- * model off by design; the test checks that it says so and exits 77.
++ * A host without a trapped-MMIO decoder (anything but arm64 and x86-64 here)
++ * keeps the model off by design; the test checks that it says so and exits
++ * 77.
+  */
+ #include "xbox_memory_layout.h"
+ #include "ohci.h"
+@@ -97,7 +98,7 @@ int main(int argc, char **argv)
+ 
+     xbox_OhciInit();
+ 
+-#if !defined(__aarch64__)
++#if !defined(__aarch64__) && !defined(__x86_64__)
+     check(!xbox_OhciOwnsAddress(XBOX_OHCI0_BASE),
+           "no decoder on this host: the model stays off", NULL);
+     printf("\n%d failure(s); trap path not available here (skipped)\n",

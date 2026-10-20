@@ -74,10 +74,22 @@ Variables útiles al ejecutar (todas del toolkit salvo la primera):
 
 `main.c` activa por defecto `RECOMP_PB_EXEC=1`, `RECOMP_TITLE_KEVENTS=1`
 (D3D espera en un KEVENT que construye él mismo), `RECOMP_VBLANK=paced` (su
-ISR necesita vblanks) y `RECOMP_AC97_READY=1` (APU emulado y reset del
-AC'97); cualquiera se puede sobrescribir desde fuera. Para ver el juego:
-`RECOMP_FB_WINDOW=1`. Usa el build optimizado
-(`-DCMAKE_BUILD_TYPE=Release`): sin optimizar es demasiado lento.
+ISR necesita vblanks), `RECOMP_AC97_READY=1` (APU emulado y reset del
+AC'97), `RECOMP_USB=1` (controladores USB OHCI emulados: XAPI encuentra ahí
+el mando) y `RECOMP_KEYBOARD=1` (el teclado como mando 0); cualquiera se
+puede sobrescribir desde fuera. Para ver el juego: `RECOMP_FB_WINDOW=1`. Usa
+el build optimizado (`-DCMAKE_BUILD_TYPE=Release`): sin optimizar es
+demasiado lento.
+
+### Mando
+
+Con `RECOMP_FB_WINDOW=1`, la ventana SDL abre cualquier mando que SDL
+reconozca como *game controller* (Xbox, PlayStation, Switch Pro, etc.),
+también conectado en caliente; el log muestra `[INPUT] controller 0: <nombre>`.
+Sin ventana no se lee el mando. Mapeo: A/B/X/Y, LB = Black, RB = White,
+gatillos analógicos, sticks, cruceta, Start y Back. El teclado se suma al
+mando 0 (Enter = Start, Z = A). `RECOMP_INPUT_DIAG=1` imprime una vez por
+segundo el estado que llega al juego.
 
 | Variable | Efecto |
 |---|---|
@@ -88,6 +100,10 @@ AC'97); cualquiera se puede sobrescribir desde fuera. Para ver el juego:
 | `RECOMP_STUB_LOG=1` | nombrar cada stub sin resolver la primera vez que se ejecuta |
 | `RECOMP_UNIMPL_TRAP=1` | abortar en la primera instrucción sin traducir |
 | `RECOMP_AC97_READY=1` | activar el APU emulado |
+| `RECOMP_USB=1` | emular los controladores USB (mando) |
+| `RECOMP_KEYBOARD=1` | teclado como mando 0 |
+| `RECOMP_INPUT_DIAG=1` | estado del mando una vez por segundo |
+| `RECOMP_PAD_PRESS=0x10` | pulsar Start cada 2 s (sin mando) |
 
 ## Regenerar el código
 

@@ -1,0 +1,70 @@
+diff --git a/src/kernel/kernel_file.c b/src/kernel/kernel_file.c
+index eb33a61..0b207cf 100644
+--- a/src/kernel/kernel_file.c
++++ b/src/kernel/kernel_file.c
+@@ -702,7 +702,11 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
+ 
+     if (!GetFileAttributesExW(win_path, GetFileExInfoStandard, &fad)) {
+         DWORD err = GetLastError();
+-        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
++        /* A missing parent is PATH_NOT_FOUND, as on the console and as
++         * NtCreateFile already reports it; see the POSIX backend below. */
++        if (err == ERROR_PATH_NOT_FOUND)
++            return STATUS_OBJECT_PATH_NOT_FOUND;
++        if (err == ERROR_FILE_NOT_FOUND)
+             return STATUS_OBJECT_NAME_NOT_FOUND;
+         return STATUS_UNSUCCESSFUL;
+     }
+@@ -1539,8 +1543,18 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
+     const char* xbox_path = get_xbox_path(ObjectAttributes);
+     if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH))
+         return STATUS_OBJECT_PATH_NOT_FOUND;
+-    if (stat(host_path, &st) != 0)
++    if (stat(host_path, &st) != 0) {
++        /* Same split as NtCreateFile: a missing parent is PATH_NOT_FOUND,
++         * which GetFileAttributes turns into ERROR_PATH_NOT_FOUND. Conker's
++         * "create directory and its parents" (0x001F1E80) only recurses
++         * into the parent on that error; told NAME_NOT_FOUND it created the
++         * leaf alone, that failed, and the title stopped on its disc-error
++         * screen while copying dvddata into the Z: cache. */
++        int e = errno;
++        if (e == ENOTDIR || (e == ENOENT && !xbox_host_parent_exists(host_path)))
++            return STATUS_OBJECT_PATH_NOT_FOUND;
+         return STATUS_OBJECT_NAME_NOT_FOUND;
++    }
+ 
+     unix_to_filetime(st.st_ctime, 0, &FileInformation->CreationTime);
+     unix_to_filetime(st.st_atime, 0, &FileInformation->LastAccessTime);
+diff --git a/tests/kernel_file_status/test_main.c b/tests/kernel_file_status/test_main.c
+index 31de9dc..9d37960 100644
+--- a/tests/kernel_file_status/test_main.c
++++ b/tests/kernel_file_status/test_main.c
+@@ -6,8 +6,12 @@
+  * directory (STATUS_OBJECT_PATH_NOT_FOUND). The POSIX backend used to answer
+  * NAME_NOT_FOUND for both, since ENOENT covers both, and left the Win32 error
+  * the bridge prints at 0. A title can branch on the status, so the two hosts
+- * must agree. Attribute queries answer NAME_NOT_FOUND for both on both
+- * backends today, and stay that way.
++ * must agree. Attribute queries (NtQueryFullAttributesFile, which XAPI's
++ * GetFileAttributes calls) make the same distinction: titles branch on it.
++ * Conker: Live and Reloaded creates a directory with its parents by
++ * recursing only on ERROR_PATH_NOT_FOUND, so answering NAME_NOT_FOUND for a
++ * missing parent made it create the leaf alone and stop on its disc-error
++ * screen.
+  *
+  * Cross-platform: Win32 backend on Windows and Proton, POSIX elsewhere.
+  */
+@@ -111,11 +115,11 @@ int main(int argc, char **argv)
+     check((uint32_t)st == 0xC000003Au, "missing directory: PATH_NOT_FOUND", (unsigned)st);
+     check(xbox_LastFileError() == 3u, "... and win32 err 3 (ERROR_PATH_NOT_FOUND)", xbox_LastFileError());
+ 
+-    printf("attribute query status (unchanged)\n");
++    printf("attribute query status\n");
+     st = query("D:\\adx\\music_TITLE.adx");
+     check((uint32_t)st == 0xC0000034u, "missing file: NAME_NOT_FOUND", (unsigned)st);
+     st = query("D:\\media\\event\\CLIP0001.BIN");
+-    check((uint32_t)st == 0xC0000034u, "missing directory: NAME_NOT_FOUND too", (unsigned)st);
++    check((uint32_t)st == 0xC000003Au, "missing directory: PATH_NOT_FOUND", (unsigned)st);
+ 
+     printf("%s (%d failure%s)\n", failures ? "FAILED" : "OK", failures, failures == 1 ? "" : "s");
+     return failures ? 1 : 0;

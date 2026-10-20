@@ -1,0 +1,129 @@
+diff --git a/src/kernel/nv2a_pb_scan.c b/src/kernel/nv2a_pb_scan.c
+index e3a16e2..4471ff5 100644
+--- a/src/kernel/nv2a_pb_scan.c
++++ b/src/kernel/nv2a_pb_scan.c
+@@ -466,6 +466,10 @@ int nv2a_pb_dma_walk(void)
+ static int s_in_call;
+ int nv2a_pb_scan_in_call(void) { return s_in_call; }
+ 
++/* Where the JUMP that ended the last top-level segment pointed, or 0: the
++ * ring's wrap, for the caller to follow (nv2a_pb_scan_segment). */
++static uint32_t s_seg_jump;
++
+ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
+                                 uint32_t *jumps, uint32_t *unknown)
+ {
+@@ -481,8 +485,10 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
+             uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
+                                              : (w & 0x1FFFFFFCu);
+             (*jumps)++;
+-            if (!in_call)
++            if (!in_call) {
++                s_seg_jump = 0x80000000u | (target & 0x0FFFFFFFu);
+                 break;                        /* the ring: a jump ends it */
++            }
+             va = 0x80000000u | (target & 0x0FFFFFFFu);
+             end_va = va + 0x400000u;
+             continue;
+@@ -524,12 +530,15 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
+     return words;
+ }
+ 
+-void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
++/* Returns the guest VA the JUMP ending the segment pointed to, or 0 when the
++ * segment ran to end_va without one. */
++uint32_t nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
+ {
+     uint32_t words, jumps = 0, unknown = 0;
+ 
++    s_seg_jump = 0;
+     if (!pb_walk_enabled() || end_va <= start_va)
+-        return;
++        return 0;
+     if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
+         end_va = start_va + 0x400000u;
+ 
+@@ -543,4 +552,5 @@ void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
+     s_tot_unknown += unknown;
+     s_tot_jumps += jumps;
+     s_tot_segments++;
++    return s_seg_jump;
+ }
+diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
+index 0f3bf25..3497e99 100644
+--- a/src/kernel/xbox_memory_layout.c
++++ b/src/kernel/xbox_memory_layout.c
+@@ -1535,7 +1535,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+                      * guess. */
+                     extern void nv2a_pb_resync(uint32_t);
+                     extern int  nv2a_pb_dma_walk(void);
+-                    extern void nv2a_pb_scan_segment(uint32_t, uint32_t);
++                    extern uint32_t nv2a_pb_scan_segment(uint32_t, uint32_t);
+ 
+                     if (nv2a_pb_dma_walk()) {
+                         uint32_t get_now = *(volatile uint32_t *)
+@@ -1551,26 +1551,45 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+                         if (put != last_put)
+                             nv2a_pb_scan(put);
+                     } else {
+-                        /* The segment scan, the default: the bytes between
+-                         * the previous PUT and this one. The pushbuffer is a
+-                         * ring, so PUT coming back below where it was is a
+-                         * wrap, not a rewind; the ring's bounds are learned
+-                         * from the lowest and highest PUT seen. */
+-                        static uint32_t put_lo, put_hi;
++                        /* The segment scan, the default: the commands between
++                         * the previous PUT and this one, followed the way the
++                         * GPU fetches them. A JUMP ends a segment and the
++                         * walk resumes at its target, until PUT is reached:
++                         * D3D ends each lap of its ring with a JUMP to the
++                         * ring's start (which may lie past the last PUT, the
++                         * commands written but not yet kicked), and jumps out
++                         * of the ring into precompiled pushbuffers that jump
++                         * back. Past PUT, a segment is bounded by a JUMP
++                         * within 4 MB.
++                         *
++                         * The ring's start used to be taken as the lowest PUT
++                         * ever seen, and a JUMP out of the ring ended the
++                         * walk. D3D moves its ring when it resets the device
++                         * -- Conker's starts at 0x3000 and then at 0x01002000
++                         * -- so later wraps replayed the boot ring from
++                         * 0x3000, stale semaphore releases included, and
++                         * D3D's fence wait spun for ever. The lowest PUT is
++                         * now only the fallback for a wrap with no JUMP. */
++                        static uint32_t put_lo;
++                        uint32_t va     = XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu);
++                        uint32_t put_va = XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu);
+                         if (!put_lo || put < put_lo) put_lo = put;
+-                        if (put > put_hi) put_hi = put;
+-                        if (last_put && put > last_put) {
+-                            nv2a_pb_scan_segment(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
+-                                                 XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
+-                        } else if (last_put && put < last_put) {
+-                            if (put_hi > last_put)
+-                                nv2a_pb_scan_segment(
+-                                    XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
+-                                    XBOX_CONTIG_BASE | (put_hi   & 0x0FFFFFFFu));
+-                            if (put > put_lo)
+-                                nv2a_pb_scan_segment(
+-                                    XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
+-                                    XBOX_CONTIG_BASE | (put    & 0x0FFFFFFFu));
++                        if (last_put && put != last_put) {
++                            /* A JUMP back to where the walk began is a ring
++                             * D3D has left: at a device reset its old ring
++                             * still ends in a JUMP to its own start. */
++                            const uint32_t first = va;
++                            int hops;
++                            for (hops = 0; hops < 64 && va != put_va; hops++) {
++                                uint32_t end = va < put_va ? put_va : va + 0x400000u;
++                                uint32_t to = nv2a_pb_scan_segment(va, end);
++                                if (!to || to == first)
++                                    break;            /* reached PUT, lost, or a loop */
++                                va = to;
++                            }
++                            if (hops == 0 && put < last_put && put > put_lo)
++                                nv2a_pb_scan_segment(XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
++                                                     put_va);
+                         }
+                     }
+                     /* Periodic, because what the title submits at init is not

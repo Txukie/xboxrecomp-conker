@@ -19,6 +19,7 @@
 
 #include <xbox/xboxrecomp.h>
 #include "conker_host.h"
+#include "ohci.h"
 
 #define CONKER_ENTRY_POINT 0x0042F0E9u
 /* Used when neither argv[1] nor CONKER_GAME_DIR names the extracted disc. */
@@ -115,11 +116,17 @@ int main(int argc, char **argv)
      *   RECOMP_VBLANK        its GPU ISR (vector 3) needs vblank interrupts
      *   RECOMP_AC97_READY    DirectSound resets the AC'97 bus master and the
      *                        codec, and talks to the APU directly: this arms
-     *                        the AC'97 write trap and the emulated APU */
+     *                        the AC'97 write trap and the emulated APU
+     *   RECOMP_USB           XAPI drives the USB host controllers directly;
+     *                        the OHCI model is what lets it find a pad
+     *   RECOMP_KEYBOARD      the keyboard is pad 0 (Enter = START, Z = A),
+     *                        through the framebuffer window (RECOMP_FB_WINDOW) */
     conker_host_setenv_default("RECOMP_PB_EXEC", "1");
     conker_host_setenv_default("RECOMP_TITLE_KEVENTS", "1");
     conker_host_setenv_default("RECOMP_VBLANK", "paced");
     conker_host_setenv_default("RECOMP_AC97_READY", "1");
+    conker_host_setenv_default("RECOMP_USB", "1");
+    conker_host_setenv_default("RECOMP_KEYBOARD", "1");
 
     if (!game_dir || !*game_dir)
         game_dir = CONKER_DEFAULT_GAME_DIR;
@@ -146,6 +153,9 @@ int main(int argc, char **argv)
         return 1;
     }
     g_xbox_mem_offset = xbox_GetMemoryOffset();
+    /* The USB host controllers' registers are trapped once guest memory is
+     * mapped; nothing happens unless RECOMP_USB is set. */
+    xbox_OhciInit();
 
     /* The APU model and its register trap come as a pair (RECOMP_AC97_READY
      * unmaps the registers so they fault into the model). */
@@ -178,6 +188,7 @@ int main(int argc, char **argv)
     printf("[CONKER] starting at %08X, ESP=%08X\n", CONKER_ENTRY_POINT, g_esp);
     entry();
     printf("[CONKER] game entry point returned, eax=%08X\n", g_eax);
+    xbox_OhciReport();
 
     xbox_kernel_shutdown();
     xbox_MemoryLayoutShutdown();
