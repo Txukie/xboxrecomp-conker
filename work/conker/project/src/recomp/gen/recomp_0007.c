@@ -1,11 +1,97 @@
 /**
  * Conker - Recompiled code chunk 7
- * Functions: 250 (0x00084300 - 0x0009BDA0)
+ * Functions: 250 (0x00084260 - 0x0009B780)
  */
 
 #define RECOMP_GENERATED_CODE
 #include "recomp_funcs.h"
 #include <math.h>
+
+/**
+ * sub_00084260
+ * Original: 0x00084260 - 0x000842F8 (152 bytes, 41 insns)
+ * Category: game_render
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00084260(void)
+{
+    int _flags = 0; /* fallback flag var */
+    uint32_t _fa = 0, _fb = 0;
+    int32_t _fas = 0, _fbs = 0;
+    (void)_fa; (void)_fb; (void)_fas; (void)_fbs;
+
+loc_00084260: ;
+    _fa = (uint32_t)(eax) & 0xFFFFFFFFu; _fb = (uint32_t)(0) & 0xFFFFFFFFu;
+    _fas = (int32_t)(int32_t)(_fa); _fbs = (int32_t)(int32_t)(_fb); /* cmp eax, 0 (32-bit) */
+    if (CMP_NE(_fa, _fb)) goto loc_00084267; /* jne: not equal / not zero */
+
+loc_00084264: ;
+    SET_LO8(eax, 0); /* xor self */
+    _fa = (uint32_t)(LO8(eax)) & 0xFFu; _fas = (int32_t)(int8_t)(_fa); /* xor result */
+    esp += 4; return; /* ret */
+
+loc_00084267: ;
+    PUSH32(esp, ebx);
+    SET_LO8(ebx, MEM8(eax + ecx + 0x1E));
+    _fa = (uint32_t)(LO8(ebx)) & 0xFFu; _fb = (uint32_t)(0) & 0xFFu;
+    _fas = (int32_t)(int8_t)(_fa); _fbs = (int32_t)(int8_t)(_fb); /* cmp LO8(ebx), 0 (8-bit) */
+    PUSH32(esp, esi);
+    if (CMP_NE(_fa, _fb)) goto loc_0008427B; /* jne: not equal / not zero */
+
+loc_00084271: ;
+    _fa = (uint32_t)(edx) & 0xFFFFFFFFu; _fb = (uint32_t)(MEM32(eax + ecx * 4)) & 0xFFFFFFFFu;
+    _fas = (int32_t)(int32_t)(_fa); _fbs = (int32_t)(int32_t)(_fb); /* cmp edx, MEM32(eax + ecx * 4) (32-bit) */
+    if (CMP_NE(_fa, _fb)) goto loc_0008427B; /* jne: not equal / not zero */
+
+loc_00084276: ;
+    POP32(esp, esi);
+    SET_LO8(eax, 0); /* xor self */
+    _fa = (uint32_t)(LO8(eax)) & 0xFFu; _fas = (int32_t)(int8_t)(_fa); /* xor result */
+    POP32(esp, ebx);
+    esp += 4; return; /* ret */
+
+loc_0008427B: ;
+    SET_LO16(esi, MEM16(0x7F9F60));
+    MEM32(eax + ecx * 4) = edx;
+    MEM16(eax + ecx * 2 + 0x14) = LO16(esi);
+    MEM8(eax + ecx + 0x1E) = 0;
+    eax = MEM32(esp + 0xC);
+    edx = edx >> 0x18;
+    _fa = (uint32_t)(edx) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* shift result */
+    _fa = (uint32_t)(LO8(edx)) & 0xFFu; _fb = (uint32_t)(0xFF) & 0xFFu;
+    _fas = (int32_t)(int8_t)(_fa); _fbs = (int32_t)(int8_t)(_fb); /* cmp LO8(edx), 0xFF (8-bit) */
+    MEM32(0x84B828) = 0x84110;
+    MEM8(eax) = 1;
+    if (CMP_EQ(_fa, _fb)) goto loc_000842F3; /* je: equal / zero */
+
+loc_000842A8: ;
+    edx = 0x8006;
+    ecx = 0x40350;
+    PUSH32(esp, 0x000842B7u); RECOMP_ABI_CALL(0x00537990u, sub_00537990); /* call 0x00537990 */
+
+loc_000842B7: ;
+    edx = 0x302;
+    ecx = 0x40344;
+    MEM32(0x549B20) = 0x8006;
+    PUSH32(esp, 0x000842D0u); RECOMP_ABI_CALL(0x00537990u, sub_00537990); /* call 0x00537990 */
+
+loc_000842D0: ;
+    edx = 0x303;
+    ecx = 0x40348;
+    MEM32(0x549AF0) = 0x302;
+    PUSH32(esp, 0x000842E9u); RECOMP_ABI_CALL(0x00537990u, sub_00537990); /* call 0x00537990 */
+
+loc_000842E9: ;
+    MEM32(0x549AF4) = 0x303;
+
+loc_000842F3: ;
+    POP32(esp, esi);
+    SET_LO8(eax, 1);
+    POP32(esp, ebx);
+    esp += 4; return; /* ret */
+
+}
 
 /**
  * sub_00084300
@@ -49865,29 +49951,4 @@ loc_0009BD7C: ;
     #undef fp_top
     #undef fp_st
     #undef fp_st1
-}
-
-/**
- * sub_0009BDA0
- * Original: 0x0009BDA0 - 0x0009BDB0 (16 bytes, 6 insns)
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0009BDA0(void)
-{
-    int _flags = 0; /* fallback flag var */
-    uint32_t _fa = 0, _fb = 0;
-    int32_t _fas = 0, _fbs = 0;
-    (void)_fa; (void)_fb; (void)_fas; (void)_fbs;
-
-loc_0009BDA0: ;
-    ecx = MEM32(esp + 8);
-    edx = MEM32(esp + 0x10);
-    eax = 0; /* xor self */
-    _fa = (uint32_t)(eax) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* xor result */
-    _fa = (uint32_t)(ecx) & 0xFFFFFFFFu; _fb = (uint32_t)(edx) & 0xFFFFFFFFu;
-    _fas = (int32_t)(int32_t)(_fa); _fbs = (int32_t)(int32_t)(_fb); /* cmp ecx, edx (32-bit) */
-    SET_LO8(eax, (CMP_G(_fas, _fbs)) ? 1 : 0); /* setg */
-    esp += 4; return; /* ret */
-
 }

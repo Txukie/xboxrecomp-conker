@@ -1,0 +1,24 @@
+[
+  {
+    "start": "0x00016620",
+    "observed": true,
+    "note": "XACT file-I/O callback (wraps GetOverlappedResult 0x0042C319), installed with mov ebx, 0x16620 at 0x000162C0. Missed by the detector after the int3 padding that ends sub_000165C0; observed at runtime as an unresolved indirect-call target 4.3e9 times, which hung XACT after the loading screen."
+  },
+  {
+    "start": "0x00248670",
+    "note": "Function start after int3 padding, referenced as an immediate; swallowed by the preceding function."
+  },
+  {
+    "start": "0x002507B0",
+    "note": "Vtable thunk (mov eax,[ecx]; jmp [eax+8]) after int3 padding, referenced as an immediate."
+  },
+  {
+    "start": "0x003FA4F0",
+    "note": "Function start (push esi; mov esi,[esp+8]) after int3 padding, referenced as an immediate."
+  },
+  {
+    "start": "0x0015D6D0",
+    "observed": true,
+    "note": "Function start (mov ecx,[esp+4]) after a ret, in a gap no detected function covers; observed at runtime as an unresolved indirect-call target."
+  }
+]

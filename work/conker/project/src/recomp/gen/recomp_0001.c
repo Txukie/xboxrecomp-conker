@@ -1,11 +1,74 @@
 /**
  * Conker - Recompiled code chunk 1
- * Functions: 250 (0x00019B90 - 0x00024EB0)
+ * Functions: 250 (0x00019B40 - 0x00024E50)
  */
 
 #define RECOMP_GENERATED_CODE
 #include "recomp_funcs.h"
 #include <math.h>
+
+/**
+ * sub_00019B40
+ * Original: 0x00019B40 - 0x00019B8D (77 bytes, 26 insns)
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00019B40(void)
+{
+    int _flags = 0; /* fallback flag var */
+    uint32_t _fa = 0, _fb = 0;
+    int32_t _fas = 0, _fbs = 0;
+    (void)_fa; (void)_fb; (void)_fas; (void)_fbs;
+
+loc_00019B40: ;
+    eax = MEM32(esi + 0x10);
+    _fa = (uint32_t)(eax) & 0xFFFFFFFFu; _fb = (uint32_t)(0) & 0xFFFFFFFFu;
+    _fas = (int32_t)(int32_t)(_fa); _fbs = (int32_t)(int32_t)(_fb); /* cmp eax, 0 (32-bit) */
+    if (CMP_EQ(_fa, _fb)) goto loc_00019B8A; /* je: equal / zero */
+
+loc_00019B47: ;
+    SET_LO8(ecx, MEM8(esi + 0x154));
+    _fa = (uint32_t)(LO8(ecx)) & 0xFFu; _fb = (uint32_t)(0) & 0xFFu;
+    _fas = (int32_t)(int8_t)(_fa); _fbs = (int32_t)(int8_t)(_fb); /* cmp LO8(ecx), 0 (8-bit) */
+    if (CMP_NE(_fa, _fb)) goto loc_00019B87; /* jne: not equal / not zero */
+
+loc_00019B51: ;
+    ecx = MEM32(eax + 0x20);
+    edx = MEM32(eax + 0x18);
+    PUSH32(esp, edi);
+    edi = esi + 0xF0;
+    PUSH32(esp, edi);
+    PUSH32(esp, ecx);
+    PUSH32(esp, edx);
+    PUSH32(esp, 0x00019B66u); RECOMP_ABI_CALL(0x00400D90u, sub_00400D90); /* call 0x00400D90 */
+
+loc_00019B66: ;
+    SET_LO8(eax, MEM8(edi));
+    _fb = (uint32_t)(0xC) & 0xFFFFFFFFu; _fbs = (int32_t)(int32_t)(_fb); /* add source, before the write */
+    esp = esp + 0xC;
+    _fa = (uint32_t)(esp) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* add result */
+    _fa = (uint32_t)(LO8(eax)) & 0xFFu; _fb = (uint32_t)(1) & 0xFFu;
+    _fas = (int32_t)(int8_t)(_fa); _fbs = (int32_t)(int8_t)(_fb); /* test LO8(eax), 1 (8-bit) */
+    POP32(esp, edi);
+    if (TEST_NZ(_fa, _fb)) goto loc_00019B80; /* jne: not equal / not zero */
+
+loc_00019B70: ;
+    xmm0 = XMM_SCALAR(MEMF(0x59D944)); /* movss */
+    MEMF(esi + 0x144) = xmm0.f[0]; /* movss */
+
+loc_00019B80: ;
+    MEM8(esi + 0x154) = 1;
+
+loc_00019B87: ;
+    SET_LO8(eax, 1);
+    esp += 4; return; /* ret */
+
+loc_00019B8A: ;
+    SET_LO8(eax, 0); /* xor self */
+    _fa = (uint32_t)(LO8(eax)) & 0xFFu; _fas = (int32_t)(int8_t)(_fa); /* xor result */
+    esp += 4; return; /* ret */
+
+}
 
 /**
  * sub_00019B90
@@ -32684,52 +32747,6 @@ loc_00024E90: ;
     PUSH32(esp, 0x00024EABu); RECOMP_ABI_CALL(0x00022D90u, sub_00022D90); /* call 0x00022D90 */
 
 loc_00024EAB: ;
-    esp += 8; return; /* ret 4 */
-
-}
-
-/**
- * sub_00024EB0
- * Original: 0x00024EB0 - 0x00024EE1 (49 bytes, 18 insns)
- * CC: cdecl, 1 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_00024EB0(void)
-{
-    int _flags = 0; /* fallback flag var */
-    uint32_t _fa = 0, _fb = 0;
-    int32_t _fas = 0, _fbs = 0;
-    (void)_fa; (void)_fb; (void)_fas; (void)_fbs;
-
-loc_00024EB0: ;
-    _fa = (uint32_t)(ecx) & 0xFFFFFFFFu; _fb = (uint32_t)(0) & 0xFFFFFFFFu;
-    _fas = (int32_t)(int32_t)(_fa); _fbs = (int32_t)(int32_t)(_fb); /* cmp ecx, 0 (32-bit) */
-    if (CMP_NE(_fa, _fb)) goto loc_00024EBA; /* jne: not equal / not zero */
-
-loc_00024EB4: ;
-    eax = eax | 0xFFFFFFFFu;
-    _fa = (uint32_t)(eax) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* or result */
-    esp += 8; return; /* ret 4 */
-
-loc_00024EBA: ;
-    eax = MEM32(esp + 4);
-    PUSH32(esp, 0);
-    PUSH32(esp, 0);
-    PUSH32(esp, 0xFFFFFFFFu);
-    PUSH32(esp, 0xFFFFFFFFu);
-    PUSH32(esp, 0);
-    PUSH32(esp, 0);
-    PUSH32(esp, 4);
-    PUSH32(esp, eax);
-    ecx = ecx & 0x7FFF;
-    _fa = (uint32_t)(ecx) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* and result */
-    edx = edx | 0xFFFFFFFFu;
-    _fa = (uint32_t)(edx) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* or result */
-    eax = eax | 0xFFFFFFFFu;
-    _fa = (uint32_t)(eax) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* or result */
-    PUSH32(esp, 0x00024EDEu); RECOMP_ABI_CALL(0x00022D90u, sub_00022D90); /* call 0x00022D90 */
-
-loc_00024EDE: ;
     esp += 8; return; /* ret 4 */
 
 }

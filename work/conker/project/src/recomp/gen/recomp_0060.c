@@ -1,11 +1,83 @@
 /**
  * Conker - Recompiled code chunk 60
- * Functions: 250 (0x0047F129 - 0x0047FE80)
+ * Functions: 250 (0x0047F108 - 0x0047FE50)
  */
 
 #define RECOMP_GENERATED_CODE
 #include "recomp_funcs.h"
 #include <math.h>
+
+/**
+ * sub_0047F108
+ * Original: 0x0047F108 - 0x0047F113 (11 bytes, 3 insns)
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_0047F108(void)
+{
+    uint32_t ebp = 0;
+    ebp = g_ebp;  /* frameless: caller's frame */
+    uint32_t _fa = 0, _fb = 0;
+    int32_t _fas = 0, _fbs = 0;
+    (void)_fa; (void)_fb; (void)_fas; (void)_fbs;
+    ebp = g_seh_ebp; /* fpo_leaf: inherit caller's frame */
+
+loc_0047F108: ;
+    ecx = MEM32(ebp + -16);
+    _fb = (uint32_t)(4) & 0xFFFFFFFFu; _fbs = (int32_t)(int32_t)(_fb); /* add source, before the write */
+    ecx = ecx + 4;
+    _fa = (uint32_t)(ecx) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* add result */
+    g_seh_ebp = ebp; sub_00014900(); return; /* tail jmp 0x00014900 */
+
+}
+
+/**
+ * sub_0047F113
+ * Original: 0x0047F113 - 0x0047F11E (11 bytes, 3 insns)
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_0047F113(void)
+{
+    uint32_t ebp = 0;
+    ebp = g_ebp;  /* frameless: caller's frame */
+    uint32_t _fa = 0, _fb = 0;
+    int32_t _fas = 0, _fbs = 0;
+    (void)_fa; (void)_fb; (void)_fas; (void)_fbs;
+    ebp = g_seh_ebp; /* fpo_leaf: inherit caller's frame */
+
+loc_0047F113: ;
+    ecx = MEM32(ebp + -16);
+    _fb = (uint32_t)(0x20) & 0xFFFFFFFFu; _fbs = (int32_t)(int32_t)(_fb); /* add source, before the write */
+    ecx = ecx + 0x20;
+    _fa = (uint32_t)(ecx) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* add result */
+    g_seh_ebp = ebp; sub_00014900(); return; /* tail jmp 0x00014900 */
+
+}
+
+/**
+ * sub_0047F11E
+ * Original: 0x0047F11E - 0x0047F129 (11 bytes, 3 insns)
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_0047F11E(void)
+{
+    uint32_t ebp = 0;
+    ebp = g_ebp;  /* frameless: caller's frame */
+    uint32_t _fa = 0, _fb = 0;
+    int32_t _fas = 0, _fbs = 0;
+    (void)_fa; (void)_fb; (void)_fas; (void)_fbs;
+    ebp = g_seh_ebp; /* fpo_leaf: inherit caller's frame */
+
+loc_0047F11E: ;
+    ecx = MEM32(ebp + -16);
+    _fb = (uint32_t)(0x3C) & 0xFFFFFFFFu; _fbs = (int32_t)(int32_t)(_fb); /* add source, before the write */
+    ecx = ecx + 0x3C;
+    _fa = (uint32_t)(ecx) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* add result */
+    g_seh_ebp = ebp; sub_00014900(); return; /* tail jmp 0x00014900 */
+
+}
 
 /**
  * sub_0047F129
@@ -4605,60 +4677,6 @@ void sub_0047FE50(void)
 
 loc_0047FE50: ;
     eax = 0x64F330;
-    g_seh_ebp = ebp; sub_00471D41(); return; /* tail jmp 0x00471D41 */
-
-}
-
-/**
- * sub_0047FE60
- * Original: 0x0047FE60 - 0x0047FE6A (10 bytes, 2 insns)
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0047FE60(void)
-{
-    uint32_t ebp = 0;
-    ebp = g_ebp;  /* frameless: caller's frame */
-    ebp = g_seh_ebp; /* fpo_leaf: inherit caller's frame */
-
-loc_0047FE60: ;
-    eax = 0x64F3B4;
-    g_seh_ebp = ebp; sub_00471D41(); return; /* tail jmp 0x00471D41 */
-
-}
-
-/**
- * sub_0047FE70
- * Original: 0x0047FE70 - 0x0047FE7A (10 bytes, 2 insns)
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0047FE70(void)
-{
-    uint32_t ebp = 0;
-    ebp = g_ebp;  /* frameless: caller's frame */
-    ebp = g_seh_ebp; /* fpo_leaf: inherit caller's frame */
-
-loc_0047FE70: ;
-    eax = 0x64F404;
-    g_seh_ebp = ebp; sub_00471D41(); return; /* tail jmp 0x00471D41 */
-
-}
-
-/**
- * sub_0047FE80
- * Original: 0x0047FE80 - 0x0047FE8A (10 bytes, 2 insns)
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0047FE80(void)
-{
-    uint32_t ebp = 0;
-    ebp = g_ebp;  /* frameless: caller's frame */
-    ebp = g_seh_ebp; /* fpo_leaf: inherit caller's frame */
-
-loc_0047FE80: ;
-    eax = 0x64F488;
     g_seh_ebp = ebp; sub_00471D41(); return; /* tail jmp 0x00471D41 */
 
 }

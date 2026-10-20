@@ -5,7 +5,9 @@
 #
 #   --install    replace project/src/recomp/gen with the new output
 #                (otherwise it stays in work/conker/pipeline/gen to inspect)
-#   --seeds      pass seed_functions.json to the disassembler. Off by default:
+#   seed_callbacks.json (always passed) lists function starts the detector
+#                misses: callbacks after int3 padding, each with a note.
+#   --seeds      also pass seed_functions.json to the disassembler. Off by default:
 #                most of those seeds are mid-function continuations, which the
 #                current disassembler treats as function starts that truncate
 #                the function they sit in. The recompiler is run with
@@ -72,7 +74,8 @@ fi
 
 if run_from disasm; then
     log "disasm (.text + $code_sections)"
-    set -- --text-only --extra-sections "$code_sections"
+    set -- --text-only --extra-sections "$code_sections" \
+        --seed-functions "$here/seed_callbacks.json"
     [ $seeds -eq 1 ] && set -- "$@" --seed-functions "$here/seed_functions.json"
     "$py" -m tools.disasm "$xbe" --analysis-json "$analysis" "$@" -v \
         > "$stage_dir/disasm.log" 2>&1

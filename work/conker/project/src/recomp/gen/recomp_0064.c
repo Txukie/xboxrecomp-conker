@@ -1,11 +1,59 @@
 /**
  * Conker - Recompiled code chunk 64
- * Functions: 250 (0x00486020 - 0x004889C0)
+ * Functions: 250 (0x00485FF0 - 0x00488970)
  */
 
 #define RECOMP_GENERATED_CODE
 #include "recomp_funcs.h"
 #include <math.h>
+
+/**
+ * sub_00485FF0
+ * Original: 0x00485FF0 - 0x00485FFB (11 bytes, 2 insns)
+ * Category: game_vtable
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00485FF0(void)
+{
+
+loc_00485FF0: ;
+    MEM32(0x85E2EC) = 0xA;
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_00486000
+ * Original: 0x00486000 - 0x0048600B (11 bytes, 2 insns)
+ * Category: game_vtable
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00486000(void)
+{
+
+loc_00486000: ;
+    MEM32(0x85E2F0) = 0xA;
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_00486010
+ * Original: 0x00486010 - 0x0048601B (11 bytes, 2 insns)
+ * Category: game_vtable
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00486010(void)
+{
+
+loc_00486010: ;
+    MEM32(0x85E2F4) = 0xA;
+    esp += 4; return; /* ret */
+
+}
 
 /**
  * sub_00486020
@@ -5059,56 +5107,6 @@ void sub_00488970(void)
 loc_00488970: ;
     xmm0 = XMM_SCALAR(MEMF(0x648D70)); /* movss */
     MEMF(0x86EF68) = xmm0.f[0]; /* movss */
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_00488990
- * Original: 0x00488990 - 0x004889A1 (17 bytes, 3 insns)
- * Category: data_init
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_00488990(void)
-{
-
-loc_00488990: ;
-    xmm0 = XMM_SCALAR(MEMF(0x64B41C)); /* movss */
-    MEMF(0x86EF6C) = xmm0.f[0]; /* movss */
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_004889B0
- * Original: 0x004889B0 - 0x004889BB (11 bytes, 2 insns)
- * Category: game_vtable
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_004889B0(void)
-{
-
-loc_004889B0: ;
-    MEM32(0x86EF70) = 0xA;
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_004889C0
- * Original: 0x004889C0 - 0x004889D1 (17 bytes, 3 insns)
- * Category: data_init
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_004889C0(void)
-{
-
-loc_004889C0: ;
-    xmm0 = XMM_SCALAR(MEMF(0x648D70)); /* movss */
-    MEMF(0x86EF74) = xmm0.f[0]; /* movss */
     esp += 4; return; /* ret */
 
 }

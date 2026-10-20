@@ -27,13 +27,38 @@ static void conker_sub_0047C29B(void)
     g_esp += 12; /* ret 8 */
 }
 
+/* An indirect call to code the dispatch table does not know: usually a
+ * function start the disassembler missed (add it to seed_callbacks.json).
+ * Reported per address at the 1st, 10th, 100th... failure, like the
+ * not-code log below: a flat cap of 128 lines hid 0x00016620 failing 4.3e9
+ * times inside XACT's polling loop. */
 void recomp_icall_fail_log(uint32_t xbox_va)
 {
-    static unsigned int reports;
-    if (reports++ < 128) {
-        fprintf(stderr, "[CONKER][ICALL] unresolved target %08X (call %llu)\n",
-                xbox_va, (unsigned long long)g_icall_count);
+    enum { SLOTS = 32 };
+    static uint32_t seen[SLOTS];
+    static uint64_t hits[SLOTS];
+    static int count;
+    uint64_t n;
+    int i;
+
+    for (i = 0; i < count; i++)
+        if (seen[i] == xbox_va)
+            break;
+    if (i == count) {
+        if (count == SLOTS)
+            return;
+        seen[count] = xbox_va;
+        hits[count] = 0;
+        count++;
     }
+    n = ++hits[i];
+    while (n >= 10 && n % 10 == 0)
+        n /= 10;
+    if (n != 1)
+        return;
+    fprintf(stderr, "[CONKER][ICALL] unresolved target %08X failed %llu time(s) "
+            "(call %llu)\n", xbox_va, (unsigned long long)hits[i],
+            (unsigned long long)g_icall_count);
 }
 
 /* An indirect call whose target is not code (null or wild pointer). Skipped,
@@ -112,6 +137,31 @@ void sub_0053C190_enter(void)
         fprintf(stderr, "[CONKER][D3D] GPU semaphore at 0x%08X (device 0x%08X)\n",
                 semaphore, device);
     }
+}
+
+/* ── APU EP DSP heartbeat ─────────────────────────────────────────────────
+ *
+ * DirectSoundDoWork ends in sub_004C7FFF, which checks a word in the EP
+ * (encode processor) DSP's memory -- *[0x004E1C60], 0xFE85A018 in practice --
+ * for 0xCCCCCC, the signature the running EP program keeps there. Anything
+ * else means "the DSP died", and DirectSound restarts the whole audio
+ * pipeline: both AC'97 channels, both DSPs, a 10 ms stall (sub_004C7DBF,
+ * counted at [0x004E1634]). The toolkit's EP is a passthrough stub that runs
+ * no DSP code, so the signature never appears and Conker restarted audio on
+ * every DoWork (87 times in 110 s), stuck after its loading screen.
+ *
+ * Until the EP program is emulated, report it alive: write the signature
+ * where DirectSound will look, just before it looks. EP memory is plain RAM
+ * in the toolkit (only the APU registers are trapped). */
+#define CONKER_DSOUND_EP_ALIVE_PTR 0x004E1C60u
+#define CONKER_DSP_ALIVE_SIGNATURE 0x00CCCCCCu
+
+void sub_004C7FFF_enter(void)
+{
+    const uint32_t alive = MEM32(CONKER_DSOUND_EP_ALIVE_PTR);
+
+    if (alive >= 0xFE800000u && alive < 0xFE880000u)   /* inside the APU window */
+        MEM32(alive) = CONKER_DSP_ALIVE_SIGNATURE;
 }
 
 void conker_debug_string(uint32_t xbox_va)

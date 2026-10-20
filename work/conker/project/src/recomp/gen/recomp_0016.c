@@ -1,11 +1,87 @@
 /**
  * Conker - Recompiled code chunk 16
- * Functions: 250 (0x00140E57 - 0x00157590)
+ * Functions: 250 (0x00140DE0 - 0x00157570)
  */
 
 #define RECOMP_GENERATED_CODE
 #include "recomp_funcs.h"
 #include <math.h>
+
+/**
+ * sub_00140DE0
+ * Original: 0x00140DE0 - 0x00140E57 (119 bytes, 40 insns)
+ * CC: cdecl, 3 params, returns int_or_void
+ * Frame: standard_frame
+ */
+void sub_00140DE0(void)
+{
+    uint32_t ebp = 0;
+    ebp = g_ebp;  /* prologue saves caller's frame */
+    int _flags = 0; /* fallback flag var */
+    uint32_t _fa = 0, _fb = 0;
+    int32_t _fas = 0, _fbs = 0;
+    (void)_fa; (void)_fb; (void)_fas; (void)_fbs;
+
+loc_00140DE0: ;
+    PUSH32(esp, ebp);
+    ebp = esp;
+    g_ebp = ebp; /* publish frame for frameless callees */
+    g_seh_ebp = ebp;
+    PUSH32(esp, 0xFFFFFFFFu);
+    PUSH32(esp, 0x47F660);
+    eax = MEM32(XBOX_FS_BASE);
+    PUSH32(esp, eax);
+    MEM32(XBOX_FS_BASE) = esp;
+    _fb = (uint32_t)(0x10) & 0xFFFFFFFFu; _fbs = (int32_t)(int32_t)(_fb); /* sub source, before the write */
+    esp = esp - 0x10;
+    _fa = (uint32_t)(esp) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* sub result */
+    PUSH32(esp, ebx);
+    PUSH32(esp, esi);
+    PUSH32(esp, edi);
+    MEM32(ebp + -16) = esp;
+    PUSH32(esp, 0xFFFFFFFFu);
+    PUSH32(esp, 0x461);
+    PUSH32(esp, 0x606A34);
+    PUSH32(esp, 0x18);
+    g_ebp = ebp; /* frame stays current across calls */
+    g_seh_ebp = ebp;
+    PUSH32(esp, 0x00140E14u); RECOMP_ABI_CALL(0x002AF0E0u, sub_002AF0E0); /* call 0x002AF0E0 */
+
+loc_00140E14: ;
+    _fb = (uint32_t)(0x10) & 0xFFFFFFFFu; _fbs = (int32_t)(int32_t)(_fb); /* add source, before the write */
+    esp = esp + 0x10;
+    _fa = (uint32_t)(esp) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* add result */
+    esi = eax;
+    MEM32(ebp + -20) = esi;
+    MEM32(ebp + -4) = 0;
+    MEM32(ebp + -28) = esi;
+    _fa = (uint32_t)(esi) & 0xFFFFFFFFu; _fb = (uint32_t)(0) & 0xFFFFFFFFu;
+    _fas = (int32_t)(int32_t)(_fa); _fbs = (int32_t)(int32_t)(_fb); /* cmp esi, 0 (32-bit) */
+    if (CMP_EQ(_fa, _fb)) goto loc_00140E3B; /* je: equal / zero */
+
+loc_00140E2A: ;
+    eax = MEM32(ebp + 0xC);
+    PUSH32(esp, eax);
+    ecx = MEM32(ebp + 0x10);
+    edx = MEM32(ebp + 8);
+    eax = esi;
+    g_ebp = ebp; /* frame stays current across calls */
+    g_seh_ebp = ebp;
+    PUSH32(esp, 0x00140E3Bu); RECOMP_ABI_CALL(0x00140F10u, sub_00140F10); /* call 0x00140F10 */
+
+loc_00140E3B: ;
+    MEM32(ebp + -4) = 0xFFFFFFFFu;
+    eax = esi;
+    ecx = MEM32(ebp + -12);
+    MEM32(XBOX_FS_BASE) = ecx;
+    POP32(esp, edi);
+    POP32(esp, esi);
+    POP32(esp, ebx);
+    esp = ebp;
+    POP32(esp, ebp);
+    esp += 16; return; /* ret 12 */
+
+}
 
 /**
  * sub_00140E57
@@ -39983,45 +40059,6 @@ loc_00157589: ;
     _fb = (uint32_t)(4) & 0xFFFFFFFFu; _fbs = (int32_t)(int32_t)(_fb); /* add source, before the write */
     esp = esp + 4;
     _fa = (uint32_t)(esp) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* add result */
-    POP32(esp, edi);
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_00157590
- * Original: 0x00157590 - 0x001575B2 (34 bytes, 12 insns)
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_00157590(void)
-{
-    uint32_t ebp = 0;
-    ebp = g_ebp;  /* frameless: caller's frame */
-    int _flags = 0; /* fallback flag var */
-    uint32_t _fa = 0, _fb = 0;
-    int32_t _fas = 0, _fbs = 0;
-    (void)_fa; (void)_fb; (void)_fas; (void)_fbs;
-    ebp = g_seh_ebp; /* fpo_leaf: inherit caller's frame */
-
-loc_00157590: ;
-    PUSH32(esp, edi);
-    edi = MEM32(esp + 8);
-    PUSH32(esp, 0x0015759Au); RECOMP_ABI_CALL(0x001575E0u, sub_001575E0); /* call 0x001575E0 */
-
-loc_0015759A: ;
-    SET_LO8(eax, MEM8(0x8472BD));
-    _fa = (uint32_t)(LO8(eax)) & 0xFFu; _fb = (uint32_t)(0) & 0xFFu;
-    _fas = (int32_t)(int8_t)(_fa); _fbs = (int32_t)(int8_t)(_fb); /* cmp LO8(eax), 0 (8-bit) */
-    if (CMP_NE(_fa, _fb)) goto loc_001575B0; /* jne: not equal / not zero */
-
-loc_001575A3: ;
-    eax = edi;
-    edx = 1;
-    POP32(esp, edi);
-    g_seh_ebp = ebp; sub_000DA5E0(); return; /* tail jmp 0x000DA5E0 */
-
-loc_001575B0: ;
     POP32(esp, edi);
     esp += 4; return; /* ret */
 

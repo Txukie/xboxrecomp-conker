@@ -1,11 +1,61 @@
 /**
  * Conker - Recompiled code chunk 65
- * Functions: 250 (0x004889E0 - 0x0048AC60)
+ * Functions: 250 (0x00488990 - 0x0048AC10)
  */
 
 #define RECOMP_GENERATED_CODE
 #include "recomp_funcs.h"
 #include <math.h>
+
+/**
+ * sub_00488990
+ * Original: 0x00488990 - 0x004889A1 (17 bytes, 3 insns)
+ * Category: data_init
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00488990(void)
+{
+
+loc_00488990: ;
+    xmm0 = XMM_SCALAR(MEMF(0x64B41C)); /* movss */
+    MEMF(0x86EF6C) = xmm0.f[0]; /* movss */
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_004889B0
+ * Original: 0x004889B0 - 0x004889BB (11 bytes, 2 insns)
+ * Category: game_vtable
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_004889B0(void)
+{
+
+loc_004889B0: ;
+    MEM32(0x86EF70) = 0xA;
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_004889C0
+ * Original: 0x004889C0 - 0x004889D1 (17 bytes, 3 insns)
+ * Category: data_init
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_004889C0(void)
+{
+
+loc_004889C0: ;
+    xmm0 = XMM_SCALAR(MEMF(0x648D70)); /* movss */
+    MEMF(0x86EF74) = xmm0.f[0]; /* movss */
+    esp += 4; return; /* ret */
+
+}
 
 /**
  * sub_004889E0
@@ -4568,56 +4618,6 @@ void sub_0048AC10(void)
 
 loc_0048AC10: ;
     MEM32(0x86F698) = 0xA;
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048AC20
- * Original: 0x0048AC20 - 0x0048AC31 (17 bytes, 3 insns)
- * Category: data_init
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048AC20(void)
-{
-
-loc_0048AC20: ;
-    xmm0 = XMM_SCALAR(MEMF(0x648D70)); /* movss */
-    MEMF(0x86F69C) = xmm0.f[0]; /* movss */
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048AC40
- * Original: 0x0048AC40 - 0x0048AC51 (17 bytes, 3 insns)
- * Category: data_init
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048AC40(void)
-{
-
-loc_0048AC40: ;
-    xmm0 = XMM_SCALAR(MEMF(0x64B41C)); /* movss */
-    MEMF(0x86F6A0) = xmm0.f[0]; /* movss */
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048AC60
- * Original: 0x0048AC60 - 0x0048AC6B (11 bytes, 2 insns)
- * Category: game_vtable
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048AC60(void)
-{
-
-loc_0048AC60: ;
-    MEM32(0x86F6A4) = 0xA;
     esp += 4; return; /* ret */
 
 }

@@ -1,11 +1,57 @@
 /**
  * Conker - Recompiled code chunk 2
- * Functions: 250 (0x00024EF0 - 0x00032630)
+ * Functions: 250 (0x00024EB0 - 0x00032620)
  */
 
 #define RECOMP_GENERATED_CODE
 #include "recomp_funcs.h"
 #include <math.h>
+
+/**
+ * sub_00024EB0
+ * Original: 0x00024EB0 - 0x00024EE1 (49 bytes, 18 insns)
+ * CC: cdecl, 1 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00024EB0(void)
+{
+    int _flags = 0; /* fallback flag var */
+    uint32_t _fa = 0, _fb = 0;
+    int32_t _fas = 0, _fbs = 0;
+    (void)_fa; (void)_fb; (void)_fas; (void)_fbs;
+
+loc_00024EB0: ;
+    _fa = (uint32_t)(ecx) & 0xFFFFFFFFu; _fb = (uint32_t)(0) & 0xFFFFFFFFu;
+    _fas = (int32_t)(int32_t)(_fa); _fbs = (int32_t)(int32_t)(_fb); /* cmp ecx, 0 (32-bit) */
+    if (CMP_NE(_fa, _fb)) goto loc_00024EBA; /* jne: not equal / not zero */
+
+loc_00024EB4: ;
+    eax = eax | 0xFFFFFFFFu;
+    _fa = (uint32_t)(eax) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* or result */
+    esp += 8; return; /* ret 4 */
+
+loc_00024EBA: ;
+    eax = MEM32(esp + 4);
+    PUSH32(esp, 0);
+    PUSH32(esp, 0);
+    PUSH32(esp, 0xFFFFFFFFu);
+    PUSH32(esp, 0xFFFFFFFFu);
+    PUSH32(esp, 0);
+    PUSH32(esp, 0);
+    PUSH32(esp, 4);
+    PUSH32(esp, eax);
+    ecx = ecx & 0x7FFF;
+    _fa = (uint32_t)(ecx) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* and result */
+    edx = edx | 0xFFFFFFFFu;
+    _fa = (uint32_t)(edx) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* or result */
+    eax = eax | 0xFFFFFFFFu;
+    _fa = (uint32_t)(eax) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* or result */
+    PUSH32(esp, 0x00024EDEu); RECOMP_ABI_CALL(0x00022D90u, sub_00022D90); /* call 0x00022D90 */
+
+loc_00024EDE: ;
+    esp += 8; return; /* ret 4 */
+
+}
 
 /**
  * sub_00024EF0
@@ -39736,21 +39782,5 @@ loc_00032620: ;
     SET_LO8(eax, 0); /* xor self */
     _fa = (uint32_t)(LO8(eax)) & 0xFFu; _fas = (int32_t)(int8_t)(_fa); /* xor result */
     esp += 12; return; /* ret 8 */
-
-}
-
-/**
- * sub_00032630
- * Original: 0x00032630 - 0x0003263A (10 bytes, 2 insns)
- * Category: game_vtable
- * CC: thiscall, 1 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_00032630(void)
-{
-
-loc_00032630: ;
-    MEM8(ecx + 0x94) = 0;
-    esp += 8; return; /* ret 4 */
 
 }

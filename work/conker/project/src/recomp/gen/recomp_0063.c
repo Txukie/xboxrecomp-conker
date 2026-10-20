@@ -1,11 +1,59 @@
 /**
  * Conker - Recompiled code chunk 63
- * Functions: 250 (0x00484A90 - 0x00486010)
+ * Functions: 250 (0x00484A60 - 0x00485FE0)
  */
 
 #define RECOMP_GENERATED_CODE
 #include "recomp_funcs.h"
 #include <math.h>
+
+/**
+ * sub_00484A60
+ * Original: 0x00484A60 - 0x00484A6B (11 bytes, 2 insns)
+ * Category: game_vtable
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00484A60(void)
+{
+
+loc_00484A60: ;
+    MEM32(0x85DF00) = 0xA;
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_00484A70
+ * Original: 0x00484A70 - 0x00484A7B (11 bytes, 2 insns)
+ * Category: game_vtable
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00484A70(void)
+{
+
+loc_00484A70: ;
+    MEM32(0x85DF04) = 0xA;
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_00484A80
+ * Original: 0x00484A80 - 0x00484A8B (11 bytes, 2 insns)
+ * Category: game_vtable
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00484A80(void)
+{
+
+loc_00484A80: ;
+    MEM32(0x85DF08) = 0xA;
+    esp += 4; return; /* ret */
+
+}
 
 /**
  * sub_00484A90
@@ -4052,54 +4100,6 @@ void sub_00485FE0(void)
 
 loc_00485FE0: ;
     MEM32(0x85E2E8) = 0xA;
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_00485FF0
- * Original: 0x00485FF0 - 0x00485FFB (11 bytes, 2 insns)
- * Category: game_vtable
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_00485FF0(void)
-{
-
-loc_00485FF0: ;
-    MEM32(0x85E2EC) = 0xA;
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_00486000
- * Original: 0x00486000 - 0x0048600B (11 bytes, 2 insns)
- * Category: game_vtable
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_00486000(void)
-{
-
-loc_00486000: ;
-    MEM32(0x85E2F0) = 0xA;
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_00486010
- * Original: 0x00486010 - 0x0048601B (11 bytes, 2 insns)
- * Category: game_vtable
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_00486010(void)
-{
-
-loc_00486010: ;
-    MEM32(0x85E2F4) = 0xA;
     esp += 4; return; /* ret */
 
 }

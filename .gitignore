@@ -52,3 +52,6 @@ work/conker/pipeline/
 
 # Python virtualenv for the xboxrecomp tools
 work/conker/.venv/
+
+# Screenshots of the game (copyrighted content): local only, never committed
+work/conker/screenshots/

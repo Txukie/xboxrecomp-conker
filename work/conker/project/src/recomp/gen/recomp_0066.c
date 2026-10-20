@@ -1,11 +1,61 @@
 /**
  * Conker - Recompiled code chunk 66
- * Functions: 250 (0x0048AC70 - 0x0048C520)
+ * Functions: 250 (0x0048AC20 - 0x0048C4F0)
  */
 
 #define RECOMP_GENERATED_CODE
 #include "recomp_funcs.h"
 #include <math.h>
+
+/**
+ * sub_0048AC20
+ * Original: 0x0048AC20 - 0x0048AC31 (17 bytes, 3 insns)
+ * Category: data_init
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_0048AC20(void)
+{
+
+loc_0048AC20: ;
+    xmm0 = XMM_SCALAR(MEMF(0x648D70)); /* movss */
+    MEMF(0x86F69C) = xmm0.f[0]; /* movss */
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_0048AC40
+ * Original: 0x0048AC40 - 0x0048AC51 (17 bytes, 3 insns)
+ * Category: data_init
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_0048AC40(void)
+{
+
+loc_0048AC40: ;
+    xmm0 = XMM_SCALAR(MEMF(0x64B41C)); /* movss */
+    MEMF(0x86F6A0) = xmm0.f[0]; /* movss */
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_0048AC60
+ * Original: 0x0048AC60 - 0x0048AC6B (11 bytes, 2 insns)
+ * Category: game_vtable
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_0048AC60(void)
+{
+
+loc_0048AC60: ;
+    MEM32(0x86F6A4) = 0xA;
+    esp += 4; return; /* ret */
+
+}
 
 /**
  * sub_0048AC70
@@ -4320,86 +4370,6 @@ loc_0048C4F0: ;
 
 loc_0048C4FB: ;
     POP32(esp, esi);
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048C500
- * Original: 0x0048C500 - 0x0048C50D (13 bytes, 5 insns)
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048C500(void)
-{
-
-loc_0048C500: ;
-    PUSH32(esp, esi);
-    esi = 0x84EB9C;
-    PUSH32(esp, 0x0048C50Bu); RECOMP_ABI_CALL(0x00082CB0u, sub_00082CB0); /* call 0x00082CB0 */
-
-loc_0048C50B: ;
-    POP32(esp, esi);
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048C510
- * Original: 0x0048C510 - 0x0048C51D (13 bytes, 5 insns)
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048C510(void)
-{
-
-loc_0048C510: ;
-    PUSH32(esp, esi);
-    esi = 0x87A1C8;
-    PUSH32(esp, 0x0048C51Bu); RECOMP_ABI_CALL(0x00084980u, sub_00084980); /* call 0x00084980 */
-
-loc_0048C51B: ;
-    POP32(esp, esi);
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048C520
- * Original: 0x0048C520 - 0x0048C559 (57 bytes, 14 insns)
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048C520(void)
-{
-    int _flags = 0; /* fallback flag var */
-    uint32_t _fa = 0, _fb = 0;
-    int32_t _fas = 0, _fbs = 0;
-    (void)_fa; (void)_fb; (void)_fas; (void)_fbs;
-
-loc_0048C520: ;
-    PUSH32(esp, ecx);
-    eax = MEM32(0x84EC00);
-    _fa = (uint32_t)(eax) & 0xFFFFFFFFu; _fb = (uint32_t)(0) & 0xFFFFFFFFu;
-    _fas = (int32_t)(int32_t)(_fa); _fbs = (int32_t)(int32_t)(_fb); /* cmp eax, 0 (32-bit) */
-    if (CMP_EQ(_fa, _fb)) goto loc_0048C539; /* je: equal / zero */
-
-loc_0048C52A: ;
-    MEM32(esp) = eax;
-    eax = esp;
-    PUSH32(esp, eax);
-    PUSH32(esp, 0x0048C536u); RECOMP_ABI_CALL(0x002AF1C0u, sub_002AF1C0); /* call 0x002AF1C0 */
-
-loc_0048C536: ;
-    _fb = (uint32_t)(4) & 0xFFFFFFFFu; _fbs = (int32_t)(int32_t)(_fb); /* add source, before the write */
-    esp = esp + 4;
-    _fa = (uint32_t)(esp) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* add result */
-
-loc_0048C539: ;
-    MEM32(0x84EC00) = 0;
-    MEM32(0x84EC04) = 0;
-    MEM32(0x84EC08) = 0;
-    POP32(esp, ecx);
     esp += 4; return; /* ret */
 
 }

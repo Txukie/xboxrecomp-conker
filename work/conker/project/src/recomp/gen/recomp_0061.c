@@ -1,11 +1,65 @@
 /**
  * Conker - Recompiled code chunk 61
- * Functions: 250 (0x0047FE8A - 0x00483610)
+ * Functions: 250 (0x0047FE60 - 0x004835D0)
  */
 
 #define RECOMP_GENERATED_CODE
 #include "recomp_funcs.h"
 #include <math.h>
+
+/**
+ * sub_0047FE60
+ * Original: 0x0047FE60 - 0x0047FE6A (10 bytes, 2 insns)
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_0047FE60(void)
+{
+    uint32_t ebp = 0;
+    ebp = g_ebp;  /* frameless: caller's frame */
+    ebp = g_seh_ebp; /* fpo_leaf: inherit caller's frame */
+
+loc_0047FE60: ;
+    eax = 0x64F3B4;
+    g_seh_ebp = ebp; sub_00471D41(); return; /* tail jmp 0x00471D41 */
+
+}
+
+/**
+ * sub_0047FE70
+ * Original: 0x0047FE70 - 0x0047FE7A (10 bytes, 2 insns)
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_0047FE70(void)
+{
+    uint32_t ebp = 0;
+    ebp = g_ebp;  /* frameless: caller's frame */
+    ebp = g_seh_ebp; /* fpo_leaf: inherit caller's frame */
+
+loc_0047FE70: ;
+    eax = 0x64F404;
+    g_seh_ebp = ebp; sub_00471D41(); return; /* tail jmp 0x00471D41 */
+
+}
+
+/**
+ * sub_0047FE80
+ * Original: 0x0047FE80 - 0x0047FE8A (10 bytes, 2 insns)
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_0047FE80(void)
+{
+    uint32_t ebp = 0;
+    ebp = g_ebp;  /* frameless: caller's frame */
+    ebp = g_seh_ebp; /* fpo_leaf: inherit caller's frame */
+
+loc_0047FE80: ;
+    eax = 0x64F488;
+    g_seh_ebp = ebp; sub_00471D41(); return; /* tail jmp 0x00471D41 */
+
+}
 
 /**
  * sub_0047FE8A
@@ -5637,56 +5691,6 @@ void sub_004835D0(void)
 
 loc_004835D0: ;
     MEM32(0x85CF08) = 0xA;
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_004835E0
- * Original: 0x004835E0 - 0x004835EB (11 bytes, 2 insns)
- * Category: game_vtable
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_004835E0(void)
-{
-
-loc_004835E0: ;
-    MEM32(0x85CF0C) = 0xA;
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_004835F0
- * Original: 0x004835F0 - 0x00483601 (17 bytes, 3 insns)
- * Category: data_init
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_004835F0(void)
-{
-
-loc_004835F0: ;
-    xmm0 = XMM_SCALAR(MEMF(0x648D70)); /* movss */
-    MEMF(0x85CF10) = xmm0.f[0]; /* movss */
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_00483610
- * Original: 0x00483610 - 0x00483621 (17 bytes, 3 insns)
- * Category: data_init
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_00483610(void)
-{
-
-loc_00483610: ;
-    xmm0 = XMM_SCALAR(MEMF(0x64B41C)); /* movss */
-    MEMF(0x85CF14) = xmm0.f[0]; /* movss */
     esp += 4; return; /* ret */
 
 }

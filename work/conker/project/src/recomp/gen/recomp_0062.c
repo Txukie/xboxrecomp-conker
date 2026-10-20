@@ -1,11 +1,61 @@
 /**
  * Conker - Recompiled code chunk 62
- * Functions: 250 (0x00483630 - 0x00484A80)
+ * Functions: 250 (0x004835E0 - 0x00484A50)
  */
 
 #define RECOMP_GENERATED_CODE
 #include "recomp_funcs.h"
 #include <math.h>
+
+/**
+ * sub_004835E0
+ * Original: 0x004835E0 - 0x004835EB (11 bytes, 2 insns)
+ * Category: game_vtable
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_004835E0(void)
+{
+
+loc_004835E0: ;
+    MEM32(0x85CF0C) = 0xA;
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_004835F0
+ * Original: 0x004835F0 - 0x00483601 (17 bytes, 3 insns)
+ * Category: data_init
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_004835F0(void)
+{
+
+loc_004835F0: ;
+    xmm0 = XMM_SCALAR(MEMF(0x648D70)); /* movss */
+    MEMF(0x85CF10) = xmm0.f[0]; /* movss */
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_00483610
+ * Original: 0x00483610 - 0x00483621 (17 bytes, 3 insns)
+ * Category: data_init
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00483610(void)
+{
+
+loc_00483610: ;
+    xmm0 = XMM_SCALAR(MEMF(0x64B41C)); /* movss */
+    MEMF(0x85CF14) = xmm0.f[0]; /* movss */
+    esp += 4; return; /* ret */
+
+}
 
 /**
  * sub_00483630
@@ -4091,54 +4141,6 @@ void sub_00484A50(void)
 
 loc_00484A50: ;
     MEM32(0x85DEFC) = 0xA;
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_00484A60
- * Original: 0x00484A60 - 0x00484A6B (11 bytes, 2 insns)
- * Category: game_vtable
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_00484A60(void)
-{
-
-loc_00484A60: ;
-    MEM32(0x85DF00) = 0xA;
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_00484A70
- * Original: 0x00484A70 - 0x00484A7B (11 bytes, 2 insns)
- * Category: game_vtable
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_00484A70(void)
-{
-
-loc_00484A70: ;
-    MEM32(0x85DF04) = 0xA;
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_00484A80
- * Original: 0x00484A80 - 0x00484A8B (11 bytes, 2 insns)
- * Category: game_vtable
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_00484A80(void)
-{
-
-loc_00484A80: ;
-    MEM32(0x85DF08) = 0xA;
     esp += 4; return; /* ret */
 
 }

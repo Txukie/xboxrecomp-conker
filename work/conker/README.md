@@ -21,13 +21,17 @@ en `external/xboxrecomp` y fijado a una versión publicada (ahora v0.15.0).
   GPU recibe vblanks, D3D8LTCG dibuja el logo y la pantalla de carga completa
   (rasterizador por CPU del ejecutor), la caché `Z:` se llena desde el DVD y
   DirectSound arranca con el APU emulado (audio por SDL2).
-- Bloqueo actual: la pantalla de carga llega al final de la barra y el motor
-  XACT queda esperando lecturas asíncronas (`GetOverlappedResult` en
-  `0x0042C319`), aunque `NtReadFile` las completa al momento.
-- Seis correcciones del runtime que upstream aún no tiene están en
+- Tras la carga se reproduce el vídeo de introducción (`BootIntro.xmv`) sin
+  fallos durante al menos 5 minutos. Pendiente: los fotogramas del vídeo se
+  ven sobreexpuestos y con bloques (decodificador de vídeo).
+- Ajustes propios de Conker en `project/src/recomp_manual.c`: semáforo de la
+  GPU de D3D, latido del DSP EP para DirectSound; y en `seed_callbacks.json`,
+  funciones que el detector no ve (callbacks tras relleno `int3`).
+- Siete correcciones del runtime que upstream aún no tiene están en
   `patches/xboxrecomp/` (ventana del invitado, `NtQueryVirtualMemory`, saltos
   tras `sub` de 8/16 bits, `PATH_NOT_FOUND`, mayúsculas/minúsculas en POSIX,
-  decodificador MMIO x86-64 en POSIX); CMake las aplica al submódulo.
+  decodificador MMIO x86-64 en POSIX, tamaño de `KDPC`); CMake las aplica al
+  submódulo.
 
 ## Preparar el juego
 
