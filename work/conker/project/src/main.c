@@ -96,44 +96,27 @@ static int load_file(const char *path, void **data_out, size_t *size_out)
     return 1;
 }
 
-int main(int argc, char **argv)
+#if !defined(_WIN32)
+/* src/video/fb_present_sdl.c. With RECOMP_FB_WINDOW set it opens the SDL
+ * window on the process main thread (where macOS requires it) and runs the
+ * boot on a second thread; otherwise it calls the boot directly. The Win32
+ * window runs on a thread of its own instead (xbox_FramebufferWindowStart). */
+extern int xbox_HostWindowMain(int (*guest_main)(void));
+#endif
+
+static const char *s_game_dir;
+static const char *s_save_path;
+
+/* Everything from the XBE to the entry point, on the thread that runs the
+ * guest: its registers are thread-local, so ESP is set here. */
+static int conker_boot(void)
 {
-    const char *game_dir = argc > 1 ? argv[1] : getenv("CONKER_GAME_DIR");
-    const char *save_path = argc > 2 ? argv[2] : getenv("CONKER_SAVE_DIR");
+    const char *game_dir = s_game_dir, *save_path = s_save_path;
     char xbe_path[MAX_PATH];
-    char default_save[MAX_PATH];
     void *xbe_data = NULL;
     size_t xbe_size = 0;
     recomp_func_t entry;
 
-    setvbuf(stdout, NULL, _IONBF, 0);
-    setvbuf(stderr, NULL, _IONBF, 0);
-    conker_host_install_fault_handler();
-
-    /* Toolkit switches Conker needs; any can be overridden from outside.
-     *   RECOMP_PB_EXEC       D3D8LTCG frames only exist as push buffers
-     *   RECOMP_TITLE_KEVENTS D3D waits on a KEVENT it builds itself (0x5492FC)
-     *   RECOMP_VBLANK        its GPU ISR (vector 3) needs vblank interrupts
-     *   RECOMP_AC97_READY    DirectSound resets the AC'97 bus master and the
-     *                        codec, and talks to the APU directly: this arms
-     *                        the AC'97 write trap and the emulated APU
-     *   RECOMP_USB           XAPI drives the USB host controllers directly;
-     *                        the OHCI model is what lets it find a pad
-     *   RECOMP_KEYBOARD      the keyboard is pad 0 (Enter = START, Z = A),
-     *                        through the framebuffer window (RECOMP_FB_WINDOW) */
-    conker_host_setenv_default("RECOMP_PB_EXEC", "1");
-    conker_host_setenv_default("RECOMP_TITLE_KEVENTS", "1");
-    conker_host_setenv_default("RECOMP_VBLANK", "paced");
-    conker_host_setenv_default("RECOMP_AC97_READY", "1");
-    conker_host_setenv_default("RECOMP_USB", "1");
-    conker_host_setenv_default("RECOMP_KEYBOARD", "1");
-
-    if (!game_dir || !*game_dir)
-        game_dir = CONKER_DEFAULT_GAME_DIR;
-    if (!save_path || !*save_path) {
-        conker_host_default_save_dir(default_save, sizeof(default_save));
-        save_path = default_save;
-    }
     if (snprintf(xbe_path, sizeof(xbe_path), "%s/default.xbe", game_dir) < 0)
         return 1;
 
@@ -194,4 +177,48 @@ int main(int argc, char **argv)
     xbox_MemoryLayoutShutdown();
     free(xbe_data);
     return 0;
+}
+
+int main(int argc, char **argv)
+{
+    static char default_save[MAX_PATH];
+
+    s_game_dir = argc > 1 ? argv[1] : getenv("CONKER_GAME_DIR");
+    s_save_path = argc > 2 ? argv[2] : getenv("CONKER_SAVE_DIR");
+
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    conker_host_install_fault_handler();
+
+    /* Toolkit switches Conker needs; any can be overridden from outside.
+     *   RECOMP_PB_EXEC       D3D8LTCG frames only exist as push buffers
+     *   RECOMP_TITLE_KEVENTS D3D waits on a KEVENT it builds itself (0x5492FC)
+     *   RECOMP_VBLANK        its GPU ISR (vector 3) needs vblank interrupts
+     *   RECOMP_AC97_READY    DirectSound resets the AC'97 bus master and the
+     *                        codec, and talks to the APU directly: this arms
+     *                        the AC'97 write trap and the emulated APU
+     *   RECOMP_USB           XAPI drives the USB host controllers directly;
+     *                        the OHCI model is what lets it find a pad
+     *   RECOMP_KEYBOARD      the keyboard is pad 0 (Enter = START, Z = A),
+     *                        through the framebuffer window (RECOMP_FB_WINDOW),
+     *                        which also reads SDL game controllers */
+    conker_host_setenv_default("RECOMP_PB_EXEC", "1");
+    conker_host_setenv_default("RECOMP_TITLE_KEVENTS", "1");
+    conker_host_setenv_default("RECOMP_VBLANK", "paced");
+    conker_host_setenv_default("RECOMP_AC97_READY", "1");
+    conker_host_setenv_default("RECOMP_USB", "1");
+    conker_host_setenv_default("RECOMP_KEYBOARD", "1");
+
+    if (!s_game_dir || !*s_game_dir)
+        s_game_dir = CONKER_DEFAULT_GAME_DIR;
+    if (!s_save_path || !*s_save_path) {
+        conker_host_default_save_dir(default_save, sizeof(default_save));
+        s_save_path = default_save;
+    }
+
+#if defined(_WIN32)
+    return conker_boot();
+#else
+    return xbox_HostWindowMain(conker_boot);
+#endif
 }

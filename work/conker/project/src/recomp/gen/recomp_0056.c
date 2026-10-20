@@ -37015,7 +37015,7 @@ void sub_00459020(void)
 
 loc_00459020: ;
     fp_push(MEMF(esp + 4)); /* fld float */
-    /* FPU: fxtract  */
+    { double _x = fp_top(), _s, _e; int _k; if (_x == 0.0) { _e = -INFINITY; _s = _x; } else if (isinf(_x)) { _e = INFINITY; _s = _x; } else if (_x != _x) { _e = _s = _x; } else { _s = frexp(_x, &_k) * 2.0; _e = (double)(_k - 1); } fp_top() = _e; fp_push(_s); } /* fxtract */
     fp_st1() = RECOMP_FP_PC(fp_st1() + fp_top()); fp_pop(); /* faddp st(1) */
     fp_push(1.0); /* fld1 */
     fp_st1() = RECOMP_FP_PC(fp_st1() - fp_top()); fp_pop(); /* fsubp st(1) */

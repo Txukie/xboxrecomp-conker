@@ -25455,7 +25455,7 @@ loc_003E2E60: ;
     if (recomp_fp_trig_in_range(fp_top())) { double _c; fp_top() = recomp_x87_sincos(fp_top(), &_c); fp_push(_c); } /* fsincos */
     MEMF(esp + 0xC) = (float)fp_top(); /* fst */
     fp_top() = RECOMP_FP_PC(fp_top() * g_fp_stack[(g_fp_top + 6) & 7]); /* fmul st(6) */
-    /* FPU: fincstp  */
+    g_fp_top = (g_fp_top + 1u) & 7u; /* fincstp */
     g_fp_stack[(g_fp_top + 5) & 7] = RECOMP_FP_PC(g_fp_stack[(g_fp_top + 5) & 7] * fp_top()); /* fmul st(5), st(0) */
     MEMF(esp + 0x14) = (float)fp_top(); fp_pop(); /* fstp */
     MEMF(esp + 8) = (float)fp_top(); /* fst */
@@ -25468,7 +25468,7 @@ loc_003E2E60: ;
     MEMF(esp) = (float)fp_top(); fp_pop(); /* fstp */
     fp_top() = -fp_top(); /* fchs */
     MEMF(eax + 8) = (float)fp_top(); fp_pop(); /* fstp */
-    /* FPU: ffree st(1) */
+    /* ffree st(1): no tags to clear */
     xmm0 = XMM_SCALAR(MEMF(esp)); /* movss */
     xmm6 = XMM_SCALAR(MEMF(esp + 0xC)); /* movss */
     xmm1 = XMM_SCALAR(MEMF(esp + 0x10)); /* movss */
