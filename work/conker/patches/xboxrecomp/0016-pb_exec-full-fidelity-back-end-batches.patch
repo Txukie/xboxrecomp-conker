@@ -1,0 +1,451 @@
+diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
+index f8c49da..71bf0a1 100644
+--- a/src/kernel/nv2a_backend.h
++++ b/src/kernel/nv2a_backend.h
+@@ -29,6 +29,8 @@
+ 
+ #include <stdint.h>
+ 
++#include "nv2a_combiner.h"
++
+ /* The colour surface being drawn into, in real (anti-aliased) pixels.
+  * aa_sx/aa_sy give the anti-aliasing factor, so width/aa_sx is the logical
+  * size the title thinks it renders at (e.g. 640x480). */
+@@ -38,6 +40,11 @@ typedef struct {
+     uint32_t pitch;             /* bytes per row */
+     uint32_t bytes_per_pixel;   /* 2 or 4 */
+     uint32_t aa_sx, aa_sy;      /* 1 or 2 each */
++    /* Where the clip rectangle starts (width/height above are its size), and
++     * for a swizzled surface log2 of its size (0 for a linear one). A clear
++     * of a swizzled surface covers CLEAR_RECT, which arrives here instead. */
++    uint32_t clip_x, clip_y;
++    uint32_t swz_log_w, swz_log_h;
+ } Nv2aSurface;
+ 
+ /* A texture as the title programmed it. uv in Nv2aVertex are in texels. */
+@@ -80,6 +87,10 @@ typedef struct {
+      * that ignores these draws that pass over the whole surface. */
+     uint32_t stencil_enable, stencil_func, stencil_ref, stencil_func_mask;
+     uint32_t stencil_write_mask, stencil_fail, stencil_zfail, stencil_zpass;
++    /* SET_ZPASS_PIXEL_COUNT_ENABLE: this draw's passing pixels count towards
++     * the next GET_REPORT (report_read below). Zeta format, SURFACE_FORMAT
++     * bits 4-7: 1 Z16 (window z 0..0xFFFF), 2 Z24S8 (0..0xFFFFFF). */
++    uint32_t zpass_enable, zeta_format;
+ } Nv2aRenderState;
+ 
+ typedef struct {
+@@ -89,6 +100,53 @@ typedef struct {
+     const Nv2aRenderState *state;
+ } Nv2aBatch;
+ 
++/* Full-fidelity batches, for a back end that rasterises like the NV2A does
++ * (Vulkan, say) rather than drawing stage 0 times the diffuse colour.
++ *
++ * A vertex is what the vertex stage produced, after the executor's near-plane
++ * clip: pos is x, y in surface pixels, z as the title produced it (0..zmax
++ * of the zeta format) and the clip-space w (1 for pre-transformed batches),
++ * so pos.x*w .. is an affine image of clip space and interpolating with w is
++ * perspective-correct. d0/d1 are the diffuse and specular colours (r g b a,
++ * 0..1), fog[0] the fog factor the fog unit computed for the vertex (1 = no
++ * fog), tex[i] stage i's coordinates as the title produced them: normalised
++ * for swizzled and compressed textures, in texels for linear ones. */
++typedef struct {
++    float pos[4];
++    float d0[4], d1[4];
++    float fog[4];
++    float tex[4][4];
++} Nv2aFullVertex;
++
++/* One texture stage as the title programmed it. */
++typedef struct {
++    uint32_t valid;             /* 0: the stage samples white */
++    uint32_t offset;            /* guest address of texel (0,0) */
++    uint32_t width, height, pitch, color, levels, filter;
++    uint32_t addr_u, addr_v, addr_p;
++    uint32_t palette;           /* guest address of the CLUT, P8 formats */
++    uint32_t border;            /* SET_TEXTURE_BORDER_COLOR (ARGB) */
++    uint32_t border_color;      /* BORDER mode reads `border` */
++    uint32_t cube;              /* six faces */
++    uint32_t normalized;        /* coordinates arrive in 0..1, not texels */
++} Nv2aStage;
++
++typedef struct {
++    const Nv2aFullVertex *vertices;  /* triangle list, count a multiple of 3 */
++    uint32_t              count;
++    const Nv2aRenderState *state;
++    /* use_rc: the pixel is the register combiners' (rc, stages 0-3 by
++     * rc->stage_program, clip_plane_mode for CLIPPLANE stages, fog_color as
++     * r g b a 0..1). Otherwise stage 0 sampled nearest, times d0, as the
++     * executor does for pre-transformed batches and before any combiner
++     * program arrived. */
++    uint32_t              use_rc;
++    const Nv2aCombiner   *rc;
++    Nv2aStage             stage[4];
++    uint32_t              clip_plane_mode;
++    float                 fog_color[4];
++} Nv2aFullBatch;
++
+ typedef struct {
+     /* flags: CLEAR_SURFACE bits (Z 0x1, stencil 0x2, colour 0xF0).
+      * zstencil: SET_ZSTENCIL_CLEAR_VALUE (depth in the top 24 bits for Z24S8). */
+@@ -96,6 +154,16 @@ typedef struct {
+                   uint32_t flags, uint32_t argb, uint32_t zstencil);
+     void (*draw)(const Nv2aSurface *s, const Nv2aBatch *b);
+     void (*flip)(void);
++    /* Optional, for a back end that keeps surfaces off guest memory.
++     * draw_full: set instead of draw to receive Nv2aFullBatch.
++     * report_clear/report_read: CLEAR_REPORT_VALUE, and the passing-pixel
++     *   count since then that GET_REPORT writes (may wait for the GPU).
++     * resolve: write the surface at this guest address back to guest memory;
++     *   called before a flip shows it. */
++    void (*draw_full)(const Nv2aSurface *s, const Nv2aFullBatch *b);
++    void (*report_clear)(void);
++    uint32_t (*report_read)(void);
++    void (*resolve)(uint32_t color_va);
+ } Nv2aBackend;
+ 
+ /* Register (or, with NULL, remove) the back end. Call before the title starts
+@@ -107,6 +175,21 @@ void nv2a_backend_register(const Nv2aBackend *backend);
+  * Returns 0 if the format is not supported. */
+ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
+ 
++/* The same for a stage, level 0 of cube face `face` (0 unless st->cube):
++ * every format the executor samples, palettes included. Texels it cannot
++ * read come out white, as the rasteriser samples them. */
++void nv2a_backend_decode_stage(const Nv2aStage *st, uint32_t face,
++                               uint32_t *argb_out);
++
++/* How many bytes of guest memory from st->offset the stage reads (every face
++ * and mip level), for a back end that caches decoded textures by content.
++ * A P8 stage also reads its 256-entry palette at st->palette. */
++uint32_t nv2a_backend_stage_bytes(const Nv2aStage *st);
++
++/* Whether [addr, addr+bytes) is guest memory the executor itself would read
++ * or write (ordinary RAM from 0, or the contiguous window). */
++int nv2a_backend_guest_span_ok(uint32_t addr, uint32_t bytes);
++
+ /* Where BACK_END_WRITE_SEMAPHORE_RELEASE (0x1D70) values land: the guest VA
+  * of the semaphore the title reads GPU progress from (for XDK D3D, the
+  * pointer at device+0x30). The executor writes each release there once it
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index f5da7dc..828e268 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -538,6 +538,11 @@ static int guest_span_ok(uint64_t addr, uint32_t bytes)
+         && end <= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
+ }
+ 
++int nv2a_backend_guest_span_ok(uint32_t addr, uint32_t bytes)
++{
++    return guest_span_ok(addr, bytes);
++}
++
+ /* Bytes one element of attribute `a` occupies, as fetch_attr reads it. */
+ static uint32_t attr_elem_bytes(const VertexAttr *a)
+ {
+@@ -787,7 +792,13 @@ void nv2a_backend_register(const Nv2aBackend *backend)
+ 
+ static int backend_draws(void)
+ {
+-    return s_backend && s_backend->draw;
++    return s_backend && (s_backend->draw || s_backend->draw_full);
++}
++
++/* The back end takes Nv2aFullBatch (every stage and the combiners). */
++static int backend_full(void)
++{
++    return s_backend && s_backend->draw_full;
+ }
+ 
+ static void current_surface(Nv2aSurface *out)
+@@ -799,6 +810,13 @@ static void current_surface(Nv2aSurface *out)
+     out->bytes_per_pixel = surface_bpp();
+     out->aa_sx           = s_gpu.aa_sx > 1.5f ? 2 : 1;
+     out->aa_sy           = s_gpu.aa_sy > 1.5f ? 2 : 1;
++    out->clip_x          = s_gpu.clip_x;
++    out->clip_y          = s_gpu.clip_y;
++    out->swz_log_w = out->swz_log_h = 0;
++    if (((s_gpu.format >> 8) & 0xF) == 2) {     /* swizzled */
++        out->swz_log_w = (s_gpu.format >> 16) & 0xF;
++        out->swz_log_h = (s_gpu.format >> 24) & 0xF;
++    }
+ }
+ 
+ /* Render state in the NV2A's own values, gathered from what the executor
+@@ -832,6 +850,8 @@ static void current_render_state(Nv2aRenderState *r)
+     r->stencil_fail      = s_reg[0x0370 / 4];        /* SET_STENCIL_OP_FAIL */
+     r->stencil_zfail     = s_reg[0x0374 / 4];        /* SET_STENCIL_OP_ZFAIL */
+     r->stencil_zpass     = s_reg[0x0378 / 4];        /* SET_STENCIL_OP_ZPASS */
++    r->zpass_enable      = s_gpu.zpass_enable;
++    r->zeta_format       = (s_gpu.format >> 4) & 0xF;
+ }
+ 
+ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);
+@@ -905,6 +925,13 @@ static void clear_surface(uint32_t param)
+             return;
+         current_surface(&surf);
+         current_render_state(&rs);
++        if (surf.swz_log_w && (s_gpu.clear_rect_set & 3) == 3) {
++            /* A swizzled clear covers CLEAR_RECT (clear_surface below). */
++            surf.clip_x = s_gpu.clear_rect_h & 0xFFFF;
++            surf.width  = (s_gpu.clear_rect_h >> 16) + 1 - surf.clip_x;
++            surf.clip_y = s_gpu.clear_rect_v & 0xFFFF;
++            surf.height = (s_gpu.clear_rect_v >> 16) + 1 - surf.clip_y;
++        }
+         s_backend->clear(&surf, &rs, param, s_gpu.clear_color,
+                          s_gpu.zstencil_clear);
+         s_gpu.clears++;
+@@ -2002,6 +2029,32 @@ static int s_xf_no_tex;
+ static Nv2aVertex *s_bverts;     /* about 5.5 MB: allocated by the first vertex */
+ static uint32_t   s_bcount;
+ 
++/* The same for a back end that takes full batches (backend_full). */
++static Nv2aFullVertex *s_bfull;  /* about 24 MB: allocated by the first vertex */
++
++static Nv2aFullVertex *backend_full_slot(void)
++{
++    if (!s_bfull
++        && !(s_bfull = (Nv2aFullVertex *)calloc(NV_BACKEND_MAX_VERTS, sizeof *s_bfull)))
++        return NULL;
++    if (s_bcount + 3 > NV_BACKEND_MAX_VERTS)
++        return NULL;
++    return &s_bfull[s_bcount];
++}
++
++static float fog_factor(float d);
++
++/* A vertex as the vertex stage left it, with the fog unit applied. */
++static void backend_full_from_xf(const Nv2aVshOutput *v, Nv2aFullVertex *o)
++{
++    memcpy(o->pos, v->pos, sizeof o->pos);
++    memcpy(o->d0, v->d0, sizeof o->d0);
++    memcpy(o->d1, v->d1, sizeof o->d1);
++    memcpy(o->tex, v->tex, sizeof o->tex);
++    o->fog[0] = fog_factor(v->fog[0]);
++    o->fog[1] = o->fog[2] = o->fog[3] = 0.0f;
++}
++
+ static Nv2aVertex *backend_slot(void)
+ {
+     if (!s_bverts
+@@ -2029,9 +2082,68 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
+     o->v = v->tex[0][1] * sv;
+ }
+ 
++static void stage_from_texture(const Texture *t, Nv2aStage *o)
++{
++    o->valid        = (uint32_t)t->valid;
++    o->offset       = t->offset;
++    o->width        = t->width;
++    o->height       = t->height;
++    o->pitch        = t->pitch;
++    o->color        = t->color;
++    o->levels       = t->pitch ? 1 : t->levels;
++    o->filter       = t->filter;
++    o->addr_u       = t->addr_u;
++    o->addr_v       = t->addr_v;
++    o->addr_p       = 0;
++    o->palette      = t->palette;
++    o->border       = t->border;
++    o->border_color = (uint32_t)t->border_color;
++    o->cube         = (uint32_t)t->cube;
++    o->normalized   = (uint32_t)tex_size_from_format(t->color);
++}
++
++/* A full batch: the combiners when the vertex stage produced the vertices
++ * (`xf`) and a combiner program has arrived, as raster_xf_triangle decides;
++ * otherwise stage 0 times diffuse, `textured` saying whether it samples. */
++static void backend_flush_full(int textured, int xf)
++{
++    static int no_rc = -1;
++    Nv2aSurface surf;
++    Nv2aRenderState rs;
++    Nv2aFullBatch b;
++    int st;
++
++    if (no_rc < 0)
++        no_rc = getenv("RECOMP_NO_COMBINERS") != NULL;
++    current_surface(&surf);
++    current_render_state(&rs);
++    memset(&b, 0, sizeof b);
++    b.vertices = s_bfull;
++    b.count = s_bcount;
++    b.state = &rs;
++    b.use_rc = (uint32_t)(xf && s_gpu.rc_seen && !no_rc);
++    b.rc = &s_gpu.rc;
++    for (st = 0; st < 4; st++)
++        stage_from_texture(&s_gpu.texs[st], &b.stage[st]);
++    if (!b.use_rc) {
++        if (!textured)
++            b.stage[0].valid = 0;
++        for (st = 1; st < 4; st++)
++            b.stage[st].valid = 0;
++    }
++    b.clip_plane_mode = s_gpu.clip_plane_mode;
++    /* FOG_COLOR is R in bits 0-7, the reverse of a D3DCOLOR. */
++    nv2a_rc_unpack(s_gpu.fog_color, b.fog_color);
++    { float r = b.fog_color[2]; b.fog_color[2] = b.fog_color[0]; b.fog_color[0] = r; }
++    s_backend->draw_full(&surf, &b);
++    s_gpu.tris_drawn += s_bcount / 3;
++    s_bcount = 0;
++    note_drawn();
++}
++
+ /* `textured`: the batch carried texture coordinates, so the bound texture is
+- * part of it. */
+-static void backend_flush(int textured)
++ * part of it. `xf`: its vertices came from the vertex stage. */
++static void backend_flush(int textured, int xf)
+ {
+     Nv2aSurface surf;
+     Nv2aRenderState rs;
+@@ -2040,6 +2152,10 @@ static void backend_flush(int textured)
+ 
+     if (!s_bcount)
+         return;
++    if (backend_full()) {
++        backend_flush_full(textured, xf);
++        return;
++    }
+     current_surface(&surf);
+     current_render_state(&rs);
+     batch.vertices = s_bverts;
+@@ -2087,6 +2203,30 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
+             && fetch_texcoord(i1, uv[1])
+             && fetch_texcoord(i2, uv[2]);
+ 
++    if (backend_full()) {                  /* a back end rasterises */
++        Nv2aFullVertex *o = backend_full_slot();
++        const uint32_t ix[3] = { i0, i1, i2 };
++        int k, norm = tex_size_from_format(s_gpu.texs[0].color);
++
++        if (!o)
++            return;
++        memset(o, 0, 3 * sizeof *o);
++        for (k = 0; k < 3; k++) {
++            o[k].pos[0] = p[k][0];
++            o[k].pos[1] = p[k][1];
++            o[k].pos[2] = p[k][2];
++            o[k].pos[3] = 1.0f;           /* drawn as it is, not projected */
++            nv2a_rc_unpack(vertex_color(ix[k]), o[k].d0);
++            o[k].fog[0] = 1.0f;
++            o[k].tex[0][3] = 1.0f;
++            if (textured) {               /* back from texels (fetch_texcoord) */
++                o[k].tex[0][0] = norm ? uv[k][0] / (float)s_gpu.texs[0].width : uv[k][0];
++                o[k].tex[0][1] = norm ? uv[k][1] / (float)s_gpu.texs[0].height : uv[k][1];
++            }
++        }
++        s_bcount += 3;
++        return;
++    }
+     if (backend_draws()) {                 /* a back end rasterises */
+         Nv2aVertex *o = backend_slot();
+         const uint32_t ix[3] = { i0, i1, i2 };
+@@ -2238,6 +2378,45 @@ static uint32_t tex_face_stride(const Texture *t)
+     return (total + 127u) & ~127u;
+ }
+ 
++uint32_t nv2a_backend_stage_bytes(const Nv2aStage *st)
++{
++    Texture t;
++
++    memset(&t, 0, sizeof t);
++    t.width = st->width;
++    t.height = st->height;
++    t.pitch = st->pitch;
++    t.color = st->color;
++    t.levels = st->levels;
++    return tex_face_stride(&t) * (st->cube ? 6u : 1u);
++}
++
++void nv2a_backend_decode_stage(const Nv2aStage *st, uint32_t face,
++                               uint32_t *argb_out)
++{
++    Texture t;
++    uint32_t u, v, off;
++
++    memset(&t, 0, sizeof t);
++    t.offset = st->offset;
++    t.width = st->width;
++    t.height = st->height;
++    t.pitch = st->pitch;
++    t.color = st->color;
++    t.levels = st->levels;
++    t.palette = st->palette;
++    t.cube = (int)st->cube;
++    t.addr_u = t.addr_v = 3;               /* texels are read in range */
++    tex_update_valid(&t);
++    off = st->cube ? face * tex_face_stride(&t) : 0;
++    for (v = 0; v < st->height; v++)
++        for (u = 0; u < st->width; u++) {
++            uint32_t *o = &argb_out[(size_t)v * st->width + u];
++            if (!sample_tex(&t, off, u, v, o))
++                *o = 0xFFFFFFFFu;
++        }
++}
++
+ /* One texel at normalised (swizzled/DXT) or texel (linear) coordinates, as
+  * floats. An unusable stage reads white, so a missing texture multiplies
+  * through instead of blacking the pixel out. */
+@@ -2698,6 +2877,16 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+         s_gpu.xf_degenerate++;
+         return;
+     }
++    if (backend_full()) {                      /* a back end rasterises */
++        Nv2aFullVertex *o = backend_full_slot();
++        if (o) {
++            backend_full_from_xf(va, &o[0]);
++            backend_full_from_xf(vb, &o[1]);
++            backend_full_from_xf(vc, &o[2]);
++            s_bcount += 3;
++        }
++        return;
++    }
+     if (backend_draws()) {                     /* a back end rasterises */
+         Nv2aVertex *o = backend_slot();
+         if (o) {
+@@ -3178,7 +3367,7 @@ static void raster_batch_program(void)
+     /* The batch's triangles, all at once (see xf_queue_push). */
+     xf_queue_flush();
+     if (backend_draws())
+-        backend_flush(!s_xf_no_tex);
++        backend_flush(!s_xf_no_tex, 1);
+ }
+ 
+ static void raster_batch(void)
+@@ -3256,7 +3445,7 @@ static void raster_batch(void)
+         break;                             /* points and lines: not yet */
+     }
+     if (backend_draws())
+-        backend_flush(textured);
++        backend_flush(textured, 0);
+ 
+     if (s_gpu.tris_drawn && (s_gpu.tris_drawn % 500) == 0)
+         fprintf(stderr, "  [GPU] %u triangles rasterised\n", s_gpu.tris_drawn);
+@@ -4037,6 +4226,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+     case 0x09C4: memcpy(&s_gpu.fog_param[1], &param, 4); break;
+     case 0x17C8:                                  /* CLEAR_REPORT_VALUE */
+         s_gpu.zpass_count = 0;
++        if (s_backend && s_backend->report_clear)
++            s_backend->report_clear();
+         break;
+     case 0x17CC:                                  /* SET_ZPASS_PIXEL_COUNT_ENABLE */
+         s_gpu.zpass_enable = param;
+@@ -4052,6 +4243,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+         uint32_t at = dma_resolve(param & 0x00FFFFFFu);
+         uint64_t stamp = (uint64_t)s_gpu.reports++ * 1000u;
++        if (s_backend && s_backend->report_read)   /* the GPU counted */
++            s_gpu.zpass_count = s_backend->report_read();
+         memcpy(mem + at, &stamp, 8);
+         memcpy(mem + at + 8, &s_gpu.zpass_count, 4);
+         memset(mem + at + 12, 0, 4);
+@@ -4217,6 +4410,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+                                                : s_gpu.color_offset;
+             uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
+                                                 : s_gpu.pitch;
++            if (done && s_backend && s_backend->resolve)
++                s_backend->resolve(dma_resolve(done));
+             if (done) {
+                 xbox_FramebufferWindowSet(dma_resolve(done), pitch);
+                 xbox_FramebufferWindowSetAA(s_gpu.aa_sy > 1.5f ? 2 : 1);

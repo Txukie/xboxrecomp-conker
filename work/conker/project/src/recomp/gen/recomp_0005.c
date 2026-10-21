@@ -11936,6 +11936,8 @@ loc_000645B5: ;
  */
 void sub_000645C0(void)
 {
+    extern void sub_000645C0_enter(void);
+    sub_000645C0_enter();
     uint32_t _fa = 0, _fb = 0;
     int32_t _fas = 0, _fbs = 0;
     (void)_fa; (void)_fb; (void)_fas; (void)_fbs;

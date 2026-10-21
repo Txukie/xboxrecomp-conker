@@ -1,0 +1,48 @@
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -380,6 +380,10 @@
+ static uint32_t s_sem_va;
+ void nv2a_pb_set_semaphore_target(uint32_t guest_va) { s_sem_va = guest_va; }
+ 
++/* The title's software-method work; see nv2a_backend.h. */
++static void (*volatile s_swmethod_hook)(uint32_t param);
++void nv2a_pb_set_swmethod_hook(void (*hook)(uint32_t param)) { s_swmethod_hook = hook; }
++
+ /* Unhandled methods, ranked. The interesting output is not that something was
+  * skipped but which things dominate, because that is the order to implement
+  * them in. */
+@@ -4135,8 +4139,11 @@
+         break;
+     case NV097_NO_OPERATION:
+         /* Non-zero, it is one of D3D's software methods, which the GPU traps
+-         * to D3D's interrupt handler on the console. Only the swap's interval
+-         * matters here (nv2a_flip_hold.h); the rest stays a no-op. */
++         * to D3D's interrupt handler on the console. The title's hook does
++         * that handler's work (nv2a_pb_set_swmethod_hook); the swap's
++         * interval matters here too (nv2a_flip_hold.h). */
++        if (param && s_swmethod_hook)
++            s_swmethod_hook(param);
+         if (!nv2a_pb_exec_flip_pacing()) {
+             if (!imm_vertex_method(method, param))
+                 note_unhandled(method, param);   /* as before the hold */
+diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
+--- a/src/kernel/nv2a_backend.h
++++ b/src/kernel/nv2a_backend.h
+@@ -117,4 +117,16 @@
+  * the semaphore context DMA object through RAMIN. */
+ void nv2a_pb_set_semaphore_target(uint32_t guest_va);
+ 
++/* Software methods: NO_OPERATION with a non-zero parameter, which the console
++ * traps to the title's GPU interrupt handler (XDK D3D's ServiceGrInterrupt)
++ * with the GPU stalled until it returns. The executor delivers no GPU
++ * interrupts, so a title whose D3D does real work there registers the work
++ * here: the hook runs on the executor thread, in pushbuffer order, before the
++ * command after the NO_OPERATION -- the point where the console's GPU would
++ * resume. XDK D3D's RunPushBuffer, for one, defers patching a pushbuffer the
++ * GPU may still be reading into a software method; unapplied, the
++ * pushbuffer's closing JUMP returns to wherever it was last called from and
++ * the walk replays old commands. NULL removes the hook. */
++void nv2a_pb_set_swmethod_hook(void (*hook)(uint32_t param));
++
+ #endif /* NV2A_BACKEND_H */

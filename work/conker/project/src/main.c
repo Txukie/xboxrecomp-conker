@@ -20,6 +20,9 @@
 #include <xbox/xboxrecomp.h>
 #include "conker_host.h"
 #include "ohci.h"
+#ifdef CONKER_HAVE_VULKAN
+#include "nv2a_vk.h"
+#endif
 
 #define CONKER_ENTRY_POINT 0x0042F0E9u
 /* Used when neither argv[1] nor CONKER_GAME_DIR names the extracted disc. */
@@ -148,6 +151,26 @@ static int conker_boot(void)
                 g_apu_state ? "up" : "FAILED to initialise");
     }
 
+    /* D3D's software-method work, which the console does in the GPU
+     * interrupt handler (recomp_manual.c). */
+    {
+        extern void conker_install_d3d_hooks(void);
+        conker_install_d3d_hooks();
+    }
+
+    /* RECOMP_RENDERER=vulkan: pixels on the host GPU instead of the CPU
+     * rasteriser (which stays the fallback when no device is usable). */
+    {
+        const char *r = getenv("RECOMP_RENDERER");
+        if (r && !strcmp(r, "vulkan")) {
+#ifdef CONKER_HAVE_VULKAN
+            nv2a_vk_install();
+#else
+            fprintf(stderr, "[CONKER] built without the Vulkan renderer\n");
+#endif
+        }
+    }
+
     xbox_kernel_init();
     xbox_path_init(game_dir, save_path);
     xbox_kernel_bridge_init();
@@ -208,6 +231,10 @@ int main(int argc, char **argv)
     conker_host_setenv_default("RECOMP_AC97_READY", "1");
     conker_host_setenv_default("RECOMP_USB", "1");
     conker_host_setenv_default("RECOMP_KEYBOARD", "1");
+    /* CONKER_ASPECT widens the projection (recomp_manual.c, Hor+); the
+     * window then shows the 640x480 frame at that shape. */
+    if (getenv("CONKER_ASPECT") && *getenv("CONKER_ASPECT"))
+        conker_host_setenv_default("RECOMP_DISPLAY_ASPECT", getenv("CONKER_ASPECT"));
 
     if (!s_game_dir || !*s_game_dir)
         s_game_dir = CONKER_DEFAULT_GAME_DIR;

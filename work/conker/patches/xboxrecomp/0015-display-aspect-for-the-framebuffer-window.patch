@@ -1,0 +1,135 @@
+diff --git a/src/video/display_aspect.h b/src/video/display_aspect.h
+new file mode 100644
+--- /dev/null
++++ b/src/video/display_aspect.h
+@@ -0,0 +1,43 @@
++/* The shape the framebuffer window shows the frame at.
++ *
++ * Every presenter letterboxed the guest's framebuffer to the framebuffer's
++ * own shape: 640x480 at 4:3. A title rendering for a wide display -- natively
++ * anamorphic, or with its projection widened by the project, Hor+ -- still
++ * renders 640x480, and wants that frame stretched to 16:9 instead.
++ * RECOMP_DISPLAY_ASPECT names the shape: "16:9", "21:9", "4:3" or a ratio
++ * such as 1.7778. Unset (or unparsable), the frame keeps its own. */
++#ifndef XBOX_DISPLAY_ASPECT_H
++#define XBOX_DISPLAY_ASPECT_H
++
++#include <stdint.h>
++#include <stdlib.h>
++
++/* Width over height, or 0 for "the frame's own". Read once. */
++static inline double xbox_DisplayAspect(void)
++{
++    static double aspect = -1.0;
++    if (aspect < 0.0) {
++        const char *e = getenv("RECOMP_DISPLAY_ASPECT");
++        char *end = NULL;
++        double a = 0.0;
++        if (e && *e) {
++            a = strtod(e, &end);
++            if (end && *end == ':') {
++                double b = strtod(end + 1, NULL);
++                a = b > 0.0 ? a / b : 0.0;
++            }
++        }
++        aspect = a > 0.25 && a < 8.0 ? a : 0.0;
++    }
++    return aspect;
++}
++
++/* The width a frame w x h is shown at for its height (w itself unless a
++ * display aspect is set). */
++static inline uint32_t xbox_DisplayWidth(uint32_t w, uint32_t h)
++{
++    double a = xbox_DisplayAspect();
++    return a > 0.0 ? (uint32_t)(h * a + 0.5) : w;
++}
++
++#endif
+diff --git a/src/video/fb_present_sdl.c b/src/video/fb_present_sdl.c
+--- a/src/video/fb_present_sdl.c
++++ b/src/video/fb_present_sdl.c
+@@ -35,6 +35,7 @@
+ #if !defined(_WIN32)
+ 
+ #include <SDL.h>
++#include "display_aspect.h"
+ #include <pthread.h>
+ #include <sched.h>
+ #include <stdint.h>
+@@ -301,7 +302,7 @@
+         return guest_main();
+     }
+     win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+-                           (int)FB_W * scale, (int)FB_H * scale,
++                           (int)xbox_DisplayWidth(FB_W, FB_H) * scale, (int)FB_H * scale,
+                            SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+     ren = win ? SDL_CreateRenderer(win, -1,
+                                    vsync ? SDL_RENDERER_PRESENTVSYNC : 0)
+@@ -314,7 +315,9 @@
+         SDL_QuitSubSystem(FBWIN_SDL_SUBSYSTEMS);
+         return guest_main();
+     }
+-    SDL_RenderSetLogicalSize(ren, (int)FB_W, (int)FB_H);
++    /* The frame's shape, or the display aspect (display_aspect.h): the
++     * texture is stretched to the logical size, letterboxed in the window. */
++    SDL_RenderSetLogicalSize(ren, (int)xbox_DisplayWidth(FB_W, FB_H), (int)FB_H);
+     {
+         SDL_RendererInfo ri;
+         if (SDL_GetRendererInfo(ren, &ri) == 0)
+diff --git a/src/video/fb_present.c b/src/video/fb_present.c
+--- a/src/video/fb_present.c
++++ b/src/video/fb_present.c
+@@ -38,6 +38,7 @@
+  * is the thing that receives the keys, so that is what has to remember
+  * them. */
+ #include "keyboard.h"   /* src/input */
++#include "display_aspect.h"
+ #include "gpu_present.h"
+ #include "recomp_exit_hook.h"   /* src/platform */
+ #include <stdbool.h>
+@@ -450,10 +451,14 @@
+         FillRect(hdc, &c, (HBRUSH)GetStockObject(BLACK_BRUSH));
+         lw = cw; lh = ch;
+     }
+-    if ((long long)cw * s_fb_height <= (long long)ch * s_fb_width) {
+-        w = cw; h = (LONG)((long long)cw * s_fb_height / s_fb_width);
+-    } else {
+-        h = ch; w = (LONG)((long long)ch * s_fb_width / s_fb_height);
++    {
++        /* The frame's shape, or the display aspect (display_aspect.h). */
++        long long fw = xbox_DisplayWidth(s_fb_width, s_fb_height), fh = s_fb_height;
++        if ((long long)cw * fh <= (long long)ch * fw) {
++            w = cw; h = (LONG)((long long)cw * fh / fw);
++        } else {
++            h = ch; w = (LONG)((long long)ch * fw / fh);
++        }
+     }
+     SetStretchBltMode(hdc, HALFTONE);
+     SetBrushOrgEx(hdc, 0, 0, NULL);     /* HALFTONE wants it after the mode */
+diff --git a/src/video/gpu_present.c b/src/video/gpu_present.c
+--- a/src/video/gpu_present.c
++++ b/src/video/gpu_present.c
+@@ -25,6 +25,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include "gpu_present.h"
++#include "display_aspect.h"
+ 
+ static ID3D11Device             *s_dev;
+ static ID3D11DeviceContext      *s_ctx;
+@@ -194,10 +195,11 @@
+                                           pixels, s_w * 4, 0);
+     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_rtv, NULL);
+     ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_rtv, black);
+-    /* The largest rectangle of the frame's shape that fits, centred. */
+-    sx = (float)s_bw / (float)s_w;
++    /* The largest rectangle of the frame's shape (or the display aspect,
++     * display_aspect.h) that fits, centred. */
++    sx = (float)s_bw / (float)xbox_DisplayWidth(s_w, s_h);
+     sy = (float)s_bh / (float)s_h;
+-    vp.Width = (float)s_w * (sx < sy ? sx : sy);
++    vp.Width = (float)xbox_DisplayWidth(s_w, s_h) * (sx < sy ? sx : sy);
+     vp.Height = (float)s_h * (sx < sy ? sx : sy);
+     vp.TopLeftX = ((float)s_bw - vp.Width) * 0.5f;
+     vp.TopLeftY = ((float)s_bh - vp.Height) * 0.5f;

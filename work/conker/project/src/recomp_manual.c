@@ -3,6 +3,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_MSC_VER)
+#include <intrin.h>   /* _InterlockedDecrement */
+#endif
 
 #define RECOMP_GENERATED_CODE
 #include "recomp_types.h"
@@ -139,6 +142,84 @@ void sub_0053C190_enter(void)
     }
 }
 
+/* ── D3D8LTCG deferred pushbuffer patches ────────────────────────────────
+ *
+ * RunPushBuffer (sub_0053AE30) makes a precompiled pushbuffer return to the
+ * ring by patching its closing JUMP, and applies the run's fixups, before
+ * the GPU gets there. When the GPU may still be reading the pushbuffer from
+ * an earlier run it cannot patch yet: it writes NO_OPERATION(param) ahead of
+ * the JUMP into the pushbuffer and leaves the patch in an entry, and the
+ * GPU, trapping that software method, has D3D's interrupt handler apply it
+ * (ServiceGrInterrupt 0x005411D0 -> sub_00541410, cases 12 and 13):
+ *
+ *   param & 0x1F == 13: the entry is slot param >> 5 of device+0x264 (20 bytes)
+ *   param & 0x1F == 12: the entry is at 0x80000000 | (param >> 5), in the ring
+ *
+ * Both decrement the pending count at device+0x50 and run sub_0053AD90 on
+ * the entry: write the return JUMP into the pushbuffer's last word, copy the
+ * fixup records ({size, offset, data}, ended by 0xFFFFFFFF) into it when bit
+ * 29 asks for them, free the slot (bit 30) when bit 31 marks one, and follow
+ * the chain at +4. The executor delivers no GPU interrupts, so it calls this
+ * when it reaches the NO_OPERATION, which is where the console's GPU stalls
+ * for the handler (nv2a_pb_set_swmethod_hook). Unapplied, the pushbuffer
+ * returned to wherever it was last called from: the walk replayed already-run
+ * commands, a million draws a frame, and the front end never got past its
+ * black loading frames. */
+#define CONKER_D3D_DEFERRED_SLOTS 0x264u
+#define CONKER_D3D_DEFERRED_COUNT 0x50u
+
+static void conker_d3d_apply_deferred(uint32_t entry)
+{
+    int guard = 0;
+
+    while (entry != 0 && entry != 0xFFFFFFFFu && guard++ < 4096) {
+        uint32_t ctl = MEM32(entry), next;
+
+        MEM32(MEM32(entry + 8)) = (ctl & 0x0FFFFFFFu) + 1u;   /* return JUMP */
+        if (ctl & 0x20000000u) {
+            uint32_t pb = MEM32(entry + 0x10), rec = MEM32(entry + 0xC), size;
+            while ((size = MEM32(rec)) != 0xFFFFFFFFu) {
+                memcpy((void *)XBOX_PTR(pb + MEM32(rec + 4)),
+                       (const void *)XBOX_PTR(rec + 8), size);
+                rec += 8 + size;
+            }
+        }
+        next = MEM32(entry + 4);
+        MEM32(entry + 4) = 0xFFFFFFFFu;
+        if (ctl & 0x80000000u)
+            MEM32(entry) = ctl & 0xBFFFFFFFu;                   /* slot free */
+        entry = next;
+    }
+}
+
+static void conker_d3d_swmethod(uint32_t param)
+{
+    const uint32_t device = MEM32(CONKER_D3D_DEVICE_PTR);
+    uint32_t entry;
+
+    if (!device)
+        return;
+    switch (param & 0x1Fu) {
+    case 13: entry = device + CONKER_D3D_DEFERRED_SLOTS + 20u * (param >> 5); break;
+    case 12: entry = 0x80000000u | (param >> 5); break;
+    default: return;
+    }
+    /* Interlocked: RunPushBuffer raises the count with xadd on the title's
+     * thread meanwhile. */
+#if defined(_MSC_VER)
+    _InterlockedDecrement((volatile long *)XBOX_PTR(device + CONKER_D3D_DEFERRED_COUNT));
+#else
+    __atomic_sub_fetch((volatile uint32_t *)XBOX_PTR(device + CONKER_D3D_DEFERRED_COUNT),
+                       1u, __ATOMIC_SEQ_CST);
+#endif
+    conker_d3d_apply_deferred(entry);
+}
+
+void conker_install_d3d_hooks(void)
+{
+    nv2a_pb_set_swmethod_hook(conker_d3d_swmethod);
+}
+
 /* ── APU EP DSP heartbeat ─────────────────────────────────────────────────
  *
  * DirectSoundDoWork ends in sub_004C7FFF, which checks a word in the EP
@@ -193,4 +274,50 @@ void conker_trace_point(uint32_t xbox_va)
         captured_malloc_stack = 1;
         conker_host_print_native_stack("[CONKER][NATIVE_STACK]", 62);
     }
+}
+
+/* ── Widescreen (Hor+) ───────────────────────────────────────────────────
+ *
+ * Conker has no widescreen mode: XGetVideoFlags is read for 480p and PAL-60
+ * only, and the projection is built for a 4:3 picture. Each player's camera
+ * keeps its field of view as two angles, horizontal and vertical (record
+ * [0x84A13C] + 0x2B0*player, +0x260 and +0x264), and sub_000645C0 hands the
+ * pair to the camera object (+0x104 the vertical angle, +0x108 their ratio)
+ * that its projection matrix and its culling frustum come from. Widening the
+ * horizontal angle by the target aspect over 4:3 is Hor+: the vertical view
+ * stays, the sides open up, and the culling follows. The 640x480 frame is
+ * then shown stretched to that aspect (RECOMP_DISPLAY_ASPECT, which main.c
+ * sets from CONKER_ASPECT), so the 3D comes out unstretched. 2D overlays
+ * drawn in screen space are stretched with it.
+ *
+ * CONKER_ASPECT: "16:9", "16:10", "21:9", "4:3" or a ratio (1.7778). Unset,
+ * the picture is the original 4:3. */
+static float conker_hor_plus(void)
+{
+    static float scale = -1.0f;
+    if (scale < 0.0f) {
+        const char *e = getenv("CONKER_ASPECT");
+        char *end = NULL;
+        double a = 0.0;
+        if (e && *e) {
+            a = strtod(e, &end);
+            if (end && *end == ':') {
+                double b = strtod(end + 1, NULL);
+                a = b > 0.0 ? a / b : 0.0;
+            }
+        }
+        scale = (a > 0.25 && a < 8.0) ? (float)(a / (4.0 / 3.0)) : 0.0f;
+        if (scale > 0.0f)
+            fprintf(stderr, "[CONKER] widescreen: aspect %.4f, horizontal view x%.4f\n",
+                    a, scale);
+    }
+    return scale;
+}
+
+/* sub_000645C0(player edx, horizontal angle xmm1, vertical angle xmm0). */
+void sub_000645C0_enter(void)
+{
+    float s = conker_hor_plus();
+    if (s > 0.0f)
+        g_xmm1.f[0] *= s;
 }

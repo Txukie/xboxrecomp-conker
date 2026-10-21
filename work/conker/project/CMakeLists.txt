@@ -104,6 +104,11 @@ if(CONKER_BUILD_GAME)
     )
 
     target_link_libraries(conker_recomp PRIVATE xboxrecomp xbox_gfx)
+    # The GPU renderer (RECOMP_RENDERER=vulkan), when the toolkit built it.
+    if(TARGET xbox_nv2a_vk)
+        target_link_libraries(conker_recomp PRIVATE xbox_nv2a_vk)
+        target_compile_definitions(conker_recomp PRIVATE CONKER_HAVE_VULKAN=1)
+    endif()
 
     if(WIN32)
         target_compile_definitions(conker_recomp PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
