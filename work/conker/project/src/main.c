@@ -217,6 +217,12 @@ int main(int argc, char **argv)
      *   RECOMP_PB_EXEC       D3D8LTCG frames only exist as push buffers
      *   RECOMP_TITLE_KEVENTS D3D waits on a KEVENT it builds itself (0x5492FC)
      *   RECOMP_VBLANK        its GPU ISR (vector 3) needs vblank interrupts
+ *   RECOMP_FLIP_PACING   a flip completes on the vblank the title's
+ *                        presentation interval names, as on the console
+ *                        (Conker asks for every second one: 30 fps).
+ *                        Without it each flip completed at once: the
+ *                        front end ran at ~43 and title cards far faster,
+ *                        unevenly from scene to scene
      *   RECOMP_AC97_READY    DirectSound resets the AC'97 bus master and the
      *                        codec, and talks to the APU directly: this arms
      *                        the AC'97 write trap and the emulated APU
@@ -228,6 +234,7 @@ int main(int argc, char **argv)
     conker_host_setenv_default("RECOMP_PB_EXEC", "1");
     conker_host_setenv_default("RECOMP_TITLE_KEVENTS", "1");
     conker_host_setenv_default("RECOMP_VBLANK", "paced");
+    conker_host_setenv_default("RECOMP_FLIP_PACING", "1");
     conker_host_setenv_default("RECOMP_AC97_READY", "1");
     conker_host_setenv_default("RECOMP_USB", "1");
     conker_host_setenv_default("RECOMP_KEYBOARD", "1");

@@ -158,6 +158,21 @@ if(CONKER_BUILD_GAME)
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 endif()
 
+# ── AppImage (Linux) ───────────────────────────────────────────────────
+# `cmake --build <build> --target appimage` packs the executable into
+# <build>/appimage/Conker-Recomp-x86_64.AppImage (../packaging/appimage).
+# Build it from a Release build; the game data is never included.
+if(TARGET conker_recomp AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(_appimage_dir "${CMAKE_BINARY_DIR}/appimage")
+    add_custom_target(appimage
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${_appimage_dir}"
+        COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/../packaging/appimage/build-appimage.sh"
+                "$<TARGET_FILE:conker_recomp>" "${_appimage_dir}"
+        DEPENDS conker_recomp
+        COMMENT "Packing Conker-Recomp-x86_64.AppImage"
+        VERBATIM)
+endif()
+
 # ── Host code check that needs no generated code ───────────────────────
 # Compiles main.c / recomp_manual.c / the host layer against the current
 # runtime headers so API drift shows up even before regeneration.

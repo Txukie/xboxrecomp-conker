@@ -13,26 +13,63 @@
 | Área | Estado |
 |---|---|
 | Análisis del XBE de Conker | ✅ 27 secciones cargadas |
-| Runtime | ✅ xboxrecomp v0.16.0 (submódulo) |
-| Compilación Linux (GCC) | ✅ Ejecutable nativo + pruebas |
+| Runtime | ✅ xboxrecomp v0.16.0 (submódulo) + parches locales en `work/conker/patches/xboxrecomp/` |
+| Compilación Linux (GCC) | ✅ Ejecutable nativo, pruebas y AppImage |
 | Compilación Windows / macOS | 🟡 Soportadas por el runtime, sin probar en este proyecto |
 | Código recompilado | ✅ Regenerado con v0.16.0 (20.029 funciones, 20 sin resolver) |
-| Frames (push-buffers D3D8LTCG) | 🟡 Ejecutor activo: superficie 640×480 y primer flip; se bloquea esperando a la GPU |
-| Backend Vulkan | 🟡 Funciona; falta conectarlo al ejecutor |
-| Backend Metal | 🔴 Esqueleto |
-| Juego visible y controlable | 🔴 Todavía no |
+| Vídeo de introducción, menús, perfiles | ✅ Se ven y se controlan (teclado o mando) |
+| Partida nueva (Game 1) | ✅ Llega a las escenas iniciales; el juego en sí está poco probado |
+| Renderizado Vulkan | ✅ Píxeles y vertex programs en la GPU; ~30 fps fijos, como en la consola |
+| Pantalla panorámica | ✅ `CONKER_ASPECT=16:9` (Hor+); los elementos 2D se estiran |
+| Backend Metal | 🔴 Todavía no |
+| Problemas conocidos | Colores del vídeo FMV; cargas de nivel lentas (~30 s); la emulación USB a veces deja de leer el mando |
 
 ## Prueba rápida
 
 Necesitas una copia **extraída** de un disco que poseas legalmente (la carpeta
-debe contener `default.xbe`; la ISO no se carga directamente).
+debe contener `default.xbe`; la ISO no se carga directamente, extráela por
+ejemplo con `extract-xiso`).
 
 ```sh
 git clone --recurse-submodules <este repositorio>
-cmake -S work/conker/project -B work/conker/project/build -G Ninja
+cmake -S work/conker/project -B work/conker/project/build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build work/conker/project/build
-./work/conker/run_conker.sh /ruta/a/Conker          # Windows: run_conker.ps1
+RECOMP_FB_WINDOW=1 RECOMP_RENDERER=vulkan \
+    ./work/conker/run_conker.sh /ruta/a/Conker      # Windows: run_conker.ps1
 ```
+
+Usa una compilación Release: con `-O0` el código recompilado es muchas veces
+más lento.
+
+### AppImage (Linux)
+
+```sh
+cmake --build work/conker/project/build --target appimage
+./work/conker/project/build/appimage/Conker-Recomp-x86_64.AppImage /ruta/a/Conker
+```
+
+La AppImage no contiene datos del juego. Sin argumento busca el disco extraído
+en `CONKER_GAME_DIR` o en `~/.local/share/conker-recomp/game`. Las partidas se
+guardan en `~/.local/share/conker-recomp/saves`. Abre la ventana y usa Vulkan
+por defecto (si no hay un dispositivo Vulkan utilizable, dibuja la CPU).
+
+Lleva SDL2, libepoxy y libcrypto; glibc, el cargador de Vulkan y los drivers de
+la GPU son los del sistema. Como se compila en Arch, necesita glibc 2.43 o
+posterior. Para distribuciones más antiguas hay que compilarla en una con una
+glibc más vieja. `appimagetool` se toma del `PATH`; si no está, se descarga
+la versión 1.9.0 y se comprueba su SHA-256.
+
+### Controles y opciones
+
+- Teclado (con la ventana abierta): Intro = START, Z = A; también sirven los
+  mandos que reconoce SDL.
+- `RECOMP_RENDERER=vulkan`: renderizado en la GPU. Sin él dibuja la CPU, que
+  es correcta pero va a unos 3 fps.
+- `CONKER_ASPECT=16:9` (o `16:10`, `21:9`, un número): vista panorámica sin
+  deformar el 3D.
+- `RECOMP_FLIP_PACING=0`: quita la sincronía con el vblank (por defecto está
+  activa: 30 fps, como la consola).
+- `RECOMP_VK_VALIDATE=1`: activa las capas de validación de Vulkan.
 
 Dependencias, variables de entorno y cómo regenerar el código:
 [work/conker/README.md](work/conker/README.md). Estado y plan del port:
@@ -45,7 +82,12 @@ Dependencias, variables de entorno y cómo regenerar el código:
 - `work/conker/project/`: el ejecutable de Conker.
   - `src/`: arranque, capa de host por SO y overrides manuales.
   - `src/recomp/gen/`: código C generado a partir del XBE.
-  - `gfx/`: backends gráficos propios (Vulkan, Metal, D3D8 heredado, null).
+  - `gfx/`: los primeros backends del port (Vulkan, Metal, D3D8, null), que
+    no están conectados al ejecutor. El renderizador Vulkan que se usa vive en
+    el toolkit
+    (`external/xboxrecomp/src/vulkan/`, parches 0016–0018).
+- `work/conker/packaging/appimage/`: `AppRun`, entrada de escritorio, icono y
+  el script del objetivo `appimage`.
 - `work/conker/recomp_single_*`, `seed_functions.json`: continuaciones
   recuperadas a mano con el generador anterior.
 - `docs/technical/porting.md`: estado y plan multiplataforma.

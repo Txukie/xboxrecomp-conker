@@ -1,0 +1,20 @@
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index 16d7dff..e661aaa 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -4894,10 +4894,13 @@ void nv2a_pb_exec_report(void)
+     int i, j;
+ 
+     {
+-        /* Frames per second of guest time, from flips between reports. */
++        /* Flips per second of wall time, between reports. This used to
++         * divide by clock(), the CPU time of every thread in the process:
++         * a run whose threads spin less read slower than it was -- Conker
++         * flipping a steady 30 a second under the flip hold reported 18. */
+         static uint32_t last_flips;
+         static unsigned long last_ms;
+-        unsigned long now = (unsigned long)(clock() * 1000.0 / CLOCKS_PER_SEC);
++        unsigned long now = (unsigned long)(xbox_HostNowNs() / 1000000u);
+         if (last_ms && now > last_ms)
+             fprintf(stderr, "[GPU] %.2f fps (%u flips)%c",
+                     (s_gpu.flips - last_flips) * 1000.0 / (now - last_ms),

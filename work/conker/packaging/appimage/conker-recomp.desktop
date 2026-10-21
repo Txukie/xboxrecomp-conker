@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Conker Recomp
+Comment=Static recompilation of Conker: Live & Reloaded (needs your own extracted disc)
+Exec=conker_recomp
+Icon=conker-recomp
+Terminal=false
+Categories=Game;
