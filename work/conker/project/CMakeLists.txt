@@ -24,6 +24,28 @@ find_package(Git QUIET)
 file(GLOB _xboxrecomp_patches
     "${CMAKE_CURRENT_SOURCE_DIR}/../patches/xboxrecomp/*.patch")
 list(SORT _xboxrecomp_patches)
+# The series goes on in order, so the newest patch already in place says
+# everything before it is too: only the ones after it are applied. (Checking
+# each patch alone fails once a later one changed the lines around it.)
+set(_xboxrecomp_reversed ${_xboxrecomp_patches})
+list(REVERSE _xboxrecomp_reversed)
+set(_xboxrecomp_todo)
+foreach(_patch IN LISTS _xboxrecomp_reversed)
+    if(NOT GIT_FOUND)
+        break()
+    endif()
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" apply --reverse --check "${_patch}"
+        WORKING_DIRECTORY "${XBOXRECOMP_DIR}"
+        RESULT_VARIABLE _already OUTPUT_QUIET ERROR_QUIET)
+    if(_already EQUAL 0)
+        break()
+    endif()
+    list(PREPEND _xboxrecomp_todo "${_patch}")
+endforeach()
+if(GIT_FOUND)
+    set(_xboxrecomp_patches ${_xboxrecomp_todo})
+endif()
 foreach(_patch IN LISTS _xboxrecomp_patches)
     get_filename_component(_patch_name "${_patch}" NAME)
     if(NOT GIT_FOUND)

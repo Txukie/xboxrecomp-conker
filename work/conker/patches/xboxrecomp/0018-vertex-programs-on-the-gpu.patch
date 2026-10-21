@@ -1,0 +1,1351 @@
+diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
+index 71bf0a1..ab19180 100644
+--- a/src/kernel/nv2a_backend.h
++++ b/src/kernel/nv2a_backend.h
+@@ -147,6 +147,43 @@ typedef struct {
+     float                 fog_color[4];
+ } Nv2aFullBatch;
+ 
++/* A vertex-program batch, for a back end that runs the program itself (on
++ * a GPU): the vertices as the title stored them, not as the program left
++ * them. The pixel half is an Nv2aFullBatch without vertices.
++ *
++ * Attribute i of vertex `index` is at data + index * stride, `bytes` long
++ * (data points at index 0's element; only min_index..max_index are read,
++ * and the executor checked that all of those lie in guest memory). type is
++ * the NV097 data type (0 D3DCOLOR, 1 S16 normalised, 2 float, 4 U8
++ * normalised, 5 S16, 6 packed 11:11:10), size the components. An attribute
++ * with data NULL reads `value` for every vertex: the current value the
++ * SET_VERTEX_DATA methods left, or 0,0,0,1 for an array that could not be
++ * read. */
++typedef struct {
++    const uint8_t *data;
++    uint32_t stride, type, size, bytes;
++    float    value[4];
++} Nv2aAttrib;
++
++typedef struct {
++    Nv2aFullBatch      pix;          /* vertices/count unused */
++    const uint32_t    *indices;      /* triangle list of vertex indices */
++    uint32_t           count;        /* a multiple of 3 */
++    uint32_t           min_index, max_index;
++    Nv2aAttrib         attr[16];
++    /* nv2a_vsh_export's layout (nv2a_vsh_interp.h), ninst entries, and
++     * c[0..191]. */
++    const uint32_t   (*program)[8];
++    uint32_t           ninst;
++    const float      (*constants)[4];
++    /* What the executor does to oPos after the program: x, y times the
++     * anti-aliasing scale; the near plane is screen z = near_z (the
++     * viewport's z offset) and w = 1e-3; the fog unit's state. */
++    float              aa_sx, aa_sy, near_z;
++    uint32_t           fog_enable, fog_mode;
++    float              fog_param[2];
++} Nv2aProgramBatch;
++
+ typedef struct {
+     /* flags: CLEAR_SURFACE bits (Z 0x1, stencil 0x2, colour 0xF0).
+      * zstencil: SET_ZSTENCIL_CLEAR_VALUE (depth in the top 24 bits for Z24S8). */
+@@ -164,6 +201,9 @@ typedef struct {
+     void (*report_clear)(void);
+     uint32_t (*report_read)(void);
+     void (*resolve)(uint32_t color_va);
++    /* draw_program: vertex-program batches, transformed by the back end.
++     * Optional; without it they arrive through draw_full, transformed. */
++    void (*draw_program)(const Nv2aSurface *s, const Nv2aProgramBatch *b);
+ } Nv2aBackend;
+ 
+ /* Register (or, with NULL, remove) the back end. Call before the title starts
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index 828e268..16d7dff 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -2105,22 +2105,18 @@ static void stage_from_texture(const Texture *t, Nv2aStage *o)
+ /* A full batch: the combiners when the vertex stage produced the vertices
+  * (`xf`) and a combiner program has arrived, as raster_xf_triangle decides;
+  * otherwise stage 0 times diffuse, `textured` saying whether it samples. */
+-static void backend_flush_full(int textured, int xf)
++static void full_batch_state(Nv2aFullBatch *bp, Nv2aRenderState *rs,
++                             int textured, int xf)
+ {
+     static int no_rc = -1;
+-    Nv2aSurface surf;
+-    Nv2aRenderState rs;
+     Nv2aFullBatch b;
+     int st;
+ 
+     if (no_rc < 0)
+         no_rc = getenv("RECOMP_NO_COMBINERS") != NULL;
+-    current_surface(&surf);
+-    current_render_state(&rs);
++    current_render_state(rs);
+     memset(&b, 0, sizeof b);
+-    b.vertices = s_bfull;
+-    b.count = s_bcount;
+-    b.state = &rs;
++    b.state = rs;
+     b.use_rc = (uint32_t)(xf && s_gpu.rc_seen && !no_rc);
+     b.rc = &s_gpu.rc;
+     for (st = 0; st < 4; st++)
+@@ -2135,6 +2131,19 @@ static void backend_flush_full(int textured, int xf)
+     /* FOG_COLOR is R in bits 0-7, the reverse of a D3DCOLOR. */
+     nv2a_rc_unpack(s_gpu.fog_color, b.fog_color);
+     { float r = b.fog_color[2]; b.fog_color[2] = b.fog_color[0]; b.fog_color[0] = r; }
++    *bp = b;
++}
++
++static void backend_flush_full(int textured, int xf)
++{
++    Nv2aSurface surf;
++    Nv2aRenderState rs;
++    Nv2aFullBatch b;
++
++    current_surface(&surf);
++    full_batch_state(&b, &rs, textured, xf);
++    b.vertices = s_bfull;
++    b.count = s_bcount;
+     s_backend->draw_full(&surf, &b);
+     s_gpu.tris_drawn += s_bcount / 3;
+     s_bcount = 0;
+@@ -3229,10 +3238,140 @@ static int xf_transform_batch(uint32_t nverts)
+     return 1;
+ }
+ 
++/* ---- Vertex programs on the back end ------------------------------------
++ *
++ * A back end with draw_program runs the title's vertex program itself, so a
++ * program batch goes over as the title stored it: the attribute arrays, the
++ * index list as triangles, and the program and constants. The CPU then does
++ * no per-vertex work at all for it -- which on Conker's front end was most of
++ * the executor's time once the GPU drew the pixels. A program that writes
++ * constants (_CXT_WRITE_EN) depends on vertex order, and stays here. */
++static int backend_program(void)
++{
++    return s_backend && s_backend->draw_program && s_backend->draw_full;
++}
++
++/* The primitive as a triangle list of vertex indices, in the order
++ * raster_batch_program assembles it. Returns the index count. */
++static uint32_t *s_ptri;
++
++static uint32_t program_triangles(uint32_t n)
++{
++    const uint32_t *x = s_gpu.idx;
++    uint32_t i, m = 0;
++
++    if (!s_ptri && !(s_ptri = (uint32_t *)malloc(sizeof *s_ptri * NV_MAX_INDICES * 3)))
++        return 0;
++#define TRI(a, b, c) (s_ptri[m] = x[a], s_ptri[m + 1] = x[b], s_ptri[m + 2] = x[c], m += 3)
++    switch (s_gpu.prim) {
++    case NV_PRIM_TRIANGLES:
++        for (i = 0; i + 2 < n; i += 3) TRI(i, i + 1, i + 2);
++        break;
++    case NV_PRIM_TRIANGLE_STRIP:
++        for (i = 0; i + 2 < n; i++) TRI(i, i + 1, i + 2);
++        break;
++    case NV_PRIM_TRIANGLE_FAN:
++    case NV_PRIM_POLYGON:
++        for (i = 1; i + 1 < n; i++) TRI(0, i, i + 1);
++        break;
++    case NV_PRIM_QUADS:
++        for (i = 0; i + 3 < n; i += 4) { TRI(i, i + 1, i + 2); TRI(i, i + 2, i + 3); }
++        break;
++    case NV_PRIM_QUAD_STRIP:
++        for (i = 0; i + 3 < n; i += 2) { TRI(i, i + 1, i + 3); TRI(i, i + 3, i + 2); }
++        break;
++    default:
++        break;
++    }
++#undef TRI
++    return m;
++}
++
++static void backend_program_batch(void)
++{
++    static uint32_t prog[NV2A_VSH_SLOTS][8];
++    static int near_z = -1;
++    Nv2aProgramBatch pb;
++    Nv2aRenderState rs;
++    Nv2aSurface surf;
++    uint32_t n = s_gpu.idx_count, i, lo = 0xFFFFFFFFu, hi = 0;
++    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
++
++    if (near_z < 0) {
++        const char *e = getenv("RECOMP_CLIP_NEAR_Z");
++        near_z = !(e && e[0] == '0');
++    }
++    memset(&pb, 0, sizeof pb);
++    pb.ninst = (uint32_t)nv2a_vsh_export(prog);
++    if (!pb.ninst)
++        return;                                        /* no program loaded */
++    pb.count = program_triangles(n);
++    if (!pb.count)
++        return;
++    pb.indices = s_ptri;
++    for (i = 0; i < n; i++) {
++        if (s_gpu.idx[i] < lo) lo = s_gpu.idx[i];
++        if (s_gpu.idx[i] > hi) hi = s_gpu.idx[i];
++    }
++    pb.min_index = lo;
++    pb.max_index = hi;
++    for (i = 0; i < NV2A_VSH_INPUTS; i++) {
++        const VertexAttr *at = &s_gpu.attr[i];
++        Nv2aAttrib *o = &pb.attr[i];
++        uint64_t first, span;
++
++        o->value[0] = o->value[1] = o->value[2] = 0.0f;
++        o->value[3] = 1.0f;
++        if (!at->size) {                   /* the current value (transform_vertex) */
++            memcpy(o->value, s_gpu.imm_attr[i], sizeof o->value);
++            continue;
++        }
++        if (!at->stride || (!at->offset && !s_gpu.inline_active))
++            continue;
++        o->stride = at->stride;
++        o->type = at->type;
++        o->size = at->size;
++        o->bytes = attr_elem_bytes(at);
++        first = (uint64_t)at->offset + (uint64_t)lo * at->stride;
++        span = (uint64_t)(hi - lo) * at->stride + o->bytes;
++        if (s_gpu.inline_active) {
++            if (first + span > (uint64_t)s_gpu.inline_count * 4)
++                continue;
++            o->data = (const uint8_t *)s_gpu.inline_buf + at->offset;
++        } else {
++            if (span > 0xFFFFFFFFu || !guest_span_ok(first, (uint32_t)span))
++                continue;
++            o->data = mem + at->offset;
++        }
++    }
++    pb.program = (const uint32_t (*)[8])prog;
++    pb.constants = nv2a_vsh_constants();
++    xf_set_viewport();
++    pb.aa_sx = s_gpu.aa_sx;
++    pb.aa_sy = s_gpu.aa_sy;
++    pb.near_z = near_z ? s_xf_o[2] : -1e30f;
++    pb.fog_enable = s_gpu.fog_enable;
++    pb.fog_mode = s_gpu.fog_mode;
++    pb.fog_param[0] = s_gpu.fog_param[0];
++    pb.fog_param[1] = s_gpu.fog_param[1];
++    current_surface(&surf);
++    full_batch_state(&pb.pix, &rs, 1, 1);
++    s_gpu.batches_program++;
++    s_gpu.verts_program += n;
++    s_backend->draw_program(&surf, &pb);
++    s_gpu.tris_drawn += pb.count / 3;
++    note_drawn();
++}
++
+ static void raster_batch_program(void)
+ {
+     uint32_t i, n = s_gpu.idx_count;
+ 
++    if (backend_program() && batch_uses_program() && !nv2a_vsh_cxt_write()) {
++        backend_program_batch();
++        return;
++    }
++
+     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
+         return;
+     if (!xf_transform_batch(n))
+diff --git a/src/kernel/nv2a_vsh_interp.c b/src/kernel/nv2a_vsh_interp.c
+index 52740a4..c065159 100644
+--- a/src/kernel/nv2a_vsh_interp.c
++++ b/src/kernel/nv2a_vsh_interp.c
+@@ -303,6 +303,37 @@ void nv2a_vsh_prepare(void)
+     }
+ }
+ 
++int nv2a_vsh_export(uint32_t out[NV2A_VSH_SLOTS][8])
++{
++    int i, k;
++
++    nv2a_vsh_prepare();
++    for (i = 0; i < s_ndecoded; i++) {
++        const VshIns *d = &s_decoded[i];
++        out[i][0] = d->mac | (uint32_t)d->ilu << 4 | (uint32_t)d->mac_mask << 8
++                  | (uint32_t)d->ilu_mask << 12 | (uint32_t)d->omask << 16
++                  | (uint32_t)d->out_ilu << 20 | (uint32_t)d->out_to_o << 21
++                  | (uint32_t)d->need_a << 22 | (uint32_t)d->need_b << 23
++                  | (uint32_t)d->need_c << 24;
++        out[i][1] = d->oaddr | (uint32_t)(uint8_t)(d->mac_dst + 1) << 8
++                  | (uint32_t)(uint8_t)(d->ilu_dst + 1) << 16;
++        for (k = 0; k < 3; k++) {
++            const VshSrc *r = &d->src[k];
++            out[i][2 + k] = r->kind | (uint32_t)r->idx << 4 | (uint32_t)r->neg << 9
++                          | (uint32_t)r->swz[0] << 10 | (uint32_t)r->swz[1] << 12
++                          | (uint32_t)r->swz[2] << 14 | (uint32_t)r->swz[3] << 16
++                          | ((uint32_t)r->ci & 0xFFFu) << 18;
++        }
++        out[i][5] = out[i][6] = out[i][7] = 0;
++    }
++    return s_ndecoded;
++}
++
++const float (*nv2a_vsh_constants(void))[4]
++{
++    return (const float (*)[4])s_const;
++}
++
+ /* Results go through pointers rather than come back as a vec4: a 16-byte
+  * struct returned by value was repacked from two registers and stored again
+  * at every call, and those stalls were the interpreter's hottest lines. */
+diff --git a/src/kernel/nv2a_vsh_interp.h b/src/kernel/nv2a_vsh_interp.h
+index 4d3ec0f..a2ab36d 100644
+--- a/src/kernel/nv2a_vsh_interp.h
++++ b/src/kernel/nv2a_vsh_interp.h
+@@ -57,6 +57,20 @@ void nv2a_vsh_prepare(void);
+  * transform this batch" rather than drawing garbage. */
+ int  nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
+ 
++/* The program from the start slot, decoded, for a back end that runs it on
++ * a GPU: one entry of eight words per instruction, returning how many (0:
++ * no FINAL, nothing to run). Layout -- keep src/vulkan/shaders/nv2a_vsh.vert
++ * in step:
++ *   [0] mac | ilu<<4 | mac_mask<<8 | ilu_mask<<12 | omask<<16 | out_ilu<<20
++ *       | out_to_o<<21 | need_a<<22 | need_b<<23 | need_c<<24
++ *   [1] oaddr | (mac_dst+1)<<8 | (ilu_dst+1)<<16   (dst: 0 none, 13 oPos)
++ *   [2..4] sources A, B, C: kind | idx<<4 | neg<<9 | swizzle x,y,z,w 2 bits
++ *       each from bit 10 | constant index<<18; kind 0 temp, 1 oPos, 2 input,
++ *       3 constant, 4 constant + a0.x
++ * and nv2a_vsh_constants() is c[0..NV2A_VSH_CONSTANTS). */
++int nv2a_vsh_export(uint32_t out[NV2A_VSH_SLOTS][8]);
++const float (*nv2a_vsh_constants(void))[4];
++
+ /* Direct access, for the self-test. */
+ void nv2a_vsh_set_constant(uint32_t index, const float v[4]);
+ const float *nv2a_vsh_constant(uint32_t index);   /* for traces */
+diff --git a/src/vulkan/CMakeLists.txt b/src/vulkan/CMakeLists.txt
+index 36b7f40..1768501 100644
+--- a/src/vulkan/CMakeLists.txt
++++ b/src/vulkan/CMakeLists.txt
+@@ -11,7 +11,7 @@ endif()
+ 
+ set(_vk_gen "${CMAKE_CURRENT_BINARY_DIR}/shaders")
+ set(_vk_spv)
+-foreach(_shader nv2a.vert nv2a.frag)
++foreach(_shader nv2a.vert nv2a.frag nv2a_vsh.vert)
+     add_custom_command(
+         OUTPUT "${_vk_gen}/${_shader}.inc"
+         COMMAND "${CMAKE_COMMAND}" -E make_directory "${_vk_gen}"
+diff --git a/src/vulkan/nv2a_vk.c b/src/vulkan/nv2a_vk.c
+index b2c4ec4..15d0921 100644
+--- a/src/vulkan/nv2a_vk.c
++++ b/src/vulkan/nv2a_vk.c
+@@ -39,9 +39,12 @@ static const uint32_t k_vert_spv[] =
+ static const uint32_t k_frag_spv[] =
+ #include "nv2a.frag.inc"
+ ;
++static const uint32_t k_vsh_spv[] =
++#include "nv2a_vsh.vert.inc"
++;
+ 
+ #define VK_RING_VERTS   (64u << 20)
+-#define VK_RING_UNIFORM (16u << 20)
++#define VK_RING_UNIFORM (32u << 20)
+ #define VK_RING_UPLOAD  (64u << 20)
+ #define VK_RING_READ    (32u << 20)
+ #define VK_MAX_QUERIES  8192
+@@ -74,12 +77,12 @@ static VkPhysicalDeviceMemoryProperties s_memprops;
+ static VkDeviceSize     s_ubo_align = 256;
+ static VkFormat         s_depth_fmt;
+ static int              s_recording, s_rendering;
+-static int              s_precise, s_depth_clamp;
++static int              s_precise, s_depth_clamp, s_clip_dist;
+ static PFN_vkCmdPushDescriptorSetKHR s_push_desc;
+ 
+ static VkDescriptorSetLayout s_dsl;
+ static VkPipelineLayout      s_layout;
+-static VkShaderModule        s_vs, s_fs;
++static VkShaderModule        s_vs, s_fs, s_vsh;
+ static VkQueryPool           s_qpool;
+ 
+ typedef struct {
+@@ -91,6 +94,13 @@ typedef struct {
+ 
+ static Ring s_rv, s_ru, s_rup, s_rrd;
+ 
++/* Program batches' constants and program, as last copied to s_ru (a flush
++ * rewinds the ring and forgets them). */
++#define NV2A_VSH_SLOTS_VK 136
++static VkDeviceSize s_kc_off = UINT64_MAX, s_kp_off = UINT64_MAX;
++static float s_kc_last[192][4];
++static uint32_t s_kp_last[NV2A_VSH_SLOTS_VK][8], s_kp_n;
++
+ typedef struct {
+     VkImage image;
+     VkDeviceMemory mem;
+@@ -327,6 +337,7 @@ static Zeta *s_rt_z;
+ static uint32_t s_frame = 1, s_use;
+ static uint32_t s_resolve_gen = 1;
+ static uint32_t s_writes;        /* Surf.version: unique across rebuilds */
++static uint32_t s_alias_syncs;
+ 
+ typedef struct { Surf *s; VkDeviceSize off; } Readback;
+ static Readback s_reads[VK_MAX_SURFACES];
+@@ -536,6 +547,33 @@ static Surf *surf_get(const Nv2aSurface *ns, uint32_t need_h)
+         s->force_upload = 1;
+     }
+     s->last_use = ++s_use;
++    /* Another view of the same memory -- the other layout, or a different
++     * pitch -- holding what the GPU drew: that goes to guest memory first,
++     * and this one picks it up from there. On the console both are just the
++     * bytes. Conker's front end clears its 256x256 text target as one layout
++     * and draws into it as the other; kept apart, the drawn image was never
++     * cleared, and a frame's worth of text piled onto every frame before. */
++    {
++        int i, any = 0;
++        for (i = 0; i < VK_MAX_SURFACES; i++) {
++            Surf *o = &s_surfs[i];
++            if (o == s || !o->color.image || !o->gpu_dirty
++                || o->va >= s->va + surf_span(s) || s->va >= o->va + surf_span(o))
++                continue;
++            if (o->version > s->version) {
++                surf_queue_readback(o);
++                any = 1;
++            } else {              /* older than what this one drew: drop it */
++                o->gpu_dirty = 0;
++                o->force_upload = 1;
++            }
++        }
++        if (any) {
++            flush();
++            s->checked_frame = 0;
++            s_alias_syncs++;
++        }
++    }
+     if (s->force_upload || s->checked_frame != s_frame) {
+         uint64_t hsh = surf_hash_guest(s);
+         if (s->force_upload || hsh != s->guest_hash) {
+@@ -919,6 +957,7 @@ static VkSampler sampler_get(int linear, uint32_t au, uint32_t av)
+ 
+ typedef struct {
+     uint32_t fmt, depth, blend, src, dst, eq, mask;
++    uint32_t vsh;            /* the vertex program runs here (nv2a_vsh.vert) */
+ } PipeKey;
+ 
+ static struct { PipeKey k; VkPipeline p; } s_pipes[VK_MAX_PIPES];
+@@ -1001,10 +1040,12 @@ static VkPipeline pipe_get(const PipeKey *k)
+     va[3].offset = offsetof(Nv2aFullVertex, fog);
+     for (i = 0; i < 4; i++)
+         va[4 + i].offset = (uint32_t)(offsetof(Nv2aFullVertex, tex) + 16 * i);
+-    vi.vertexBindingDescriptionCount = 1;
+-    vi.pVertexBindingDescriptions = &vb;
+-    vi.vertexAttributeDescriptionCount = 8;
+-    vi.pVertexAttributeDescriptions = va;
++    if (!k->vsh) {           /* a program batch pulls its own vertices */
++        vi.vertexBindingDescriptionCount = 1;
++        vi.pVertexBindingDescriptions = &vb;
++        vi.vertexAttributeDescriptionCount = 8;
++        vi.pVertexAttributeDescriptions = va;
++    }
+     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+     vp.viewportCount = 1;
+     vp.scissorCount = 1;
+@@ -1031,7 +1072,7 @@ static VkPipeline pipe_get(const PipeKey *k)
+     memset(st, 0, sizeof st);
+     st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+     st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+-    st[0].module = s_vs;
++    st[0].module = k->vsh ? s_vsh : s_vs;
+     st[0].pName = "main";
+     st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+     st[1].module = s_fs;
+@@ -1072,7 +1113,7 @@ static uint64_t s_report_acc;
+ 
+ /* ---- Flush ---------------------------------------------------------- */
+ 
+-static uint32_t s_flushes, s_draws, s_tris;
++static uint32_t s_flushes, s_draws, s_tris, s_prog_draws;
+ 
+ static void flush(void)
+ {
+@@ -1119,6 +1160,7 @@ static void flush(void)
+         img_destroy_now(&s_dead[i]);
+     s_ndead = 0;
+     s_rv.used = s_ru.used = s_rup.used = s_rrd.used = 0;
++    s_kc_off = s_kp_off = UINT64_MAX;
+ }
+ 
+ /* ---- The back end --------------------------------------------------- */
+@@ -1275,29 +1317,20 @@ static void vk_clear(const Nv2aSurface *ns, const Nv2aRenderState *rs,
+     vkCmdClearAttachments(cmd(), n, at, 1, &rect);
+ }
+ 
+-static void vk_draw_full(const Nv2aSurface *ns, const Nv2aFullBatch *b)
++/* Per-draw vertex-stage uniforms: shaders/nv2a_vsh.vert's VshDraw, std140. */
++typedef struct {
++    uint32_t attr[16][4];
++    float    value[16][4];
++    float    vp[4], vp2[4], fogp[4];
++} VkVshDraw;
++
++/* The textures a batch's stages sample, as descriptors (decoding or
++ * resolving one may flush, so this comes first). */
++static void stage_descriptors(const Nv2aFullBatch *b, VkDescriptorImageInfo img2d[4],
++                              VkDescriptorImageInfo imgcube[4])
+ {
+-    const Nv2aRenderState *rs = b->state;
+-    VkDescriptorImageInfo img2d[4], imgcube[4];
+-    VkDescriptorBufferInfo ubi;
+-    VkWriteDescriptorSet w[3];
+-    VkDraw *u;
+-    VkDeviceSize uoff, voff;
+-    Nv2aFullVertex *vo;
+-    PipeKey pk;
+-    VkPipeline pipe;
+-    VkCommandBuffer c;
+-    Surf *s;
+-    Zeta *z;
+-    float zmax = zmax_of(rs->zeta_format), sx, sy;
+-    uint32_t i, st;
+-    int need_z, use_q;
+-    VkDeviceSize vbytes = (VkDeviceSize)b->count * sizeof(Nv2aFullVertex);
+-
+-    if (!b->count || vbytes > s_rv.size)
+-        return;
++    uint32_t st;
+ 
+-    /* Textures first: decoding or resolving one may flush. */
+     for (st = 0; st < 4; st++) {
+         const Nv2aStage *sg = &b->stage[st];
+         uint32_t mode = b->use_rc ? (b->rc->stage_program >> (st * 5)) & 0x1F
+@@ -1312,32 +1345,15 @@ static void vk_draw_full(const Nv2aSurface *ns, const Nv2aFullBatch *b)
+         img2d[st].imageView = (im && !cube) ? im->view : s_white2d.view;
+         imgcube[st].imageView = cube ? im->view : s_whitecube.view;
+     }
++}
+ 
+-    s = surf_get(ns, ns->clip_y + ns->height);
+-    if (!s)
+-        return;
+-    need_z = rs->depth_test_enable || rs->depth_write
+-          || (s_stencil && rs->stencil_enable);
+-    z = zeta_for(rs, s, need_z);
+-
+-    uoff = ring_take(&s_ru, sizeof(VkDraw), s_ubo_align);
+-    voff = ring_take(&s_rv, vbytes, 16);
+-    use_q = rs->zpass_enable != 0;
+-    if (uoff == UINT64_MAX || voff == UINT64_MAX
+-        || (use_q && s_q_used == VK_MAX_QUERIES)) {
+-        flush();
+-        /* The flush may have retired nothing we hold, but the open pass is
+-         * gone: take everything again. */
+-        s = surf_get(ns, ns->clip_y + ns->height);
+-        if (!s)
+-            return;
+-        z = zeta_for(rs, s, need_z);
+-        uoff = ring_take(&s_ru, sizeof(VkDraw), s_ubo_align);
+-        voff = ring_take(&s_rv, vbytes, 16);
+-    }
++static void fill_draw_uniforms(VkDraw *u, const Nv2aFullBatch *b,
++                               const VkDescriptorImageInfo img2d[4],
++                               const VkDescriptorImageInfo imgcube[4])
++{
++    const Nv2aRenderState *rs = b->state;
++    uint32_t i, st;
+ 
+-    /* Uniforms. */
+-    u = (VkDraw *)(s_ru.map + uoff);
+     memset(u, 0, sizeof *u);
+     memcpy(u->cicw, b->rc->color_icw, 32);
+     memcpy(u->aicw, b->rc->alpha_icw, 32);
+@@ -1372,36 +1388,39 @@ static void vk_draw_full(const Nv2aSurface *ns, const Nv2aFullBatch *b)
+         nv2a_rc_unpack(sg->border, u->border[st]);
+     }
+     memcpy(u->fogc, b->fog_color, 16);
++}
+ 
+-    /* Vertices: surface pixels to clip coordinates over the whole image. */
+-    vo = (Nv2aFullVertex *)(s_rv.map + voff);
+-    memcpy(vo, b->vertices, (size_t)vbytes);
+-    sx = 2.0f / (float)s->w;
+-    sy = 2.0f / (float)s->h;
+-    for (i = 0; i < b->count; i++) {
+-        float *p = vo[i].pos, wv = p[3];
+-        p[0] = (p[0] * sx - 1.0f) * wv;
+-        p[1] = (p[1] * sy - 1.0f) * wv;
+-        p[2] = p[2] / zmax * wv;
++static void pipe_key(PipeKey *pk, const Surf *s, const Zeta *z,
++                     const Nv2aRenderState *rs, int vsh)
++{
++    memset(pk, 0, sizeof *pk);
++    pk->fmt = (uint32_t)s->color.fmt;
++    pk->depth = z != NULL;
++    pk->vsh = (uint32_t)vsh;
++    pk->blend = rs->blend_enable && !(rs->blend_src == 1 && rs->blend_dst == 0);
++    if (pk->blend) {
++        pk->src = rs->blend_src;
++        pk->dst = rs->blend_dst;
++        pk->eq = rs->blend_eq;
+     }
++    pk->mask = ((rs->color_mask & 0x00010000u) ? VK_COLOR_COMPONENT_R_BIT : 0)
++             | ((rs->color_mask & 0x00000100u) ? VK_COLOR_COMPONENT_G_BIT : 0)
++             | ((rs->color_mask & 0x00000001u) ? VK_COLOR_COMPONENT_B_BIT : 0)
++             | ((rs->color_mask & 0x01000000u) ? VK_COLOR_COMPONENT_A_BIT : 0);
++}
+ 
+-    /* Pipeline. */
+-    memset(&pk, 0, sizeof pk);
+-    pk.fmt = (uint32_t)s->color.fmt;
+-    pk.depth = z != NULL;
+-    pk.blend = rs->blend_enable && !(rs->blend_src == 1 && rs->blend_dst == 0);
+-    if (pk.blend) {
+-        pk.src = rs->blend_src;
+-        pk.dst = rs->blend_dst;
+-        pk.eq = rs->blend_eq;
+-    }
+-    pk.mask = ((rs->color_mask & 0x00010000u) ? VK_COLOR_COMPONENT_R_BIT : 0)
+-            | ((rs->color_mask & 0x00000100u) ? VK_COLOR_COMPONENT_G_BIT : 0)
+-            | ((rs->color_mask & 0x00000001u) ? VK_COLOR_COMPONENT_B_BIT : 0)
+-            | ((rs->color_mask & 0x01000000u) ? VK_COLOR_COMPONENT_A_BIT : 0);
+-    pipe = pipe_get(&pk);
+-    if (!pipe)
+-        return;
++/* Everything a draw needs bound, both kinds. `nw` descriptor writes beyond
++ * the pixel stage's three (the vertex stage's, for program batches). */
++static VkCommandBuffer bind_draw(const Nv2aSurface *ns, const Nv2aRenderState *rs,
++                                 Surf *s, Zeta *z, VkPipeline pipe, VkDeviceSize uoff,
++                                 VkDescriptorImageInfo img2d[4],
++                                 VkDescriptorImageInfo imgcube[4],
++                                 const VkWriteDescriptorSet *extra, uint32_t nextra)
++{
++    VkDescriptorBufferInfo ubi;
++    VkWriteDescriptorSet w[8];
++    VkCommandBuffer c;
++    uint32_t i;
+ 
+     begin_rendering(s, z);
+     c = cmd();
+@@ -1425,7 +1444,82 @@ static void vk_draw_full(const Nv2aSurface *ns, const Nv2aFullBatch *b)
+     w[2].dstBinding = 5;
+     w[2].descriptorCount = 4;
+     w[2].pImageInfo = imgcube;
+-    s_push_desc(c, VK_PIPELINE_BIND_POINT_GRAPHICS, s_layout, 0, 3, w);
++    for (i = 0; i < nextra && i < 5; i++)
++        w[3 + i] = extra[i];
++    s_push_desc(c, VK_PIPELINE_BIND_POINT_GRAPHICS, s_layout, 0, 3 + i, w);
++    return c;
++}
++
++static void end_draw(VkCommandBuffer c, Surf *s, const PipeKey *pk, int use_q)
++{
++    (void)c;
++    if (pk->mask) {
++        s->gpu_dirty = 1;
++        s->version = ++s_writes;
++    }
++    (void)use_q;
++    s_draws++;
++}
++
++static void vk_draw_full(const Nv2aSurface *ns, const Nv2aFullBatch *b)
++{
++    const Nv2aRenderState *rs = b->state;
++    VkDescriptorImageInfo img2d[4], imgcube[4];
++    VkDeviceSize uoff, voff;
++    Nv2aFullVertex *vo;
++    PipeKey pk;
++    VkPipeline pipe;
++    VkCommandBuffer c;
++    Surf *s;
++    Zeta *z;
++    float zmax = zmax_of(rs->zeta_format), sx, sy;
++    uint32_t i;
++    int need_z, use_q;
++    VkDeviceSize vbytes = (VkDeviceSize)b->count * sizeof(Nv2aFullVertex);
++
++    if (!b->count || vbytes > s_rv.size)
++        return;
++    stage_descriptors(b, img2d, imgcube);
++    s = surf_get(ns, ns->clip_y + ns->height);
++    if (!s)
++        return;
++    need_z = rs->depth_test_enable || rs->depth_write
++          || (s_stencil && rs->stencil_enable);
++    z = zeta_for(rs, s, need_z);
++
++    uoff = ring_take(&s_ru, sizeof(VkDraw), s_ubo_align);
++    voff = ring_take(&s_rv, vbytes, 16);
++    use_q = rs->zpass_enable != 0;
++    if (uoff == UINT64_MAX || voff == UINT64_MAX
++        || (use_q && s_q_used == VK_MAX_QUERIES)) {
++        flush();
++        /* The open pass is gone: take everything again. */
++        s = surf_get(ns, ns->clip_y + ns->height);
++        if (!s)
++            return;
++        z = zeta_for(rs, s, need_z);
++        uoff = ring_take(&s_ru, sizeof(VkDraw), s_ubo_align);
++        voff = ring_take(&s_rv, vbytes, 16);
++    }
++    fill_draw_uniforms((VkDraw *)(s_ru.map + uoff), b, img2d, imgcube);
++
++    /* Vertices: surface pixels to clip coordinates over the whole image. */
++    vo = (Nv2aFullVertex *)(s_rv.map + voff);
++    memcpy(vo, b->vertices, (size_t)vbytes);
++    sx = 2.0f / (float)s->w;
++    sy = 2.0f / (float)s->h;
++    for (i = 0; i < b->count; i++) {
++        float *p = vo[i].pos, wv = p[3];
++        p[0] = (p[0] * sx - 1.0f) * wv;
++        p[1] = (p[1] * sy - 1.0f) * wv;
++        p[2] = p[2] / zmax * wv;
++    }
++
++    pipe_key(&pk, s, z, rs, 0);
++    pipe = pipe_get(&pk);
++    if (!pipe)
++        return;
++    c = bind_draw(ns, rs, s, z, pipe, uoff, img2d, imgcube, NULL, 0);
+     vkCmdBindVertexBuffers(c, 0, 1, &s_rv.buf, &voff);
+     if (use_q)
+         vkCmdBeginQuery(c, s_qpool, s_q_used,
+@@ -1433,12 +1527,196 @@ static void vk_draw_full(const Nv2aSurface *ns, const Nv2aFullBatch *b)
+     vkCmdDraw(c, b->count, 1, 0, 0);
+     if (use_q)
+         vkCmdEndQuery(c, s_qpool, s_q_used++);
+-    if (pk.mask) {
+-        s->gpu_dirty = 1;
+-        s->version = ++s_writes;
++    end_draw(c, s, &pk, use_q);
++    s_tris += b->count / 3;
++}
++
++/* Program batches. The constants and the program change far less often than
++ * draws happen, so each is copied to the ring only when it differs from the
++ * last copy (until a flush rewinds the ring). */
++
++/* One copy of vertex data per group of attributes that share an array
++ * (interleaved: same stride, starts less than a stride apart). */
++typedef struct { const uint8_t *base; uint32_t stride, end; VkDeviceSize off; } Stream;
++
++static void vk_draw_program(const Nv2aSurface *ns, const Nv2aProgramBatch *b)
++{
++    const Nv2aFullBatch *pix = &b->pix;
++    const Nv2aRenderState *rs = pix->state;
++    VkDescriptorImageInfo img2d[4], imgcube[4];
++    VkDescriptorBufferInfo bi[4];
++    VkWriteDescriptorSet w[4];
++    Stream st[16];
++    int ns_ = 0, order[16], na = 0, i, j, need_z, use_q;
++    uint32_t nv = b->max_index - b->min_index + 1, k;
++    VkDeviceSize uoff, voff, ioff, total = 0, ibytes = (VkDeviceSize)b->count * 4;
++    VkVshDraw *vd;
++    PipeKey pk;
++    VkPipeline pipe;
++    VkCommandBuffer c;
++    Surf *s;
++    Zeta *z;
++    uint32_t *ix;
++
++    if (!b->count || !b->ninst || b->ninst > NV2A_VSH_SLOTS_VK)
++        return;
++    stage_descriptors(pix, img2d, imgcube);
++    s = surf_get(ns, ns->clip_y + ns->height);
++    if (!s)
++        return;
++    need_z = rs->depth_test_enable || rs->depth_write
++          || (s_stencil && rs->stencil_enable);
++    z = zeta_for(rs, s, need_z);
++
++    /* Attribute arrays into streams, by start address. */
++    for (i = 0; i < 16; i++)
++        if (b->attr[i].data)
++            order[na++] = i;
++    for (i = 1; i < na; i++)
++        for (j = i; j > 0 && b->attr[order[j]].data < b->attr[order[j - 1]].data; j--) {
++            int t = order[j]; order[j] = order[j - 1]; order[j - 1] = t;
++        }
++    for (i = 0; i < na; i++) {
++        const Nv2aAttrib *a = &b->attr[order[i]];
++        uint32_t end = (uint32_t)((uint64_t)(nv - 1) * a->stride + a->bytes);
++        if (ns_ && st[ns_ - 1].stride == a->stride
++            && a->data - st[ns_ - 1].base < (ptrdiff_t)a->stride) {
++            uint32_t rel = (uint32_t)(a->data - st[ns_ - 1].base) + end;
++            if (rel > st[ns_ - 1].end) st[ns_ - 1].end = rel;
++            continue;
++        }
++        st[ns_].base = a->data;
++        st[ns_].stride = a->stride;
++        st[ns_].end = end;
++        ns_++;
+     }
+-    s_draws++;
++    for (i = 0; i < ns_; i++)
++        total += ((VkDeviceSize)st[i].end + 4 + 15) & ~(VkDeviceSize)15;
++    if (total + ibytes + 64 > s_rv.size)
++        return;
++
++    use_q = rs->zpass_enable != 0;
++    for (int pass = 0; pass < 2; pass++) {
++        int ok = 1;
++        uoff = ring_take(&s_ru, sizeof(VkDraw), s_ubo_align);
++        {
++            VkDeviceSize d = ring_take(&s_ru, sizeof(VkVshDraw), s_ubo_align);
++            ok &= d != UINT64_MAX;
++            if (ok) {
++                vd = (VkVshDraw *)(s_ru.map + d);
++                bi[3].buffer = s_ru.buf;
++                bi[3].offset = d;
++                bi[3].range = sizeof(VkVshDraw);
++            }
++        }
++        if (s_kc_off == UINT64_MAX || memcmp(s_kc_last, b->constants, sizeof s_kc_last)) {
++            s_kc_off = ring_take(&s_ru, sizeof s_kc_last, s_ubo_align);
++            if (s_kc_off != UINT64_MAX) {
++                memcpy(s_kc_last, b->constants, sizeof s_kc_last);
++                memcpy(s_ru.map + s_kc_off, s_kc_last, sizeof s_kc_last);
++            }
++        }
++        if (s_kp_off == UINT64_MAX || s_kp_n != b->ninst
++            || memcmp(s_kp_last, b->program, b->ninst * 32)) {
++            s_kp_off = ring_take(&s_ru, sizeof s_kp_last, s_ubo_align);
++            if (s_kp_off != UINT64_MAX) {
++                memcpy(s_kp_last, b->program, b->ninst * 32);
++                s_kp_n = b->ninst;
++                memcpy(s_ru.map + s_kp_off, s_kp_last, sizeof s_kp_last);
++            }
++        }
++        voff = ring_take(&s_rv, total, 16);
++        ioff = ring_take(&s_rv, ibytes, 16);
++        ok &= uoff != UINT64_MAX && s_kc_off != UINT64_MAX && s_kp_off != UINT64_MAX
++           && voff != UINT64_MAX && ioff != UINT64_MAX
++           && !(use_q && s_q_used == VK_MAX_QUERIES);
++        if (ok)
++            break;
++        if (pass)
++            return;
++        flush();
++        s = surf_get(ns, ns->clip_y + ns->height);
++        if (!s)
++            return;
++        z = zeta_for(rs, s, need_z);
++    }
++    fill_draw_uniforms((VkDraw *)(s_ru.map + uoff), pix, img2d, imgcube);
++
++    /* Vertex data, from the batch's lowest index on. */
++    {
++        VkDeviceSize at = voff;
++        for (i = 0; i < ns_; i++) {
++            memcpy(s_rv.map + at, st[i].base + (size_t)b->min_index * st[i].stride,
++                   st[i].end);
++            memset(s_rv.map + at + st[i].end, 0, 4);
++            st[i].off = at;
++            at += ((VkDeviceSize)st[i].end + 4 + 15) & ~(VkDeviceSize)15;
++        }
++    }
++    memset(vd, 0, sizeof *vd);
++    for (i = 0; i < 16; i++) {
++        const Nv2aAttrib *a = &b->attr[i];
++        memcpy(vd->value[i], a->value, 16);
++        if (!a->data)
++            continue;
++        for (j = 0; j < ns_; j++)
++            if (st[j].stride == a->stride && a->data >= st[j].base
++                && a->data - st[j].base < (ptrdiff_t)(a->stride ? a->stride : 1)) {
++                vd->attr[i][0] = (uint32_t)(st[j].off + (VkDeviceSize)(a->data - st[j].base));
++                break;
++            }
++        vd->attr[i][1] = a->stride;
++        vd->attr[i][2] = (a->type & 0xFF) | (a->size & 0xFF) << 8 | 0x10000u;
++    }
++    vd->vp[0] = 2.0f / (float)s->w;
++    vd->vp[1] = 2.0f / (float)s->h;
++    vd->vp[2] = 1.0f / zmax_of(rs->zeta_format);
++    vd->vp[3] = b->aa_sx;
++    vd->vp2[0] = b->aa_sy;
++    vd->vp2[1] = b->near_z;
++    vd->vp2[2] = (float)b->ninst;
++    vd->fogp[0] = (float)(b->fog_enable != 0);
++    vd->fogp[1] = (float)b->fog_mode;
++    vd->fogp[2] = b->fog_param[0];
++    vd->fogp[3] = b->fog_param[1];
++
++    ix = (uint32_t *)(s_rv.map + ioff);
++    for (k = 0; k < b->count; k++)
++        ix[k] = b->indices[k] - b->min_index;
++
++    pipe_key(&pk, s, z, rs, 1);
++    pipe = pipe_get(&pk);
++    if (!pipe)
++        return;
++    bi[0].buffer = s_rv.buf;
++    bi[0].offset = 0;
++    bi[0].range = VK_WHOLE_SIZE;
++    bi[1].buffer = s_ru.buf;
++    bi[1].offset = s_kc_off;
++    bi[1].range = sizeof s_kc_last;
++    bi[2].buffer = s_ru.buf;
++    bi[2].offset = s_kp_off;
++    bi[2].range = sizeof s_kp_last;
++    memset(w, 0, sizeof w);
++    for (i = 0; i < 4; i++) {
++        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++        w[i].dstBinding = 9 + (uint32_t)i;
++        w[i].descriptorCount = 1;
++        w[i].descriptorType = i ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
++                                : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++        w[i].pBufferInfo = &bi[i];
++    }
++    c = bind_draw(ns, rs, s, z, pipe, uoff, img2d, imgcube, w, 4);
++    vkCmdBindIndexBuffer(c, s_rv.buf, ioff, VK_INDEX_TYPE_UINT32);
++    if (use_q)
++        vkCmdBeginQuery(c, s_qpool, s_q_used,
++                        s_precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
++    vkCmdDrawIndexed(c, b->count, 1, 0, 0, 0);
++    if (use_q)
++        vkCmdEndQuery(c, s_qpool, s_q_used++);
++    end_draw(c, s, &pk, use_q);
+     s_tris += b->count / 3;
++    s_prog_draws++;
+ }
+ 
+ static void vk_report_clear(void)
+@@ -1454,12 +1732,26 @@ static uint32_t vk_report_read(void)
+     return s_report_acc > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)s_report_acc;
+ }
+ 
++/* Before a flip shows `va`: that surface, and every other one drawn since
++ * guest memory last matched it. A title may read a render target on the
++ * CPU -- Conker's front end draws a 256x256 luminance downsample of the
++ * frame that no draw ever samples: the CPU averages it to set the exposure,
++ * and read stale it saw a black scene and turned the glow all the way up.
++ * Nothing says when the CPU will look, so every drawn surface goes back by
++ * the flip, as it would have been in guest memory all along on the console.
++ * RECOMP_VK_RESOLVE=shown writes back only the surface being shown. */
+ static void vk_resolve(uint32_t va)
+ {
++    static int shown_only = -1;
+     int i, any = 0;
++
++    if (shown_only < 0) {
++        const char *e = getenv("RECOMP_VK_RESOLVE");
++        shown_only = e && !strcmp(e, "shown");
++    }
+     for (i = 0; i < VK_MAX_SURFACES; i++) {
+         Surf *s = &s_surfs[i];
+-        if (s->color.image && s->gpu_dirty && s->va == va) {
++        if (s->color.image && s->gpu_dirty && (s->va == va || !shown_only)) {
+             surf_queue_readback(s);
+             any = 1;
+         }
+@@ -1483,9 +1775,9 @@ static void vk_flip(void)
+         }
+     if (s_verbose && s_frame % 300 == 0)
+         fprintf(stderr, "[VK] flip %u: %u draws, %u tris, %u flushes, %d textures"
+-                        " (%u uploads, %u new, %u read back, %u copied, %u hits)\n", s_frame,
++                        " (%u uploads, %u new, %u read back, %u copied, %u hits), %u program draws, %u alias syncs\n", s_frame,
+                 s_draws, s_tris, s_flushes, s_ntex, s_tex_uploads, s_tex_new, s_tex_rt,
+-                s_tex_copies, s_tex_hits);
++                s_tex_copies, s_tex_hits, s_prog_draws, s_alias_syncs);
+ }
+ 
+ /* The executor's own draw() is never used: draw_full is set. */
+@@ -1495,9 +1787,10 @@ static void vk_draw_unused(const Nv2aSurface *s, const Nv2aBatch *b)
+     (void)b;
+ }
+ 
+-static const Nv2aBackend s_backend = {
++static Nv2aBackend s_backend = {
+     vk_clear, vk_draw_unused, vk_flip,
+     vk_draw_full, vk_report_clear, vk_report_read, vk_resolve,
++    vk_draw_program,
+ };
+ 
+ /* ---- Set-up --------------------------------------------------------- */
+@@ -1606,8 +1899,9 @@ static int create_device(void)
+     h13.pNext = &h12;
+     have.pNext = &h13;
+     vkGetPhysicalDeviceFeatures2(s_phys, &have);
+-    if (!h13.dynamicRendering || !h12.hostQueryReset) {
+-        fprintf(stderr, "[VK] device lacks dynamic rendering or host query reset\n");
++    if (!h13.dynamicRendering || !h12.hostQueryReset
++        || !h13.shaderDemoteToHelperInvocation) {
++        fprintf(stderr, "[VK] device lacks dynamic rendering, host query reset or demote\n");
+         return 0;
+     }
+     if (vkEnumerateDeviceExtensionProperties(s_phys, NULL, &n, ext) < 0)
+@@ -1621,12 +1915,16 @@ static int create_device(void)
+         exts[ne++] = "VK_KHR_portability_subset";
+ 
+     f13.dynamicRendering = VK_TRUE;
++    /* glslc targets 1.3, where `discard` is OpDemoteToHelperInvocation. */
++    f13.shaderDemoteToHelperInvocation = VK_TRUE;
+     f12.hostQueryReset = VK_TRUE;
+     f13.pNext = &f12;
+     f2.pNext = &f13;
+     f2.features.depthClamp = have.features.depthClamp;
+     f2.features.occlusionQueryPrecise = have.features.occlusionQueryPrecise;
+     s_depth_clamp = have.features.depthClamp;
++    f2.features.shaderClipDistance = have.features.shaderClipDistance;
++    s_clip_dist = have.features.shaderClipDistance;
+     s_precise = have.features.occlusionQueryPrecise;
+     qi.queueFamilyIndex = s_qfam;
+     qi.queueCount = 1;
+@@ -1664,7 +1962,7 @@ static int create_objects(void)
+     VkCommandPoolCreateInfo pi = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+     VkCommandBufferAllocateInfo ai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+     VkFenceCreateInfo fi = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+-    VkDescriptorSetLayoutBinding bind[3];
++    VkDescriptorSetLayoutBinding bind[7];
+     VkDescriptorSetLayoutCreateInfo dl = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+     VkPipelineLayoutCreateInfo pl = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+     VkShaderModuleCreateInfo sm = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+@@ -1698,8 +1996,17 @@ static int create_objects(void)
+     bind[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+     bind[2] = bind[1];
+     bind[2].binding = 5;
++    /* The vertex stage of program batches: vertex data, constants, program,
++     * per-draw attribute table. */
++    for (int k = 3; k < 7; k++) {
++        bind[k].binding = 9 + (uint32_t)(k - 3);
++        bind[k].descriptorType = k == 3 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
++                                        : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
++        bind[k].descriptorCount = 1;
++        bind[k].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
++    }
+     dl.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+-    dl.bindingCount = 3;
++    dl.bindingCount = 7;
+     dl.pBindings = bind;
+     VK_CHECK(vkCreateDescriptorSetLayout(s_dev, &dl, NULL, &s_dsl));
+     pl.setLayoutCount = 1;
+@@ -1712,13 +2019,18 @@ static int create_objects(void)
+     sm.codeSize = sizeof k_frag_spv;
+     sm.pCode = k_frag_spv;
+     VK_CHECK(vkCreateShaderModule(s_dev, &sm, NULL, &s_fs));
++    sm.codeSize = sizeof k_vsh_spv;
++    sm.pCode = k_vsh_spv;
++    VK_CHECK(vkCreateShaderModule(s_dev, &sm, NULL, &s_vsh));
+ 
+     qp.queryType = VK_QUERY_TYPE_OCCLUSION;
+     qp.queryCount = VK_MAX_QUERIES;
+     VK_CHECK(vkCreateQueryPool(s_dev, &qp, NULL, &s_qpool));
+     vkResetQueryPool(s_dev, s_qpool, 0, VK_MAX_QUERIES);
+ 
+-    if (!ring_create(&s_rv, VK_RING_VERTS, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)
++    if (!ring_create(&s_rv, VK_RING_VERTS, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
++                         | VK_BUFFER_USAGE_INDEX_BUFFER_BIT
++                         | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+         || !ring_create(&s_ru, VK_RING_UNIFORM, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)
+         || !ring_create(&s_rup, VK_RING_UPLOAD, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)
+         || !ring_create(&s_rrd, VK_RING_READ, VK_BUFFER_USAGE_TRANSFER_DST_BIT))
+@@ -1753,7 +2065,17 @@ int nv2a_vk_install(void)
+         fprintf(stderr, "[VK] no usable Vulkan device; the CPU rasteriser draws\n");
+         return 0;
+     }
++    /* Program batches need clip distances (the near plane) and the vertex
++     * ring as one storage buffer; RECOMP_VK_CPU_VSH=1 keeps them on the CPU. */
++    {
++        VkPhysicalDeviceProperties p;
++        vkGetPhysicalDeviceProperties(s_phys, &p);
++        if (!s_clip_dist || p.limits.maxStorageBufferRange < VK_RING_VERTS
++            || getenv("RECOMP_VK_CPU_VSH"))
++            s_backend.draw_program = NULL;
++    }
+     nv2a_backend_register(&s_backend);
+-    fprintf(stderr, "[VK] rendering on the GPU (depth format %d)\n", (int)s_depth_fmt);
++    fprintf(stderr, "[VK] rendering on the GPU (depth format %d, vertex programs on the %s)\n",
++            (int)s_depth_fmt, s_backend.draw_program ? "GPU" : "CPU");
+     return 1;
+ }
+diff --git a/src/vulkan/nv2a_vk.h b/src/vulkan/nv2a_vk.h
+index 73cc2a3..df17f1b 100644
+--- a/src/vulkan/nv2a_vk.h
++++ b/src/vulkan/nv2a_vk.h
+@@ -1,15 +1,19 @@
+ /*
+  * NV2A render back end on Vulkan.
+  *
+- * Registers itself with the pushbuffer executor (nv2a_backend.h, draw_full)
+- * and rasterises on the host GPU what the CPU rasteriser would draw: the
+- * executor still runs the vertex stage and the near-plane clip, the GPU does
+- * every pixel -- texture stages, register combiners, alpha test, blending,
+- * depth, stencil and the visibility-test pixel counts.
++ * Registers itself with the pushbuffer executor (nv2a_backend.h) and draws
++ * on the host GPU what the CPU rasteriser would draw. Vertex-program batches
++ * run their program on the GPU too (draw_program: shaders/nv2a_vsh.vert
++ * interprets it, pulling the attributes from a copy of the title's arrays,
++ * and clip distances stand in for the executor's near-plane clip);
++ * fixed-function and pre-transformed batches arrive transformed (draw_full).
++ * The GPU does every pixel -- texture stages, register combiners, alpha
++ * test, blending, depth, stencil and the visibility-test pixel counts.
+  *
+  * Surfaces live in GPU images. Guest memory is brought up to date when the
+  * title would see it: before a flip shows a surface, and before a texture
+- * stage reads memory a surface was drawn into (render to texture). A surface
++ * stage reads memory a surface was drawn into -- unless the stage reads
++ * exactly the surface, when it samples a GPU copy instead. A surface
+  * whose guest memory changed since then (written by the CPU) is uploaded
+  * before the GPU draws into it again. The framebuffer window keeps showing
+  * guest memory, so every presenter works unchanged.
+@@ -18,6 +22,7 @@
+  *   RECOMP_VK_VALIDATE  enable the Khronos validation layer
+  *   RECOMP_VK_VERBOSE   device choice, and a line of counts every 300 flips
+  *   RECOMP_VK_STENCIL=0 ignore the stencil test (the CPU rasteriser has none)
++ *   RECOMP_VK_CPU_VSH   run vertex programs on the CPU, as for draw_full
+  */
+ #ifndef XBOXRECOMP_NV2A_VK_H
+ #define XBOXRECOMP_NV2A_VK_H
+diff --git a/src/vulkan/shaders/nv2a_vsh.vert b/src/vulkan/shaders/nv2a_vsh.vert
+new file mode 100644
+index 0000000..b23aeea
+--- /dev/null
++++ b/src/vulkan/shaders/nv2a_vsh.vert
+@@ -0,0 +1,255 @@
++#version 450
++/* An NV2A vertex program, run on the GPU.
++ *
++ * A port of the executor's interpreter (nv2a_vsh_interp.c nv2a_vsh_run, and
++ * fetch_attr and transform_vertex in nv2a_pb_exec.c), so that a program batch
++ * comes out as it does on the CPU. The program is data: the decoded form
++ * nv2a_vsh_export() writes (its layout is in nv2a_vsh_interp.h), read from a
++ * uniform block, one instruction at a time. Attributes are pulled from the
++ * batch's vertex data, copied as the title stored it.
++ *
++ * The CPU path's near-plane clip becomes two clip distances, the same two
++ * planes: w = 1e-3, and screen z at the viewport's z offset. */
++
++layout(location = 0) out vec4 v_d0;
++layout(location = 1) out vec4 v_d1;
++layout(location = 2) out float v_fog;
++layout(location = 3) out vec4 v_t0;
++layout(location = 4) out vec4 v_t1;
++layout(location = 5) out vec4 v_t2;
++layout(location = 6) out vec4 v_t3;
++
++out gl_PerVertex {
++    vec4 gl_Position;
++    float gl_ClipDistance[2];
++};
++
++layout(set = 0, binding = 9, std430) readonly buffer Verts { uint words[]; } vb;
++layout(set = 0, binding = 10, std140) uniform Consts { vec4 c[192]; } kc;
++layout(set = 0, binding = 11, std140) uniform Prog { uvec4 p[272]; } kp;
++/* nv2a_vk.c VkVshDraw: keep the two in step. */
++layout(set = 0, binding = 12, std140) uniform VshDraw {
++    uvec4 attr[16];   /* byte address of vertex 0, stride, type | size << 8
++                       * | present << 16, - */
++    vec4  value[16];  /* what an absent attribute reads */
++    vec4  vp;         /* 2 / width, 2 / height, 1 / zmax, aa x */
++    vec4  vp2;        /* aa y, near-plane screen z, instructions, - */
++    vec4  fogp;       /* enable, mode, param 0, param 1 */
++} u;
++
++uint rd32(uint a)
++{
++    uint i = a >> 2, sh = (a & 3u) * 8u;
++    if (sh == 0u)
++        return vb.words[i];
++    return (vb.words[i] >> sh) | (vb.words[i + 1u] << (32u - sh));
++}
++
++float s16(uint a)
++{
++    uint v = rd32(a) & 0xFFFFu;
++    return float(int(v << 16) >> 16);
++}
++
++float u8(uint a) { return float(rd32(a) & 0xFFu); }
++
++vec4 fetch(int i, uint vid)
++{
++    uvec4 d = u.attr[i];
++    vec4 o = vec4(0.0, 0.0, 0.0, 1.0);
++    uint type = d.z & 0xFFu, size = min((d.z >> 8) & 0xFFu, 4u);
++    uint a = d.x + vid * d.y;
++
++    if ((d.z & 0x10000u) == 0u)
++        return u.value[i];
++    if (type == 0u) {                                  /* D3DCOLOR */
++        uint v = rd32(a);
++        return vec4(float((v >> 16) & 0xFFu), float((v >> 8) & 0xFFu),
++                    float(v & 0xFFu), float(v >> 24)) / 255.0;
++    }
++    if (type == 6u) {                                  /* packed 11:11:10 */
++        uint v = rd32(a);
++        o.x = float(int(v << 21) >> 21) / 1023.0;
++        o.y = float(int(v << 10) >> 21) / 1023.0;
++        o.z = float(int(v) >> 22) / 511.0;
++        return o;
++    }
++    for (uint k = 0u; k < size; k++) {
++        if (type == 2u)      o[k] = uintBitsToFloat(rd32(a + 4u * k));
++        else if (type == 4u) o[k] = u8(a + k) / 255.0;
++        else if (type == 1u) o[k] = s16(a + 2u * k) / 32767.0;
++        else if (type == 5u) o[k] = s16(a + 2u * k);
++    }
++    return o;
++}
++
++vec4 R[13];        /* r0..r11, and 12 = oPos */
++vec4 O[13];        /* o[1..12]; o[0] is oPos */
++vec4 V[16];
++int a0;
++
++vec4 src(uint w)
++{
++    uint kind = w & 0xFu, idx = (w >> 4) & 0x1Fu;
++    vec4 s;
++    if (kind == 0u)      s = R[idx];
++    else if (kind == 1u) s = R[12];
++    else if (kind == 2u) s = V[idx];
++    else {
++        int ci = int(w >> 18);
++        if (kind == 4u) {
++            ci += a0;
++            if (ci < 0 || ci >= 192) ci = 0;
++        }
++        s = kc.c[ci];
++    }
++    vec4 r = vec4(s[(w >> 10) & 3u], s[(w >> 12) & 3u], s[(w >> 14) & 3u], s[(w >> 16) & 3u]);
++    return ((w >> 9) & 1u) != 0u ? -r : r;
++}
++
++void put(inout vec4 d, vec4 v, uint m)
++{
++    if ((m & 8u) != 0u) d.x = v.x;
++    if ((m & 4u) != 0u) d.y = v.y;
++    if ((m & 2u) != 0u) d.z = v.z;
++    if ((m & 1u) != 0u) d.w = v.w;
++}
++
++const float INF = uintBitsToFloat(0x7F800000u);
++
++vec4 mac(uint op, vec4 a, vec4 b, vec4 c)
++{
++    switch (op) {
++    case 1u:  return a;
++    case 2u:  return a * b;
++    case 3u:  return a + c;
++    case 4u:  return a * b + c;
++    case 5u:  return vec4(a.x * b.x + a.y * b.y + a.z * b.z);
++    case 6u:  return vec4(a.x * b.x + a.y * b.y + a.z * b.z + b.w);
++    case 7u:  return vec4(a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w);
++    case 8u:  return vec4(1.0, a.y * b.y, a.z, b.w);
++    case 9u:  return vec4(a.x < b.x ? a.x : b.x, a.y < b.y ? a.y : b.y,
++                          a.z < b.z ? a.z : b.z, a.w < b.w ? a.w : b.w);
++    case 10u: return vec4(a.x >= b.x ? a.x : b.x, a.y >= b.y ? a.y : b.y,
++                          a.z >= b.z ? a.z : b.z, a.w >= b.w ? a.w : b.w);
++    case 11u: return vec4(lessThan(a, b));
++    case 12u: return vec4(greaterThanEqual(a, b));
++    case 13u: a0 = int(floor(a.x + 0.001)); return a;
++    default:  return a;
++    }
++}
++
++vec4 ilu(uint op, vec4 c)
++{
++    float x = c.x;
++    switch (op) {
++    case 1u: return c;
++    case 2u: return vec4(x == 0.0 ? INF : 1.0 / x);
++    case 3u: {
++        float f = 1.0 / x;
++        if (abs(f) < 5.42101e-20) f = f < 0.0 ? -5.42101e-20 : 5.42101e-20;
++        if (abs(f) > 1.884467e19) f = f < 0.0 ? -1.884467e19 : 1.884467e19;
++        return vec4(f);
++    }
++    case 4u: return vec4(abs(x) == 0.0 ? INF : inversesqrt(abs(x)));
++    case 5u: {
++        float fl = floor(x);
++        return vec4(exp2(fl), x - fl, exp2(x), 1.0);
++    }
++    case 6u: {
++        float ax = abs(x);
++        if (ax == 0.0)
++            return vec4(-INF, 1.0, -INF, 1.0);
++        float e = floor(log2(ax));
++        return vec4(e, ax / exp2(e), log2(ax), 1.0);
++    }
++    case 7u: {
++        float nl = max(c.x, 0.0), nh = max(c.y, 0.0);
++        float p = clamp(c.w, -127.9961, 127.9961), sp;
++        if (nh == 0.0)
++            sp = p > 0.0 ? 0.0 : (p == 0.0 ? 1.0 : INF);
++        else
++            sp = pow(nh, p);
++        return vec4(1.0, nl, c.x > 0.0 ? sp : 0.0, 1.0);
++    }
++    default: return c;
++    }
++}
++
++/* The fog unit, per vertex (nv2a_pb_exec.c fog_factor). */
++float fog_factor(float d)
++{
++    uint mode = uint(u.fogp.y);
++    float px = u.fogp.z, py = u.fogp.w, f;
++    if (u.fogp.x == 0.0)
++        return 1.0;
++    if (mode == 0x800u || mode == 0x802u)
++        f = px + exp2(d * py * 16.0) - 1.5;
++    else if (mode == 0x801u || mode == 0x803u)
++        f = px + exp2(-d * d * py * py * 32.0) - 1.5;
++    else
++        f = px + d * py - 1.0;
++    if (mode == 0x802u || mode == 0x803u || mode == 0x804u)
++        f = abs(f);
++    if (isnan(f))
++        f = 1.0;
++    return clamp(f, 0.0, 1.0);
++}
++
++void main()
++{
++    uint vid = uint(gl_VertexIndex), n = uint(u.vp2.z);
++
++    for (int i = 0; i < 16; i++)
++        V[i] = fetch(i, vid);
++    for (int i = 0; i < 13; i++) {
++        R[i] = vec4(0.0);
++        O[i] = vec4(0.0);
++    }
++    O[3].w = O[4].w = 1.0;
++    O[9].w = O[10].w = O[11].w = O[12].w = 1.0;
++    a0 = 0;
++
++    for (uint s = 0u; s < n; s++) {
++        uvec4 w0 = kp.p[2u * s], w1 = kp.p[2u * s + 1u];
++        uint f = w0.x, op = f & 0xFu, iop = (f >> 4) & 0x7u;
++        vec4 a = vec4(0.0), b = vec4(0.0), c = vec4(0.0), mr = vec4(0.0), ir = vec4(0.0);
++
++        /* Both units read their sources before either writes. */
++        if ((f & (1u << 22)) != 0u) a = src(w0.z);
++        if ((f & (1u << 23)) != 0u) b = src(w0.w);
++        if ((f & (1u << 24)) != 0u) c = src(w1.x);
++        if (op != 0u)  mr = mac(op, a, b, c);
++        if (iop != 0u) ir = ilu(iop, c);
++
++        uint md = (w0.y >> 8) & 0xFFu, id = (w0.y >> 16) & 0xFFu;
++        if (md != 0u) put(R[md - 1u], mr, (f >> 8) & 0xFu);
++        if (id != 0u) put(R[id - 1u], ir, (f >> 12) & 0xFu);
++        uint om = (f >> 16) & 0xFu;
++        if (om != 0u && ((f >> 21) & 1u) != 0u) {    /* to o[] (c[] stays CPU) */
++            uint oa = w0.y & 0xFFu;
++            vec4 v = ((f >> 20) & 1u) != 0u ? ir : mr;
++            if (oa == 0u)       put(R[12], v, om);
++            else if (oa < 13u)  put(O[oa], v, om);
++        }
++    }
++
++    vec4 pos = R[12];
++    /* w == +0: a program that never divided by w (transform_vertex). */
++    if (pos.w == 0.0 && floatBitsToUint(pos.w) == 0u)
++        pos.w = 1.0;
++    pos.x *= u.vp.w;
++    pos.y *= u.vp2.x;
++    gl_ClipDistance[0] = pos.w - 1e-3;
++    gl_ClipDistance[1] = (pos.z - u.vp2.y) * pos.w;
++    gl_Position = vec4((pos.x * u.vp.x - 1.0) * pos.w, (pos.y * u.vp.y - 1.0) * pos.w,
++                       pos.z * u.vp.z * pos.w, pos.w);
++
++    v_d0 = clamp(O[3], 0.0, 1.0);
++    v_d1 = clamp(O[4], 0.0, 1.0);
++    v_fog = fog_factor(O[5].x);
++    v_t0 = O[9];
++    v_t1 = O[10];
++    v_t2 = O[11];
++    v_t3 = O[12];
++}
