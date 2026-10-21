@@ -1,5 +1,5 @@
 diff --git a/src/kernel/kernel_file.c b/src/kernel/kernel_file.c
-index eb33a61..0b207cf 100644
+index 2651871..86d8268 100644
 --- a/src/kernel/kernel_file.c
 +++ b/src/kernel/kernel_file.c
 @@ -702,7 +702,11 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
@@ -15,9 +15,9 @@ index eb33a61..0b207cf 100644
              return STATUS_OBJECT_NAME_NOT_FOUND;
          return STATUS_UNSUCCESSFUL;
      }
-@@ -1539,8 +1543,18 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
-     const char* xbox_path = get_xbox_path(ObjectAttributes);
-     if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH))
+@@ -1574,8 +1578,18 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
+         return STATUS_INVALID_PARAMETER;
+     if (!posix_obj_path(ObjectAttributes, host_path, MAX_PATH))
          return STATUS_OBJECT_PATH_NOT_FOUND;
 -    if (stat(host_path, &st) != 0)
 +    if (stat(host_path, &st) != 0) {

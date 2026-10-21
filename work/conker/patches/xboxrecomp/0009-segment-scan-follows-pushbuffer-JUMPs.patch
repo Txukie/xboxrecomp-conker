@@ -62,7 +62,7 @@ index 0f3bf25..3497e99 100644
  
                      if (nv2a_pb_dma_walk()) {
                          uint32_t get_now = *(volatile uint32_t *)
-@@ -1551,26 +1551,49 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+@@ -1551,26 +1551,50 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                          if (put != last_put)
                              nv2a_pb_scan(put);
                      } else {
@@ -115,10 +115,11 @@ index 0f3bf25..3497e99 100644
 +                             * The hop bound only stops a cycle that never
 +                             * returns there: a precompiled pushbuffer jumps
 +                             * once per chunk it skips, and Conker's level
-+                             * takes well over 64 between two PUTs. */
++                             * takes well over 64 between two PUTs, its
++                             * characters well over 4096. */
 +                            const uint32_t first = va;
 +                            int hops;
-+                            for (hops = 0; hops < 4096 && va != put_va; hops++) {
++                            for (hops = 0; hops < (1 << 20) && va != put_va; hops++) {
 +                                uint32_t end = va < put_va ? put_va : va + 0x400000u;
 +                                uint32_t to = nv2a_pb_scan_segment(va, end);
 +                                if (!to || to == first)

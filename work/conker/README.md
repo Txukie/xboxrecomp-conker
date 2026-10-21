@@ -6,12 +6,12 @@ parte del repositorio y nunca se modifican.
 
 El runtime y las herramientas vienen de
 [xboxrecomp](https://github.com/sp00nznet/xboxrecomp), incluido como submódulo
-en `external/xboxrecomp` y fijado a una versión publicada (ahora v0.15.0).
+en `external/xboxrecomp` y fijado a una versión publicada (ahora v0.16.0).
 
 ## Estado actual
 
-- Código regenerado con xboxrecomp v0.15.0 (`regenerate.sh`): 19.993
-  funciones, 21 destinos sin resolver (antes 9.425), los 145 imports del
+- Código regenerado con xboxrecomp v0.16.0 (`regenerate.sh`): 20.029
+  funciones, 20 destinos sin resolver (antes 9.425), los 145 imports del
   kernel con bridge. Incluye las secciones de las librerías XDK (D3D, DSOUND,
   XACTENG, XONLINE...), no solo `.text`.
 - Compila y enlaza en Linux (GCC). Windows (MSVC) y macOS (x86-64 y arm64)
@@ -27,11 +27,14 @@ en `external/xboxrecomp` y fijado a una versión publicada (ahora v0.15.0).
 - Ajustes propios de Conker en `project/src/recomp_manual.c`: semáforo de la
   GPU de D3D, latido del DSP EP para DirectSound; y en `seed_callbacks.json`,
   funciones que el detector no ve (callbacks tras relleno `int3`).
-- Siete correcciones del runtime que upstream aún no tiene están en
+- Doce correcciones del runtime que upstream aún no tiene están en
   `patches/xboxrecomp/` (ventana del invitado, `NtQueryVirtualMemory`, saltos
   tras `sub` de 8/16 bits, `PATH_NOT_FOUND`, mayúsculas/minúsculas en POSIX,
-  decodificador MMIO x86-64 en POSIX, tamaño de `KDPC`); CMake las aplica al
-  submódulo.
+  decodificador MMIO x86-64 en POSIX, tamaño de `KDPC`, OHCI en POSIX, el
+  recorrido del push-buffer sigue los `JUMP`, mandos SDL conectados en
+  caliente, `fincstp`/`fdecstp`/`fxtract` en x87, y la reserva de memoria
+  contigua por debajo de 8 MB para los tests de visibilidad de D3D); CMake las
+  aplica al submódulo.
 
 ## Preparar el juego
 

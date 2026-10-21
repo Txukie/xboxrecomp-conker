@@ -7,7 +7,7 @@ Windows, Linux and macOS executable, with Vulkan (Windows/Linux) and Metal
 ## Basis: upstream xboxrecomp
 
 The runtime and tools are [xboxrecomp](https://github.com/sp00nznet/xboxrecomp),
-pinned as a submodule in `external/xboxrecomp` (v0.15.0). Upstream already
+pinned as a submodule in `external/xboxrecomp` (v0.16.0). Upstream already
 provides most of the porting work:
 
 - Linux and macOS hosts, x86-64 and arm64, with SDL2 for window, input and

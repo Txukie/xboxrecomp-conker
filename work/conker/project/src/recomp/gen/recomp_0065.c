@@ -1,11 +1,610 @@
 /**
  * Conker - Recompiled code chunk 65
- * Functions: 250 (0x00488990 - 0x0048AC10)
+ * Functions: 250 (0x00488620 - 0x0048A890)
  */
 
 #define RECOMP_GENERATED_CODE
 #include "recomp_funcs.h"
 #include <math.h>
+
+/**
+ * sub_00488620
+ * Original: 0x00488620 - 0x0048862B (11 bytes, 2 insns)
+ * Category: game_vtable
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00488620(void)
+{
+
+loc_00488620: ;
+    MEM32(0x86EEBC) = 0xA;
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_00488630
+ * Original: 0x00488630 - 0x00488641 (17 bytes, 3 insns)
+ * Category: data_init
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00488630(void)
+{
+
+loc_00488630: ;
+    xmm0 = XMM_SCALAR(MEMF(0x648D70)); /* movss */
+    MEMF(0x86EEC0) = xmm0.f[0]; /* movss */
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_00488650
+ * Original: 0x00488650 - 0x00488661 (17 bytes, 3 insns)
+ * Category: data_init
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00488650(void)
+{
+
+loc_00488650: ;
+    xmm0 = XMM_SCALAR(MEMF(0x64B41C)); /* movss */
+    MEMF(0x86EEC4) = xmm0.f[0]; /* movss */
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_00488670
+ * Original: 0x00488670 - 0x0048867B (11 bytes, 2 insns)
+ * Category: game_vtable
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00488670(void)
+{
+
+loc_00488670: ;
+    MEM32(0x86EEC8) = 0xA;
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_00488680
+ * Original: 0x00488680 - 0x00488691 (17 bytes, 3 insns)
+ * Category: data_init
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00488680(void)
+{
+
+loc_00488680: ;
+    xmm0 = XMM_SCALAR(MEMF(0x648D70)); /* movss */
+    MEMF(0x86EECC) = xmm0.f[0]; /* movss */
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_004886A0
+ * Original: 0x004886A0 - 0x004886B1 (17 bytes, 3 insns)
+ * Category: data_init
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_004886A0(void)
+{
+
+loc_004886A0: ;
+    xmm0 = XMM_SCALAR(MEMF(0x64B41C)); /* movss */
+    MEMF(0x86EED0) = xmm0.f[0]; /* movss */
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_004886C0
+ * Original: 0x004886C0 - 0x004886CC (12 bytes, 4 insns)
+ * Category: game_vtable
+ * CC: thiscall, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_004886C0(void)
+{
+
+loc_004886C0: ;
+    PUSH32(esp, 0x48CB60);
+    PUSH32(esp, 0x004886CAu); RECOMP_ABI_CALL(0x0046ED65u, sub_0046ED65); /* call 0x0046ED65 */
+
+loc_004886CA: ;
+    POP32(esp, ecx);
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_004886D0
+ * Original: 0x004886D0 - 0x004886F5 (37 bytes, 8 insns)
+ * Category: game_vtable
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_004886D0(void)
+{
+    int _flags = 0; /* fallback flag var */
+    uint32_t _fa = 0, _fb = 0;
+    int32_t _fas = 0, _fbs = 0;
+    (void)_fa; (void)_fb; (void)_fas; (void)_fbs;
+
+loc_004886D0: ;
+    SET_LO8(eax, MEM8(0x7FA23C));
+    _fa = (uint32_t)(LO8(eax)) & 0xFFu; _fb = (uint32_t)(0) & 0xFFu;
+    _fas = (int32_t)(int8_t)(_fa); _fbs = (int32_t)(int8_t)(_fb); /* cmp LO8(eax), 0 (8-bit) */
+    xmm0 = XMM_ZERO(); /* xorps self = zero */
+    if (CMP_NE(_fa, _fb)) goto loc_004886E4; /* jne: not equal / not zero */
+
+loc_004886DC: ;
+    xmm0 = XMM_SCALAR(MEMF(0x7F9F4C)); /* movss */
+
+loc_004886E4: ;
+    MEMF(0x86EEE4) = xmm0.f[0]; /* movss */
+    MEMF(0x86EEE8) = xmm0.f[0]; /* movss */
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_00488700
+ * Original: 0x00488700 - 0x0048870B (11 bytes, 2 insns)
+ * Category: game_vtable
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00488700(void)
+{
+
+loc_00488700: ;
+    MEM32(0x86EEF0) = 0xA;
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_00488710
+ * Original: 0x00488710 - 0x0048871B (11 bytes, 2 insns)
+ * Category: game_vtable
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00488710(void)
+{
+
+loc_00488710: ;
+    MEM32(0x86EEF4) = 0xA;
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_00488720
+ * Original: 0x00488720 - 0x0048872B (11 bytes, 2 insns)
+ * Category: game_vtable
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00488720(void)
+{
+
+loc_00488720: ;
+    MEM32(0x86EEF8) = 0xA;
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_00488730
+ * Original: 0x00488730 - 0x0048877F (79 bytes, 17 insns)
+ * Category: game_vtable
+ * CC: thiscall, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00488730(void)
+{
+
+loc_00488730: ;
+    PUSH32(esp, 0x00488735u); RECOMP_ABI_CALL(0x00287A70u, sub_00287A70); /* call 0x00287A70 */
+
+loc_00488735: ;
+    MEM32(0x86EF00) = eax;
+    MEM32(0x86EF04) = 0;
+    PUSH32(esp, 0x00488749u); RECOMP_ABI_CALL(0x00298900u, sub_00298900); /* call 0x00298900 */
+
+loc_00488749: ;
+    MEM32(0x86EF0C) = eax;
+    MEM8(eax + 0xF) = 1;
+    eax = MEM32(0x86EF0C);
+    MEM32(eax + 4) = eax;
+    eax = MEM32(0x86EF0C);
+    MEM32(eax) = eax;
+    eax = MEM32(0x86EF0C);
+    MEM32(eax + 8) = eax;
+    PUSH32(esp, 0x48CBB0);
+    MEM32(0x86EF10) = 0;
+    PUSH32(esp, 0x0048877Du); RECOMP_ABI_CALL(0x0046ED65u, sub_0046ED65); /* call 0x0046ED65 */
+
+loc_0048877D: ;
+    POP32(esp, ecx);
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_00488780
+ * Original: 0x00488780 - 0x0048878B (11 bytes, 2 insns)
+ * Category: game_vtable
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00488780(void)
+{
+
+loc_00488780: ;
+    MEM32(0x86EF14) = 0xA;
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_00488790
+ * Original: 0x00488790 - 0x0048879B (11 bytes, 2 insns)
+ * Category: game_vtable
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00488790(void)
+{
+
+loc_00488790: ;
+    MEM32(0x86EF18) = 0xA;
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_004887A0
+ * Original: 0x004887A0 - 0x004887AB (11 bytes, 2 insns)
+ * Category: game_vtable
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_004887A0(void)
+{
+
+loc_004887A0: ;
+    MEM32(0x86EF1C) = 0xA;
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_004887B0
+ * Original: 0x004887B0 - 0x004887BB (11 bytes, 2 insns)
+ * Category: game_vtable
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_004887B0(void)
+{
+
+loc_004887B0: ;
+    MEM32(0x86EF20) = 0xA;
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_004887C0
+ * Original: 0x004887C0 - 0x004887CB (11 bytes, 2 insns)
+ * Category: game_vtable
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_004887C0(void)
+{
+
+loc_004887C0: ;
+    MEM32(0x86EF24) = 0xA;
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_004887D0
+ * Original: 0x004887D0 - 0x004887DB (11 bytes, 2 insns)
+ * Category: game_vtable
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_004887D0(void)
+{
+
+loc_004887D0: ;
+    MEM32(0x86EF28) = 0xA;
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_004887E0
+ * Original: 0x004887E0 - 0x004887F1 (17 bytes, 3 insns)
+ * Category: data_init
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_004887E0(void)
+{
+
+loc_004887E0: ;
+    xmm0 = XMM_SCALAR(MEMF(0x648D70)); /* movss */
+    MEMF(0x86EF2C) = xmm0.f[0]; /* movss */
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_00488800
+ * Original: 0x00488800 - 0x00488811 (17 bytes, 3 insns)
+ * Category: data_init
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00488800(void)
+{
+
+loc_00488800: ;
+    xmm0 = XMM_SCALAR(MEMF(0x64B41C)); /* movss */
+    MEMF(0x86EF30) = xmm0.f[0]; /* movss */
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_00488820
+ * Original: 0x00488820 - 0x0048882B (11 bytes, 2 insns)
+ * Category: game_vtable
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00488820(void)
+{
+
+loc_00488820: ;
+    MEM32(0x86EF34) = 0xA;
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_00488830
+ * Original: 0x00488830 - 0x0048883B (11 bytes, 2 insns)
+ * Category: game_vtable
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00488830(void)
+{
+
+loc_00488830: ;
+    MEM32(0x86EF38) = 0xA;
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_00488840
+ * Original: 0x00488840 - 0x00488851 (17 bytes, 3 insns)
+ * Category: data_init
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00488840(void)
+{
+
+loc_00488840: ;
+    xmm0 = XMM_SCALAR(MEMF(0x648D70)); /* movss */
+    MEMF(0x86EF3C) = xmm0.f[0]; /* movss */
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_00488860
+ * Original: 0x00488860 - 0x00488871 (17 bytes, 3 insns)
+ * Category: data_init
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00488860(void)
+{
+
+loc_00488860: ;
+    xmm0 = XMM_SCALAR(MEMF(0x64B41C)); /* movss */
+    MEMF(0x86EF40) = xmm0.f[0]; /* movss */
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_00488880
+ * Original: 0x00488880 - 0x0048888B (11 bytes, 2 insns)
+ * Category: game_vtable
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00488880(void)
+{
+
+loc_00488880: ;
+    MEM32(0x86EF44) = 0xA;
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_00488890
+ * Original: 0x00488890 - 0x004888A1 (17 bytes, 3 insns)
+ * Category: data_init
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00488890(void)
+{
+
+loc_00488890: ;
+    xmm0 = XMM_SCALAR(MEMF(0x648D70)); /* movss */
+    MEMF(0x86EF48) = xmm0.f[0]; /* movss */
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_004888B0
+ * Original: 0x004888B0 - 0x004888C1 (17 bytes, 3 insns)
+ * Category: data_init
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_004888B0(void)
+{
+
+loc_004888B0: ;
+    xmm0 = XMM_SCALAR(MEMF(0x64B41C)); /* movss */
+    MEMF(0x86EF4C) = xmm0.f[0]; /* movss */
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_004888D0
+ * Original: 0x004888D0 - 0x004888DB (11 bytes, 2 insns)
+ * Category: game_vtable
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_004888D0(void)
+{
+
+loc_004888D0: ;
+    MEM32(0x86EF50) = 0xA;
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_004888E0
+ * Original: 0x004888E0 - 0x004888F1 (17 bytes, 3 insns)
+ * Category: data_init
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_004888E0(void)
+{
+
+loc_004888E0: ;
+    xmm0 = XMM_SCALAR(MEMF(0x648D70)); /* movss */
+    MEMF(0x86EF54) = xmm0.f[0]; /* movss */
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_00488900
+ * Original: 0x00488900 - 0x00488911 (17 bytes, 3 insns)
+ * Category: data_init
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00488900(void)
+{
+
+loc_00488900: ;
+    xmm0 = XMM_SCALAR(MEMF(0x64B41C)); /* movss */
+    MEMF(0x86EF58) = xmm0.f[0]; /* movss */
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_00488920
+ * Original: 0x00488920 - 0x00488931 (17 bytes, 3 insns)
+ * Category: data_init
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00488920(void)
+{
+
+loc_00488920: ;
+    xmm0 = XMM_SCALAR(MEMF(0x648D70)); /* movss */
+    MEMF(0x86EF5C) = xmm0.f[0]; /* movss */
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_00488940
+ * Original: 0x00488940 - 0x00488951 (17 bytes, 3 insns)
+ * Category: data_init
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00488940(void)
+{
+
+loc_00488940: ;
+    xmm0 = XMM_SCALAR(MEMF(0x64B41C)); /* movss */
+    MEMF(0x86EF60) = xmm0.f[0]; /* movss */
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_00488960
+ * Original: 0x00488960 - 0x0048896B (11 bytes, 2 insns)
+ * Category: game_vtable
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00488960(void)
+{
+
+loc_00488960: ;
+    MEM32(0x86EF64) = 0xA;
+    esp += 4; return; /* ret */
+
+}
+
+/**
+ * sub_00488970
+ * Original: 0x00488970 - 0x00488981 (17 bytes, 3 insns)
+ * Category: data_init
+ * CC: cdecl, 0 params, returns int_or_void
+ * Frame: fpo_leaf
+ */
+void sub_00488970(void)
+{
+
+loc_00488970: ;
+    xmm0 = XMM_SCALAR(MEMF(0x648D70)); /* movss */
+    MEMF(0x86EF68) = xmm0.f[0]; /* movss */
+    esp += 4; return; /* ret */
+
+}
 
 /**
  * sub_00488990
@@ -4052,572 +4651,6 @@ void sub_0048A890(void)
 
 loc_0048A890: ;
     MEM32(0x86F610) = 0xA;
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048A8A0
- * Original: 0x0048A8A0 - 0x0048A8B1 (17 bytes, 3 insns)
- * Category: data_init
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048A8A0(void)
-{
-
-loc_0048A8A0: ;
-    xmm0 = XMM_SCALAR(MEMF(0x648D70)); /* movss */
-    MEMF(0x86F614) = xmm0.f[0]; /* movss */
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048A8C0
- * Original: 0x0048A8C0 - 0x0048A8D1 (17 bytes, 3 insns)
- * Category: data_init
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048A8C0(void)
-{
-
-loc_0048A8C0: ;
-    xmm0 = XMM_SCALAR(MEMF(0x64B41C)); /* movss */
-    MEMF(0x86F618) = xmm0.f[0]; /* movss */
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048A8E0
- * Original: 0x0048A8E0 - 0x0048A8EB (11 bytes, 2 insns)
- * Category: game_vtable
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048A8E0(void)
-{
-
-loc_0048A8E0: ;
-    MEM32(0x86F61C) = 0xA;
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048A8F0
- * Original: 0x0048A8F0 - 0x0048A901 (17 bytes, 3 insns)
- * Category: data_init
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048A8F0(void)
-{
-
-loc_0048A8F0: ;
-    xmm0 = XMM_SCALAR(MEMF(0x648D70)); /* movss */
-    MEMF(0x86F620) = xmm0.f[0]; /* movss */
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048A910
- * Original: 0x0048A910 - 0x0048A921 (17 bytes, 3 insns)
- * Category: data_init
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048A910(void)
-{
-
-loc_0048A910: ;
-    xmm0 = XMM_SCALAR(MEMF(0x64B41C)); /* movss */
-    MEMF(0x86F624) = xmm0.f[0]; /* movss */
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048A930
- * Original: 0x0048A930 - 0x0048A93B (11 bytes, 2 insns)
- * Category: game_vtable
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048A930(void)
-{
-
-loc_0048A930: ;
-    MEM32(0x86F628) = 0xA;
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048A940
- * Original: 0x0048A940 - 0x0048A94B (11 bytes, 2 insns)
- * Category: game_vtable
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048A940(void)
-{
-
-loc_0048A940: ;
-    MEM32(0x86F62C) = 0xA;
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048A950
- * Original: 0x0048A950 - 0x0048A961 (17 bytes, 3 insns)
- * Category: data_init
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048A950(void)
-{
-
-loc_0048A950: ;
-    xmm0 = XMM_SCALAR(MEMF(0x648D70)); /* movss */
-    MEMF(0x86F630) = xmm0.f[0]; /* movss */
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048A970
- * Original: 0x0048A970 - 0x0048A981 (17 bytes, 3 insns)
- * Category: data_init
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048A970(void)
-{
-
-loc_0048A970: ;
-    xmm0 = XMM_SCALAR(MEMF(0x64B41C)); /* movss */
-    MEMF(0x86F634) = xmm0.f[0]; /* movss */
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048A990
- * Original: 0x0048A990 - 0x0048A99B (11 bytes, 2 insns)
- * Category: game_vtable
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048A990(void)
-{
-
-loc_0048A990: ;
-    MEM32(0x86F638) = 0xA;
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048A9A0
- * Original: 0x0048A9A0 - 0x0048A9B1 (17 bytes, 3 insns)
- * Category: data_init
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048A9A0(void)
-{
-
-loc_0048A9A0: ;
-    xmm0 = XMM_SCALAR(MEMF(0x648D70)); /* movss */
-    MEMF(0x86F63C) = xmm0.f[0]; /* movss */
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048A9C0
- * Original: 0x0048A9C0 - 0x0048A9D1 (17 bytes, 3 insns)
- * Category: data_init
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048A9C0(void)
-{
-
-loc_0048A9C0: ;
-    xmm0 = XMM_SCALAR(MEMF(0x64B41C)); /* movss */
-    MEMF(0x86F640) = xmm0.f[0]; /* movss */
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048A9E0
- * Original: 0x0048A9E0 - 0x0048A9EB (11 bytes, 2 insns)
- * Category: game_vtable
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048A9E0(void)
-{
-
-loc_0048A9E0: ;
-    MEM32(0x86F644) = 0xA;
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048A9F0
- * Original: 0x0048A9F0 - 0x0048AA01 (17 bytes, 3 insns)
- * Category: data_init
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048A9F0(void)
-{
-
-loc_0048A9F0: ;
-    xmm0 = XMM_SCALAR(MEMF(0x648D70)); /* movss */
-    MEMF(0x86F648) = xmm0.f[0]; /* movss */
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048AA10
- * Original: 0x0048AA10 - 0x0048AA21 (17 bytes, 3 insns)
- * Category: data_init
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048AA10(void)
-{
-
-loc_0048AA10: ;
-    xmm0 = XMM_SCALAR(MEMF(0x64B41C)); /* movss */
-    MEMF(0x86F64C) = xmm0.f[0]; /* movss */
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048AA30
- * Original: 0x0048AA30 - 0x0048AA3B (11 bytes, 2 insns)
- * Category: game_vtable
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048AA30(void)
-{
-
-loc_0048AA30: ;
-    MEM32(0x86F650) = 0xA;
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048AA40
- * Original: 0x0048AA40 - 0x0048AA51 (17 bytes, 3 insns)
- * Category: data_init
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048AA40(void)
-{
-
-loc_0048AA40: ;
-    xmm0 = XMM_SCALAR(MEMF(0x648D70)); /* movss */
-    MEMF(0x86F654) = xmm0.f[0]; /* movss */
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048AA60
- * Original: 0x0048AA60 - 0x0048AA71 (17 bytes, 3 insns)
- * Category: data_init
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048AA60(void)
-{
-
-loc_0048AA60: ;
-    xmm0 = XMM_SCALAR(MEMF(0x64B41C)); /* movss */
-    MEMF(0x86F658) = xmm0.f[0]; /* movss */
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048AA80
- * Original: 0x0048AA80 - 0x0048AA8B (11 bytes, 2 insns)
- * Category: game_vtable
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048AA80(void)
-{
-
-loc_0048AA80: ;
-    MEM32(0x86F65C) = 0xA;
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048AA90
- * Original: 0x0048AA90 - 0x0048AAA1 (17 bytes, 3 insns)
- * Category: data_init
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048AA90(void)
-{
-
-loc_0048AA90: ;
-    xmm0 = XMM_SCALAR(MEMF(0x648D70)); /* movss */
-    MEMF(0x86F660) = xmm0.f[0]; /* movss */
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048AAB0
- * Original: 0x0048AAB0 - 0x0048AAC1 (17 bytes, 3 insns)
- * Category: data_init
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048AAB0(void)
-{
-
-loc_0048AAB0: ;
-    xmm0 = XMM_SCALAR(MEMF(0x64B41C)); /* movss */
-    MEMF(0x86F664) = xmm0.f[0]; /* movss */
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048AAD0
- * Original: 0x0048AAD0 - 0x0048AADB (11 bytes, 2 insns)
- * Category: game_vtable
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048AAD0(void)
-{
-
-loc_0048AAD0: ;
-    MEM32(0x86F668) = 0xA;
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048AAE0
- * Original: 0x0048AAE0 - 0x0048AAF1 (17 bytes, 3 insns)
- * Category: data_init
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048AAE0(void)
-{
-
-loc_0048AAE0: ;
-    xmm0 = XMM_SCALAR(MEMF(0x648D70)); /* movss */
-    MEMF(0x86F66C) = xmm0.f[0]; /* movss */
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048AB00
- * Original: 0x0048AB00 - 0x0048AB11 (17 bytes, 3 insns)
- * Category: data_init
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048AB00(void)
-{
-
-loc_0048AB00: ;
-    xmm0 = XMM_SCALAR(MEMF(0x64B41C)); /* movss */
-    MEMF(0x86F670) = xmm0.f[0]; /* movss */
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048AB20
- * Original: 0x0048AB20 - 0x0048AB2B (11 bytes, 2 insns)
- * Category: game_vtable
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048AB20(void)
-{
-
-loc_0048AB20: ;
-    MEM32(0x86F674) = 0xA;
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048AB30
- * Original: 0x0048AB30 - 0x0048AB41 (17 bytes, 3 insns)
- * Category: data_init
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048AB30(void)
-{
-
-loc_0048AB30: ;
-    xmm0 = XMM_SCALAR(MEMF(0x648D70)); /* movss */
-    MEMF(0x86F678) = xmm0.f[0]; /* movss */
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048AB50
- * Original: 0x0048AB50 - 0x0048AB61 (17 bytes, 3 insns)
- * Category: data_init
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048AB50(void)
-{
-
-loc_0048AB50: ;
-    xmm0 = XMM_SCALAR(MEMF(0x64B41C)); /* movss */
-    MEMF(0x86F67C) = xmm0.f[0]; /* movss */
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048AB70
- * Original: 0x0048AB70 - 0x0048AB7B (11 bytes, 2 insns)
- * Category: game_vtable
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048AB70(void)
-{
-
-loc_0048AB70: ;
-    MEM32(0x86F680) = 0xA;
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048AB80
- * Original: 0x0048AB80 - 0x0048AB91 (17 bytes, 3 insns)
- * Category: data_init
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048AB80(void)
-{
-
-loc_0048AB80: ;
-    xmm0 = XMM_SCALAR(MEMF(0x648D70)); /* movss */
-    MEMF(0x86F684) = xmm0.f[0]; /* movss */
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048ABA0
- * Original: 0x0048ABA0 - 0x0048ABB1 (17 bytes, 3 insns)
- * Category: data_init
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048ABA0(void)
-{
-
-loc_0048ABA0: ;
-    xmm0 = XMM_SCALAR(MEMF(0x64B41C)); /* movss */
-    MEMF(0x86F688) = xmm0.f[0]; /* movss */
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048ABC0
- * Original: 0x0048ABC0 - 0x0048ABCB (11 bytes, 2 insns)
- * Category: game_vtable
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048ABC0(void)
-{
-
-loc_0048ABC0: ;
-    MEM32(0x86F68C) = 0xA;
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048ABD0
- * Original: 0x0048ABD0 - 0x0048ABE1 (17 bytes, 3 insns)
- * Category: data_init
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048ABD0(void)
-{
-
-loc_0048ABD0: ;
-    xmm0 = XMM_SCALAR(MEMF(0x648D70)); /* movss */
-    MEMF(0x86F690) = xmm0.f[0]; /* movss */
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048ABF0
- * Original: 0x0048ABF0 - 0x0048AC01 (17 bytes, 3 insns)
- * Category: data_init
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048ABF0(void)
-{
-
-loc_0048ABF0: ;
-    xmm0 = XMM_SCALAR(MEMF(0x64B41C)); /* movss */
-    MEMF(0x86F694) = xmm0.f[0]; /* movss */
-    esp += 4; return; /* ret */
-
-}
-
-/**
- * sub_0048AC10
- * Original: 0x0048AC10 - 0x0048AC1B (11 bytes, 2 insns)
- * Category: game_vtable
- * CC: cdecl, 0 params, returns int_or_void
- * Frame: fpo_leaf
- */
-void sub_0048AC10(void)
-{
-
-loc_0048AC10: ;
-    MEM32(0x86F698) = 0xA;
     esp += 4; return; /* ret */
 
 }

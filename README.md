@@ -13,10 +13,10 @@
 | Área | Estado |
 |---|---|
 | Análisis del XBE de Conker | ✅ 27 secciones cargadas |
-| Runtime | ✅ xboxrecomp v0.15.0 (submódulo) |
+| Runtime | ✅ xboxrecomp v0.16.0 (submódulo) |
 | Compilación Linux (GCC) | ✅ Ejecutable nativo + pruebas |
 | Compilación Windows / macOS | 🟡 Soportadas por el runtime, sin probar en este proyecto |
-| Código recompilado | ✅ Regenerado con v0.15.0 (19.993 funciones, 21 sin resolver) |
+| Código recompilado | ✅ Regenerado con v0.16.0 (20.029 funciones, 20 sin resolver) |
 | Frames (push-buffers D3D8LTCG) | 🟡 Ejecutor activo: superficie 640×480 y primer flip; se bloquea esperando a la GPU |
 | Backend Vulkan | 🟡 Funciona; falta conectarlo al ejecutor |
 | Backend Metal | 🔴 Esqueleto |
