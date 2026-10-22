@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
-project(conker_recomp C)
+# The release version: the AppImage is named after it, and the executable
+# prints it. 0.1.x until the next milestone.
+project(conker_recomp VERSION 0.1.1 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -131,6 +133,8 @@ if(CONKER_BUILD_GAME)
         target_link_libraries(conker_recomp PRIVATE xbox_nv2a_vk)
         target_compile_definitions(conker_recomp PRIVATE CONKER_HAVE_VULKAN=1)
     endif()
+    target_compile_definitions(conker_recomp PRIVATE
+        CONKER_VERSION="${PROJECT_VERSION}")
 
     if(WIN32)
         target_compile_definitions(conker_recomp PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -160,16 +164,21 @@ endif()
 
 # ── AppImage (Linux) ───────────────────────────────────────────────────
 # `cmake --build <build> --target appimage` packs the executable into
-# <build>/appimage/Conker-Recomp-x86_64.AppImage (../packaging/appimage).
+# CONKER_APPIMAGE_DIR/Conker-Recomp-<version>-x86_64.AppImage (by default
+# appimage/ at the repository root, git-ignored; ../packaging/appimage).
 # Build it from a Release build; the game data is never included.
 if(TARGET conker_recomp AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    set(_appimage_dir "${CMAKE_BINARY_DIR}/appimage")
+    get_filename_component(_appimage_default
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../../appimage" ABSOLUTE)
+    set(CONKER_APPIMAGE_DIR "${_appimage_default}" CACHE PATH
+        "Where the appimage target writes the AppImage")
     add_custom_target(appimage
-        COMMAND "${CMAKE_COMMAND}" -E make_directory "${_appimage_dir}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${CONKER_APPIMAGE_DIR}"
         COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/../packaging/appimage/build-appimage.sh"
-                "$<TARGET_FILE:conker_recomp>" "${_appimage_dir}"
+                "$<TARGET_FILE:conker_recomp>" "${CMAKE_BINARY_DIR}/appimage"
+                "${CONKER_APPIMAGE_DIR}" "${PROJECT_VERSION}"
         DEPENDS conker_recomp
-        COMMENT "Packing Conker-Recomp-x86_64.AppImage"
+        COMMENT "Packing Conker-Recomp-${PROJECT_VERSION}-x86_64.AppImage"
         VERBATIM)
 endif()
 

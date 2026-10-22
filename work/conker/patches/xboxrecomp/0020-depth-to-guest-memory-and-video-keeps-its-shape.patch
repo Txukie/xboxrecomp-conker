@@ -1,0 +1,455 @@
+diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
+index ab19180..e25e288 100644
+--- a/src/kernel/nv2a_backend.h
++++ b/src/kernel/nv2a_backend.h
+@@ -91,6 +91,10 @@ typedef struct {
+      * the next GET_REPORT (report_read below). Zeta format, SURFACE_FORMAT
+      * bits 4-7: 1 Z16 (window z 0..0xFFFF), 2 Z24S8 (0..0xFFFFFF). */
+     uint32_t zpass_enable, zeta_format;
++    /* SET_SURFACE_PITCH's top half: bytes per row of the zeta surface, for a
++     * back end that writes depth back to guest memory (a title can sample
++     * its depth buffer as a texture). */
++    uint32_t zeta_pitch;
+ } Nv2aRenderState;
+ 
+ typedef struct {
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index e661aaa..3181de1 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -852,6 +852,7 @@ static void current_render_state(Nv2aRenderState *r)
+     r->stencil_zpass     = s_reg[0x0378 / 4];        /* SET_STENCIL_OP_ZPASS */
+     r->zpass_enable      = s_gpu.zpass_enable;
+     r->zeta_format       = (s_gpu.format >> 4) & 0xF;
++    r->zeta_pitch        = s_reg[NV097_SET_SURFACE_PITCH / 4] >> 16;
+ }
+ 
+ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);
+@@ -3509,6 +3510,45 @@ static void raster_batch_program(void)
+         backend_flush(!s_xf_no_tex, 1);
+ }
+ 
++/* Full-screen video (display_aspect.h g_xbox_display_video).
++ *
++ * A movie player hands the GPU each decoded frame as a YUV texture and draws
++ * it over the surface. No 3D scene samples YUV, so a batch that does, with a
++ * texture covering at least a quarter of the surface, marks the frame as
++ * video; the presenters then show it at its own shape. The flag drops only
++ * after a second of frames without one, so a fade or a frame the player
++ * skips does not make the picture change shape. */
++volatile int g_xbox_display_video;
++static int s_frame_video, s_video_hold;
++
++static void note_video_batch(void)
++{
++    int st;
++    for (st = 0; st < 4; st++) {
++        const Texture *t = &s_gpu.texs[st];
++        if (t->valid && (t->color == 0x24 || t->color == 0x25)
++            && 4ull * t->width * t->height * s_gpu.aa_sx * s_gpu.aa_sy
++               >= (unsigned long long)s_gpu.clip_w * s_gpu.clip_h) {
++            s_frame_video = 1;
++            return;
++        }
++    }
++}
++
++static void video_flip(void)
++{
++    if (s_frame_video)
++        s_video_hold = 30;
++    else if (s_video_hold)
++        s_video_hold--;
++    s_frame_video = 0;
++    if (g_xbox_display_video != (s_video_hold > 0))
++        fprintf(stderr, "  [GPU] %s\n", s_video_hold > 0
++                ? "video: frames keep their own shape"
++                : "video over");
++    g_xbox_display_video = s_video_hold > 0;
++}
++
+ static void raster_batch(void)
+ {
+     uint32_t i;
+@@ -3517,6 +3557,7 @@ static void raster_batch(void)
+ 
+     if (s_gpu.idx_count < 3)
+         return;
++    note_video_batch();
+     if (batch_uses_program() || batch_is_ffp()) {
+         raster_batch_program();
+         return;
+@@ -4529,6 +4570,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+         /* And this is a completed swap, which is what a title's own swap
+          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
+         xbox_Nv2aFrameCounterFlip();
++        /* Before the window gets the frame: whether it is video decides
++         * the shape it is shown at. */
++        video_flip();
+         /* Hand the window a copy of the frame just finished.
+          *
+          * The buffer the title has finished is the one the last batch drew
+diff --git a/src/video/display_aspect.h b/src/video/display_aspect.h
+index b683f50..1d4ef4d 100644
+--- a/src/video/display_aspect.h
++++ b/src/video/display_aspect.h
+@@ -33,11 +33,30 @@ static inline double xbox_DisplayAspect(void)
+ }
+ 
+ /* The width a frame w x h is shown at for its height (w itself unless a
+- * display aspect is set). */
++ * display aspect is set): the window's shape. */
+ static inline uint32_t xbox_DisplayWidth(uint32_t w, uint32_t h)
+ {
+     double a = xbox_DisplayAspect();
+     return a > 0.0 ? (uint32_t)(h * a + 0.5) : w;
+ }
+ 
++/* Non-zero while the frames being shown are a full-screen video (the
++ * pushbuffer executor sets it, nv2a_pb_exec.c). A movie was encoded for the
++ * frame's own shape, and a projection the project widened (Hor+) does not
++ * reach it: stretched to 16:9 it only distorts. */
++extern volatile int g_xbox_display_video;
++
++/* The width this frame is shown at: the display aspect, except that a video
++ * keeps its own shape, with black bars beside it (RECOMP_VIDEO_STRETCH=1
++ * stretches it like everything else). */
++static inline uint32_t xbox_DisplayContentWidth(uint32_t w, uint32_t h)
++{
++    static int stretch = -1;
++    if (stretch < 0) {
++        const char *e = getenv("RECOMP_VIDEO_STRETCH");
++        stretch = e && e[0] == '1';
++    }
++    return g_xbox_display_video && !stretch ? w : xbox_DisplayWidth(w, h);
++}
++
+ #endif
+diff --git a/src/video/fb_present.c b/src/video/fb_present.c
+index ee82a9c..1f43af5 100644
+--- a/src/video/fb_present.c
++++ b/src/video/fb_present.c
+@@ -441,19 +441,24 @@ int xbox_FramebufferDumpBmp(const char *path)
+ static void gdi_blit(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
+ {
+     static LONG lw, lh;
++    static long long lfw;
+     RECT c;
+     LONG cw, ch, w, h;
+     GetClientRect(hwnd, &c);
+     cw = c.right - c.left; ch = c.bottom - c.top;
+     if (cw <= 0 || ch <= 0)
+         return;
+-    if (cw != lw || ch != lh) {
++    /* The bars are repainted when the window or the shown shape changes
++     * (a video keeps its own shape, display_aspect.h). */
++    if (cw != lw || ch != lh
++        || lfw != (long long)xbox_DisplayContentWidth(s_fb_width, s_fb_height)) {
+         FillRect(hdc, &c, (HBRUSH)GetStockObject(BLACK_BRUSH));
+         lw = cw; lh = ch;
++        lfw = xbox_DisplayContentWidth(s_fb_width, s_fb_height);
+     }
+     {
+         /* The frame's shape, or the display aspect (display_aspect.h). */
+-        long long fw = xbox_DisplayWidth(s_fb_width, s_fb_height), fh = s_fb_height;
++        long long fw = xbox_DisplayContentWidth(s_fb_width, s_fb_height), fh = s_fb_height;
+         if ((long long)cw * fh <= (long long)ch * fw) {
+             w = cw; h = (LONG)((long long)cw * fh / fw);
+         } else {
+diff --git a/src/video/fb_present_sdl.c b/src/video/fb_present_sdl.c
+index 3817675..696f9d5 100644
+--- a/src/video/fb_present_sdl.c
++++ b/src/video/fb_present_sdl.c
+@@ -271,6 +271,40 @@ static int env_on(const char *name)
+     return e && *e && *e != '0';
+ }
+ 
++/* RECOMP_FB_WINDOW_SHOT=<prefix>: while <prefix>.req exists, each presented
++ * window image -- scaled, with its bars, as the player sees it -- is written
++ * to <prefix>NNNN.bmp. It shows what the window does to a frame, which the
++ * framebuffer dumps (RECOMP_FB_DUMP) cannot; with SDL_VIDEODRIVER=offscreen
++ * it works without a display. */
++static void window_shot(SDL_Renderer *ren)
++{
++    static const char *prefix = (const char *)-1;
++    static unsigned seq;
++    char path[512];
++    FILE *f;
++    int w, h;
++    SDL_Surface *sf;
++
++    if (prefix == (const char *)-1)
++        prefix = getenv("RECOMP_FB_WINDOW_SHOT");
++    if (!prefix || !*prefix)
++        return;
++    snprintf(path, sizeof path, "%s.req", prefix);
++    if (!(f = fopen(path, "rb")))
++        return;
++    fclose(f);
++    if (SDL_GetRendererOutputSize(ren, &w, &h) != 0)
++        return;
++    sf = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_ARGB8888);
++    if (!sf)
++        return;
++    if (SDL_RenderReadPixels(ren, NULL, SDL_PIXELFORMAT_ARGB8888, sf->pixels, sf->pitch) == 0) {
++        snprintf(path, sizeof path, "%s%04u.bmp", prefix, seq++);
++        SDL_SaveBMP(sf, path);
++    }
++    SDL_FreeSurface(sf);
++}
++
+ int xbox_HostWindowMain(int (*guest_main)(void))
+ {
+     SDL_Window *win;
+@@ -315,9 +349,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+         SDL_QuitSubSystem(FBWIN_SDL_SUBSYSTEMS);
+         return guest_main();
+     }
+-    /* The frame's shape, or the display aspect (display_aspect.h): the
+-     * texture is stretched to the logical size, letterboxed in the window. */
+-    SDL_RenderSetLogicalSize(ren, (int)xbox_DisplayWidth(FB_W, FB_H), (int)FB_H);
++    /* The frame is drawn into the largest rectangle of its shown shape
++     * (display_aspect.h) that fits the window, centred, with black around it
++     * -- computed per frame, since a video keeps its own shape. */
+     {
+         SDL_RendererInfo ri;
+         if (SDL_GetRendererInfo(ren, &ri) == 0)
+@@ -417,11 +451,29 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+             dirty = 1;
+         }
+         if (dirty) {
++            SDL_Rect dst;
++            int ow, oh;
++            long long cw = xbox_DisplayContentWidth(FB_W, FB_H), ch = FB_H;
++
+             dirty = 0;
++            if (SDL_GetRendererOutputSize(ren, &ow, &oh) != 0 || ow <= 0 || oh <= 0) {
++                ow = (int)cw;
++                oh = (int)ch;
++            }
++            if ((long long)ow * ch <= (long long)oh * cw) {
++                dst.w = ow;
++                dst.h = (int)((long long)ow * ch / cw);
++            } else {
++                dst.h = oh;
++                dst.w = (int)((long long)oh * cw / ch);
++            }
++            dst.x = (ow - dst.w) / 2;
++            dst.y = (oh - dst.h) / 2;
+             SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+             SDL_RenderClear(ren);
+             if (tex)
+-                SDL_RenderCopy(ren, tex, NULL, NULL);
++                SDL_RenderCopy(ren, tex, NULL, &dst);
++            window_shot(ren);
+             SDL_RenderPresent(ren);
+         }
+ 
+diff --git a/src/video/gpu_present.c b/src/video/gpu_present.c
+index fc85f86..2a0bb5c 100644
+--- a/src/video/gpu_present.c
++++ b/src/video/gpu_present.c
+@@ -196,10 +196,10 @@ int gpu_present_frame(const uint32_t *pixels)
+     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_rtv, NULL);
+     ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_rtv, black);
+     /* The largest rectangle of the frame's shape (or the display aspect,
+-     * display_aspect.h) that fits, centred. */
+-    sx = (float)s_bw / (float)xbox_DisplayWidth(s_w, s_h);
++     * display_aspect.h; a video keeps its own) that fits, centred. */
++    sx = (float)s_bw / (float)xbox_DisplayContentWidth(s_w, s_h);
+     sy = (float)s_bh / (float)s_h;
+-    vp.Width = (float)xbox_DisplayWidth(s_w, s_h) * (sx < sy ? sx : sy);
++    vp.Width = (float)xbox_DisplayContentWidth(s_w, s_h) * (sx < sy ? sx : sy);
+     vp.Height = (float)s_h * (sx < sy ? sx : sy);
+     vp.TopLeftX = ((float)s_bw - vp.Width) * 0.5f;
+     vp.TopLeftY = ((float)s_bh - vp.Height) * 0.5f;
+diff --git a/src/vulkan/nv2a_vk.c b/src/vulkan/nv2a_vk.c
+index 15d0921..b41873a 100644
+--- a/src/vulkan/nv2a_vk.c
++++ b/src/vulkan/nv2a_vk.c
+@@ -328,6 +328,12 @@ typedef struct {
+     uint32_t va;
+     Img depth;
+     uint32_t last_use;
++    /* How the zeta surface lies in guest memory (Z24S8: depth << 8 |
++     * stencil, a dword per pixel; Z16: a word), how many rows of it the
++     * colour surfaces drawn with it cover, and whether the GPU wrote depth
++     * or stencil since guest memory last had them (zeta_queue_readback). */
++    uint32_t pitch, zfmt, rows;
++    int gpu_dirty;
+ } Zeta;
+ 
+ static Surf s_surfs[VK_MAX_SURFACES];
+@@ -343,6 +349,10 @@ typedef struct { Surf *s; VkDeviceSize off; } Readback;
+ static Readback s_reads[VK_MAX_SURFACES];
+ static int s_nreads;
+ 
++typedef struct { Zeta *z; VkDeviceSize depth_off, stencil_off; uint32_t w, h; } ZetaReadback;
++static ZetaReadback s_zreads[VK_MAX_ZETAS];
++static int s_nzreads;
++
+ static size_t surf_row_bytes(const Surf *s) { return (size_t)s->w * s->bpp; }
+ 
+ static size_t surf_span(const Surf *s)
+@@ -696,6 +706,78 @@ static uint32_t s_tex_uploads, s_tex_hits, s_tex_new, s_tex_rt, s_tex_copies;
+ 
+ /* Surfaces drawn over [va, va+bytes) go back to guest memory first: the
+  * stage is about to read what a render pass left there. */
++/* A zeta surface's bytes in guest memory: rows * pitch. */
++static uint32_t zeta_span(const Zeta *z)
++{
++    return z->pitch && z->rows ? z->rows * z->pitch : 0;
++}
++
++/* Depth and stencil into guest memory as the NV2A stores them, at the next
++ * flush. A title can sample its depth buffer as a texture: Conker's glow
++ * reads the 640x480 Z24S8 zeta surface as LIN_R8G8B8A8 for a depth mask,
++ * and with nothing written there it read whatever the memory held. */
++static void zeta_queue_readback(Zeta *z)
++{
++    uint32_t bpp = z->zfmt == 1 ? 2u : 4u, w, h, i;
++    VkDeviceSize doff, soff = 0;
++    VkBufferImageCopy r[2];
++    int with_stencil = s_depth_fmt != VK_FORMAT_D32_SFLOAT;
++
++    for (i = 0; i < (uint32_t)s_nzreads; i++)
++        if (s_zreads[i].z == z)
++            return;
++    if (!zeta_span(z) || !nv2a_backend_guest_span_ok(z->va, zeta_span(z)))
++        return;
++    w = z->pitch / bpp;
++    if (w > z->depth.w) w = z->depth.w;
++    h = z->rows < z->depth.h ? z->rows : z->depth.h;
++    doff = ring_take(&s_rrd, (VkDeviceSize)w * h * 4, 16);
++    if (with_stencil && doff != UINT64_MAX)
++        soff = ring_take(&s_rrd, (VkDeviceSize)w * h, 16);
++    if (doff == UINT64_MAX || soff == UINT64_MAX || s_nzreads == VK_MAX_ZETAS) {
++        flush();
++        doff = ring_take(&s_rrd, (VkDeviceSize)w * h * 4, 16);
++        soff = with_stencil ? ring_take(&s_rrd, (VkDeviceSize)w * h, 16) : 0;
++        if (doff == UINT64_MAX || soff == UINT64_MAX)
++            return;
++    }
++    end_rendering();
++    barrier_all();
++    r[0] = copy_region(w, h, 1, doff, VK_IMAGE_ASPECT_DEPTH_BIT);
++    r[1] = copy_region(w, h, 1, soff, VK_IMAGE_ASPECT_STENCIL_BIT);
++    vkCmdCopyImageToBuffer(cmd(), z->depth.image, VK_IMAGE_LAYOUT_GENERAL, s_rrd.buf,
++                           with_stencil ? 2 : 1, r);
++    barrier_all();
++    s_zreads[s_nzreads].z = z;
++    s_zreads[s_nzreads].depth_off = doff;
++    s_zreads[s_nzreads].stencil_off = with_stencil ? soff : UINT64_MAX;
++    s_zreads[s_nzreads].w = w;
++    s_zreads[s_nzreads].h = h;
++    s_nzreads++;
++}
++
++static void zeta_write_guest(const ZetaReadback *zr)
++{
++    const Zeta *z = zr->z;
++    const float *d = (const float *)(s_rrd.map + zr->depth_off);
++    const uint8_t *st = zr->stencil_off != UINT64_MAX ? s_rrd.map + zr->stencil_off : NULL;
++    uint32_t x, y;
++
++    for (y = 0; y < zr->h; y++) {
++        uint8_t *row = guest(z->va + y * z->pitch);
++        for (x = 0; x < zr->w; x++) {
++            float f = d[(size_t)y * zr->w + x];
++            f = f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
++            if (z->zfmt == 1) {
++                ((uint16_t *)row)[x] = (uint16_t)(f * 65535.0f + 0.5f);
++            } else {
++                uint32_t d24 = (uint32_t)(f * 16777215.0f + 0.5f);
++                ((uint32_t *)row)[x] = d24 << 8 | (st ? st[(size_t)y * zr->w + x] : 0u);
++            }
++        }
++    }
++}
++
+ static int resolve_overlaps(uint32_t va, uint32_t bytes)
+ {
+     int i, any = 0;
+@@ -707,6 +789,15 @@ static int resolve_overlaps(uint32_t va, uint32_t bytes)
+             any = 1;
+         }
+     }
++    for (i = 0; i < VK_MAX_ZETAS; i++) {
++        Zeta *z = &s_zetas[i];
++        if (z->depth.image && z->gpu_dirty && zeta_span(z)
++            && va < z->va + zeta_span(z) && z->va < va + bytes) {
++            zeta_queue_readback(z);
++            z->gpu_dirty = 0;
++            any = 1;
++        }
++    }
+     if (any)
+         flush();
+     return any;
+@@ -1153,9 +1244,12 @@ static void flush(void)
+ 
+     for (i = 0; i < s_nreads; i++)
+         surf_write_guest(s_reads[i].s, s_rrd.map + s_reads[i].off);
+-    if (s_nreads)
++    for (i = 0; i < s_nzreads; i++)
++        zeta_write_guest(&s_zreads[i]);
++    if (s_nreads || s_nzreads)
+         s_resolve_gen++;
+     s_nreads = 0;
++    s_nzreads = 0;
+     for (i = 0; i < s_ndead; i++)
+         img_destroy_now(&s_dead[i]);
+     s_ndead = 0;
+@@ -1257,9 +1351,25 @@ static void set_dynamic_state(VkCommandBuffer c, const Surf *s,
+ /* Whether a draw needs the depth/stencil attachment, and which. */
+ static Zeta *zeta_for(const Nv2aRenderState *rs, const Surf *s, int need)
+ {
++    Zeta *z;
++
+     if (!rs->zeta_va && !need)
+         return NULL;
+-    return zeta_get(rs->zeta_va, s->w, s->h);
++    z = zeta_get(rs->zeta_va, s->w, s->h);
++    if (z) {
++        z->pitch = rs->zeta_pitch;
++        z->zfmt = rs->zeta_format;
++        if (s->h > z->rows)
++            z->rows = s->h;
++    }
++    return z;
++}
++
++/* Does this draw (or clear) change the depth/stencil attachment? */
++static int writes_zeta(const Nv2aRenderState *rs)
++{
++    return rs->depth_write
++        || (s_stencil && rs->stencil_enable && (rs->stencil_write_mask & 0xFF));
+ }
+ 
+ static void vk_clear(const Nv2aSurface *ns, const Nv2aRenderState *rs,
+@@ -1288,6 +1398,7 @@ static void vk_clear(const Nv2aSurface *ns, const Nv2aRenderState *rs,
+         s->version = ++s_writes;
+     }
+     if ((flags & 3) && z) {
++        z->gpu_dirty = 1;
+         memset(&at[n], 0, sizeof at[n]);
+         if (flags & 1)
+             at[n].aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
+@@ -1528,6 +1639,8 @@ static void vk_draw_full(const Nv2aSurface *ns, const Nv2aFullBatch *b)
+     if (use_q)
+         vkCmdEndQuery(c, s_qpool, s_q_used++);
+     end_draw(c, s, &pk, use_q);
++    if (z && writes_zeta(rs))
++        z->gpu_dirty = 1;
+     s_tris += b->count / 3;
+ }
+ 
+@@ -1715,6 +1828,8 @@ static void vk_draw_program(const Nv2aSurface *ns, const Nv2aProgramBatch *b)
+     if (use_q)
+         vkCmdEndQuery(c, s_qpool, s_q_used++);
+     end_draw(c, s, &pk, use_q);
++    if (z && writes_zeta(rs))
++        z->gpu_dirty = 1;
+     s_tris += b->count / 3;
+     s_prog_draws++;
+ }

@@ -55,3 +55,6 @@ work/conker/.venv/
 
 # Screenshots of the game (copyrighted content): local only, never committed
 work/conker/screenshots/
+
+# AppImages built by the appimage target (work/conker/packaging/appimage)
+/appimage/

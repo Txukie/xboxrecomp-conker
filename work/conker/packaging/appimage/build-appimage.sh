@@ -1,9 +1,10 @@
 #!/bin/sh
-# build-appimage.sh BINARY OUTPUT_DIR
+# build-appimage.sh BINARY WORK_DIR OUTPUT_DIR VERSION
 #
-# Packs the Linux build of conker_recomp into OUTPUT_DIR/Conker-Recomp-x86_64.AppImage.
+# Packs the Linux build of conker_recomp into
+# OUTPUT_DIR/Conker-Recomp-VERSION-x86_64.AppImage, assembling it in WORK_DIR.
 # Run through the CMake target (`cmake --build <build> --target appimage`),
-# which passes both arguments.
+# which passes all four (VERSION is the CMake project version).
 #
 # Bundled: the binary, AppRun, the desktop entry and icon, and the libraries
 # a desktop may lack (SDL2, libepoxy, OpenSSL's libcrypto). Not bundled, on
@@ -12,13 +13,17 @@
 # as the build machine's.
 #
 # appimagetool comes from APPIMAGETOOL, then PATH, then a pinned release
-# downloaded into OUTPUT_DIR and checked against its SHA-256.
+# downloaded into WORK_DIR and checked against its SHA-256.
 set -eu
 
 bin=$1
 out=$2
+dest=$3
+version=$4
 here=$(cd "$(dirname "$0")" && pwd)
 appdir="$out/AppDir"
+image="$dest/Conker-Recomp-$version-x86_64.AppImage"
+mkdir -p "$out" "$dest"
 
 tool_version=1.9.0
 tool_sha256=46fdd785094c7f6e545b61afcfb0f3d98d8eab243f644b4b17698c01d06083d1
@@ -63,9 +68,9 @@ if [ -z "$tool" ]; then
     fi
 fi
 
-version=$(git -C "$here" describe --always --dirty 2>/dev/null || echo dev)
+commit=$(git -C "$here" rev-parse --short HEAD 2>/dev/null || echo unknown)
 # --appimage-extract-and-run: appimagetool is itself an AppImage, and this
 # way building needs no FUSE.
 ARCH=x86_64 VERSION="$version" "$tool" --appimage-extract-and-run --no-appstream \
-    "$appdir" "$out/Conker-Recomp-x86_64.AppImage"
-echo "build-appimage: $out/Conker-Recomp-x86_64.AppImage ($version)"
+    "$appdir" "$image"
+echo "build-appimage: $image ($version, $commit)"

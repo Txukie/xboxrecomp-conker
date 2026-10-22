@@ -123,7 +123,11 @@ static int conker_boot(void)
     if (snprintf(xbe_path, sizeof(xbe_path), "%s/default.xbe", game_dir) < 0)
         return 1;
 
-    printf("=== Conker: Live and Reloaded static recompilation ===\n");
+#ifndef CONKER_VERSION
+#define CONKER_VERSION "dev"
+#endif
+    printf("=== Conker: Live and Reloaded static recompilation %s ===\n",
+           CONKER_VERSION);
     printf("[CONKER] game directory: %s\n", game_dir);
     printf("[CONKER] save directory: %s\n", save_path);
     if (!load_file(xbe_path, &xbe_data, &xbe_size))
@@ -158,11 +162,13 @@ static int conker_boot(void)
         conker_install_d3d_hooks();
     }
 
-    /* RECOMP_RENDERER=vulkan: pixels on the host GPU instead of the CPU
-     * rasteriser (which stays the fallback when no device is usable). */
+    /* RECOMP_RENDERER: vulkan (the default) draws on the host GPU, and the
+     * CPU rasteriser takes over when no Vulkan device is usable; cpu draws
+     * on the CPU from the start. The CPU rasteriser is correct but slow,
+     * and its intro video came out washed out. */
     {
         const char *r = getenv("RECOMP_RENDERER");
-        if (r && !strcmp(r, "vulkan")) {
+        if (!r || !*r || !strcmp(r, "vulkan")) {
 #ifdef CONKER_HAVE_VULKAN
             nv2a_vk_install();
 #else

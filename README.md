@@ -20,9 +20,10 @@
 | Vídeo de introducción, menús, perfiles | ✅ Se ven y se controlan (teclado o mando) |
 | Partida nueva (Game 1) | ✅ Llega a las escenas iniciales; el juego en sí está poco probado |
 | Renderizado Vulkan | ✅ Píxeles y vertex programs en la GPU; ~30 fps fijos, como en la consola |
-| Pantalla panorámica | ✅ `CONKER_ASPECT=16:9` (Hor+); los elementos 2D se estiran |
+| Pantalla panorámica | ✅ `CONKER_ASPECT=16:9` (Hor+); los vídeos conservan su 4:3 con barras negras; los elementos 2D del menú se estiran |
+| Vídeos (FMV) | ✅ Decodificación y colores comprobados contra ffmpeg con Vulkan |
 | Backend Metal | 🔴 Todavía no |
-| Problemas conocidos | Colores del vídeo FMV; cargas de nivel lentas (~30 s); la emulación USB a veces deja de leer el mando |
+| Problemas conocidos | Con el rasterizador de CPU los vídeos salen lavados; cargas de nivel lentas (~30 s); la emulación USB a veces deja de leer el mando |
 
 ## Prueba rápida
 
@@ -34,8 +35,7 @@ ejemplo con `extract-xiso`).
 git clone --recurse-submodules <este repositorio>
 cmake -S work/conker/project -B work/conker/project/build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build work/conker/project/build
-RECOMP_FB_WINDOW=1 RECOMP_RENDERER=vulkan \
-    ./work/conker/run_conker.sh /ruta/a/Conker      # Windows: run_conker.ps1
+RECOMP_FB_WINDOW=1 ./work/conker/run_conker.sh /ruta/a/Conker   # Windows: run_conker.ps1
 ```
 
 Usa una compilación Release: con `-O0` el código recompilado es muchas veces
@@ -45,8 +45,13 @@ más lento.
 
 ```sh
 cmake --build work/conker/project/build --target appimage
-./work/conker/project/build/appimage/Conker-Recomp-x86_64.AppImage /ruta/a/Conker
+./appimage/Conker-Recomp-0.1.1-x86_64.AppImage /ruta/a/Conker
 ```
+
+El objetivo deja la AppImage en `appimage/`, en la raíz del repositorio
+(ignorada por git), con la versión del proyecto en el nombre. La versión está
+en `project(conker_recomp VERSION …)` de `work/conker/project/CMakeLists.txt`,
+y el ejecutable la muestra al arrancar.
 
 La AppImage no contiene datos del juego. Sin argumento busca el disco extraído
 en `CONKER_GAME_DIR` o en `~/.local/share/conker-recomp/game`. Las partidas se
@@ -63,10 +68,12 @@ la versión 1.9.0 y se comprueba su SHA-256.
 
 - Teclado (con la ventana abierta): Intro = START, Z = A; también sirven los
   mandos que reconoce SDL.
-- `RECOMP_RENDERER=vulkan`: renderizado en la GPU. Sin él dibuja la CPU, que
-  es correcta pero va a unos 3 fps.
+- `RECOMP_RENDERER`: `vulkan` (por defecto) dibuja en la GPU; si no hay un
+  dispositivo Vulkan utilizable, o con `cpu`, dibuja la CPU, que va a unos
+  3 fps.
 - `CONKER_ASPECT=16:9` (o `16:10`, `21:9`, un número): vista panorámica sin
-  deformar el 3D.
+  deformar el 3D. Los vídeos se ven siempre en su proporción original, con
+  barras negras a los lados (`RECOMP_VIDEO_STRETCH=1` los estira).
 - `RECOMP_FLIP_PACING=0`: quita la sincronía con el vblank (por defecto está
   activa: 30 fps, como la consola).
 - `RECOMP_VK_VALIDATE=1`: activa las capas de validación de Vulkan.
