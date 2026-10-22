@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 # The release version: the AppImage is named after it, and the executable
 # prints it. 0.1.x until the next milestone.
-project(conker_recomp VERSION 0.1.1 LANGUAGES C)
+project(conker_recomp VERSION 0.1.3 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -108,6 +108,8 @@ if(CONKER_BUILD_GAME)
     add_executable(conker_recomp
         src/main.c
         src/recomp_manual.c
+        src/conker_menu.c
+        src/conker_settings.c
         ${CONKER_HOST_SOURCES}
         ${RECOMP_GEN_SOURCES}
     )
@@ -188,6 +190,8 @@ endif()
 add_library(conker_host_check OBJECT
     src/main.c
     src/recomp_manual.c
+    src/conker_menu.c
+    src/conker_settings.c
     ${CONKER_HOST_SOURCES}
 )
 target_include_directories(conker_host_check PRIVATE

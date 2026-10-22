@@ -1,0 +1,701 @@
+diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
+index e25e288..91b908c 100644
+--- a/src/kernel/nv2a_backend.h
++++ b/src/kernel/nv2a_backend.h
+@@ -45,6 +45,10 @@ typedef struct {
+      * of a swizzled surface covers CLEAR_RECT, which arrives here instead. */
+     uint32_t clip_x, clip_y;
+     uint32_t swz_log_w, swz_log_h;
++    /* SET_SURFACE_FORMAT's colour code: 1/2 X1R5G5B5, 3 R5G6B5, 4/5
++     * X8R8G8B8, 6/7 X1A7R8G8B8, 8 A8R8G8B8 (0 when the title never set it).
++     * clear() gets its colour as ARGB whatever this is. */
++    uint32_t color_format;
+ } Nv2aSurface;
+ 
+ /* A texture as the title programmed it. uv in Nv2aVertex are in texels. */
+@@ -133,6 +137,11 @@ typedef struct {
+     uint32_t border_color;      /* BORDER mode reads `border` */
+     uint32_t cube;              /* six faces */
+     uint32_t normalized;        /* coordinates arrive in 0..1, not texels */
++    /* SET_TEXTURE_SET_BUMP_ENV_MAT (00, 01, 10, 11), _SCALE and _OFFSET:
++     * how a BUMPENVMAP stage turns the du/dv it reads from its input stage
++     * into an offset of its own coordinates (and, for the luminance
++     * variant, a brightness). */
++    float    bump_mat[4], bump_scale, bump_offset;
+ } Nv2aStage;
+ 
+ typedef struct {
+@@ -149,6 +158,10 @@ typedef struct {
+     Nv2aStage             stage[4];
+     uint32_t              clip_plane_mode;
+     float                 fog_color[4];
++    /* SET_SHADER_OTHER_STAGE_INPUT: which earlier stage a dependent stage
++     * (bump, dot product) reads -- stage 1 reads stage 0, stage 2 the one
++     * in bits 16-19, stage 3 the one in bits 20-23. */
++    uint32_t              stage_input;
+ } Nv2aFullBatch;
+ 
+ /* A vertex-program batch, for a back end that runs the program itself (on
+@@ -225,6 +238,12 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
+ void nv2a_backend_decode_stage(const Nv2aStage *st, uint32_t face,
+                                uint32_t *argb_out);
+ 
++/* Mip level `level` of the same (width >> level by height >> level, at least
++ * 1): the levels a swizzled or compressed texture stores after level 0.
++ * st->levels says how many there are. */
++void nv2a_backend_decode_stage_level(const Nv2aStage *st, uint32_t face,
++                                     uint32_t level, uint32_t *argb_out);
++
+ /* How many bytes of guest memory from st->offset the stage reads (every face
+  * and mip level), for a back end that caches decoded textures by content.
+  * A P8 stage also reads its 256-entry palette at st->palette. */
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index 3181de1..6a01526 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -812,6 +812,7 @@ static void current_surface(Nv2aSurface *out)
+     out->aa_sy           = s_gpu.aa_sy > 1.5f ? 2 : 1;
+     out->clip_x          = s_gpu.clip_x;
+     out->clip_y          = s_gpu.clip_y;
++    out->color_format    = s_gpu.format & 0xF;
+     out->swz_log_w = out->swz_log_h = 0;
+     if (((s_gpu.format >> 8) & 0xF) == 2) {     /* swizzled */
+         out->swz_log_w = (s_gpu.format >> 16) & 0xF;
+@@ -910,6 +911,43 @@ static void surface_swizzle_update(void)
+                            &s_swz_mx, &s_swz_my);
+ }
+ 
++/* SET_COLOR_CLEAR_VALUE is a pixel in the colour surface's own format, not
++ * always A8R8G8B8 (xemu's pgraph clear decodes it per format): a 16-bit
++ * surface takes it as a raw R5G6B5 or X1R5G5B5 pixel. Read as ARGB, the
++ * 0xFFFF (white) that Conker clears its 128x128 R5G6B5 blob-shadow map to
++ * became 0x0000FFFF, cyan -- and the ground, multiplied by that map, showed
++ * a green-blue square around every character. */
++static uint16_t clear_color_16(void)
++{
++    switch (s_gpu.format & 0xF) {
++    case 0x1: case 0x2: case 0x3:            /* X1R5G5B5 (Z/O), R5G6B5 */
++        return (uint16_t)(s_gpu.clear_color & 0xFFFF);
++    default:                                 /* a 16-bit guess: from ARGB */
++        return (uint16_t)(((s_gpu.clear_color >> 8) & 0xF800)
++                        | ((s_gpu.clear_color >> 5) & 0x07E0)
++                        | ((s_gpu.clear_color >> 3) & 0x001F));
++    }
++}
++
++/* The clear colour as ARGB, whatever the surface format. */
++static uint32_t clear_color_argb(void)
++{
++    uint32_t v = s_gpu.clear_color & 0xFFFF;
++
++    switch (s_gpu.format & 0xF) {
++    case 0x1: case 0x2:                      /* X1R5G5B5 */
++        return 0xFF000000u | d3d8_expand_channel((v >> 10) & 0x1F, 5) << 16
++             | d3d8_expand_channel((v >> 5) & 0x1F, 5) << 8
++             | d3d8_expand_channel(v & 0x1F, 5);
++    case 0x3:                                /* R5G6B5 */
++        return 0xFF000000u | d3d8_expand_channel((v >> 11) & 0x1F, 5) << 16
++             | d3d8_expand_channel((v >> 5) & 0x3F, 6) << 8
++             | d3d8_expand_channel(v & 0x1F, 5);
++    default:
++        return s_gpu.clear_color;
++    }
++}
++
+ static void clear_surface(uint32_t param)
+ {
+     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+@@ -933,7 +971,7 @@ static void clear_surface(uint32_t param)
+             surf.clip_y = s_gpu.clear_rect_v & 0xFFFF;
+             surf.height = (s_gpu.clear_rect_v >> 16) + 1 - surf.clip_y;
+         }
+-        s_backend->clear(&surf, &rs, param, s_gpu.clear_color,
++        s_backend->clear(&surf, &rs, param, clear_color_argb(),
+                          s_gpu.zstencil_clear);
+         s_gpu.clears++;
+         return;
+@@ -962,9 +1000,7 @@ static void clear_surface(uint32_t param)
+         uint32_t sh = 1u << ((s_gpu.format >> 24) & 0xF);
+         uint32_t x0 = s_gpu.clip_x, x1 = s_gpu.clip_x + s_gpu.clip_w;
+         uint32_t y0 = s_gpu.clip_y, y1 = s_gpu.clip_y + s_gpu.clip_h;
+-        uint16_t v16 = (uint16_t)(((s_gpu.clear_color >> 8) & 0xF800)
+-                                | ((s_gpu.clear_color >> 5) & 0x07E0)
+-                                | ((s_gpu.clear_color >> 3) & 0x001F));
++        uint16_t v16 = clear_color_16();
+         if ((s_gpu.clear_rect_set & 3) == 3) {
+             x0 = s_gpu.clear_rect_h & 0xFFFF; x1 = (s_gpu.clear_rect_h >> 16) + 1;
+             y0 = s_gpu.clear_rect_v & 0xFFFF; y1 = (s_gpu.clear_rect_v >> 16) + 1;
+@@ -988,11 +1024,8 @@ static void clear_surface(uint32_t param)
+             for (x = 0; x < s_gpu.clip_w; x++)
+                 p[x] = s_gpu.clear_color;
+         } else if (bpp == 2) {
+-            /* The clear value is always given as A8R8G8B8; a 16-bit surface
+-             * takes the same colour reduced to 5:6:5. */
+-            uint16_t v = (uint16_t)(((s_gpu.clear_color >> 8) & 0xF800)
+-                                  | ((s_gpu.clear_color >> 5) & 0x07E0)
+-                                  | ((s_gpu.clear_color >> 3) & 0x001F));
++            /* A raw pixel of the surface's format (clear_color_16). */
++            uint16_t v = clear_color_16();
+             uint16_t *p = (uint16_t *)row + s_gpu.clip_x;
+             for (x = 0; x < s_gpu.clip_w; x++)
+                 p[x] = v;
+@@ -1168,6 +1201,13 @@ static uint32_t linear_twin(uint32_t fmt)
+     case 0x06: return 0x12;                /* A8R8G8B8  -> LIN_A8R8G8B8  */
+     case 0x07: return 0x1E;                /* X8R8G8B8  -> LIN_X8R8G8B8  */
+     case 0x19: return 0x1F;                /* A8        -> LIN_A8        */
++    case 0x1A: return 0x20;                /* A8Y8      -> LIN_A8Y8      */
++    case 0x01: return 0x1B;                /* AY8       -> LIN_AY8       */
++    case 0x28: return 0x17;                /* G8B8      -> LIN_G8B8      */
++    case 0x29: return 0x16;                /* R8B8      -> LIN_R8B8      */
++    case 0x3A: return 0x3F;                /* A8B8G8R8  -> LIN_A8B8G8R8  */
++    case 0x3B: return 0x40;                /* B8G8R8A8  -> LIN_B8G8R8A8  */
++    case 0x3C: return 0x41;                /* R8G8B8A8  -> LIN_R8G8B8A8  */
+     default:   return fmt;                 /* already linear, or unhandled */
+     }
+ }
+@@ -1314,7 +1354,32 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+         return 1;
+     }
+ 
++    /* Two 8-bit channels in a word, low byte first (xemu's table: A8Y8 is
++     * luminance then alpha). Conker draws its fur as shells, each an A8Y8
++     * texture of alpha-tested strands; with no case they read as white,
++     * opaque, and Conker's tail came out a smooth pale egg. */
++    case 0x20: {                                    /* LIN_A8Y8 */
++        uint32_t t = ((const uint16_t *)p)[u], l = t & 0xFF;
++        *argb = (t >> 8) << 24 | l << 16 | l << 8 | l;
++        return 1;
++    }
++    case 0x17: {                                    /* LIN_G8B8 */
++        uint32_t t = ((const uint16_t *)p)[u];
++        *argb = 0xFF000000u | (t >> 8) << 8 | (t & 0xFF);
++        return 1;
++    }
++    case 0x16: {                                    /* LIN_R8B8 */
++        uint32_t t = ((const uint16_t *)p)[u];
++        *argb = 0xFF000000u | (t >> 8) << 16 | (t & 0xFF);
++        return 1;
++    }
++
+     /* 8-bit. */
++    case 0x1B: {                                    /* LIN_AY8: both */
++        uint32_t t = p[u];
++        *argb = t << 24 | t << 16 | t << 8 | t;
++        return 1;
++    }
+     case 0x13: {                                    /* LIN_L8 */
+         uint32_t t = p[u];
+         *argb = 0xFF000000u | (t << 16) | (t << 8) | t;
+@@ -2083,15 +2148,23 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
+     o->v = v->tex[0][1] * sv;
+ }
+ 
+-static void stage_from_texture(const Texture *t, Nv2aStage *o)
++static void stage_from_texture(const Texture *t, Nv2aStage *o, int st)
+ {
++    /* The stage's bump-environment registers, 0x1B38 + 0x40 * stage on. */
++    uint32_t r = (0x1B38u + 0x40u * (uint32_t)st - NV_TEX_FIRST) / 4;
++    memcpy(o->bump_mat, &s_tex_reg[r], sizeof o->bump_mat);
++    memcpy(&o->bump_scale, &s_tex_reg[r + 4], 4);
++    memcpy(&o->bump_offset, &s_tex_reg[r + 5], 4);
+     o->valid        = (uint32_t)t->valid;
+     o->offset       = t->offset;
+     o->width        = t->width;
+     o->height       = t->height;
+     o->pitch        = t->pitch;
+     o->color        = t->color;
+-    o->levels       = t->pitch ? 1 : t->levels;
++    /* A linear texture has level 0 only. Not decided by the pitch: the
++     * pitch register keeps whatever the last linear texture set, so every
++     * swizzled texture bound after one lost its mip levels. */
++    o->levels       = tex_size_from_format(t->color) ? (t->levels ? t->levels : 1) : 1;
+     o->filter       = t->filter;
+     o->addr_u       = t->addr_u;
+     o->addr_v       = t->addr_v;
+@@ -2121,7 +2194,8 @@ static void full_batch_state(Nv2aFullBatch *bp, Nv2aRenderState *rs,
+     b.use_rc = (uint32_t)(xf && s_gpu.rc_seen && !no_rc);
+     b.rc = &s_gpu.rc;
+     for (st = 0; st < 4; st++)
+-        stage_from_texture(&s_gpu.texs[st], &b.stage[st]);
++        stage_from_texture(&s_gpu.texs[st], &b.stage[st], st);
++    b.stage_input = s_reg[0x1E78 / 4];          /* SET_SHADER_OTHER_STAGE_INPUT */
+     if (!b.use_rc) {
+         if (!textured)
+             b.stage[0].valid = 0;
+@@ -2180,7 +2254,8 @@ static void backend_flush(int textured, int xf)
+         tex.color  = s_gpu.texs[0].color;
+         tex.addr_u = s_gpu.texs[0].addr_u;
+         tex.addr_v = s_gpu.texs[0].addr_v;
+-        tex.levels = s_gpu.texs[0].pitch ? 1 : s_gpu.texs[0].levels;
++        tex.levels = tex_size_from_format(s_gpu.texs[0].color)
++                   ? (s_gpu.texs[0].levels ? s_gpu.texs[0].levels : 1) : 1;
+         tex.filter = s_gpu.texs[0].filter;
+         batch.texture = &tex;
+     }
+@@ -2360,10 +2435,12 @@ static uint32_t modulate(uint32_t t, const float c[4])
+ static uint32_t tex_texel_bytes(uint32_t fmt)
+ {
+     switch (fmt) {
+-    case 0x00: case 0x01: case 0x0B: case 0x13: case 0x19: case 0x1F:
++    case 0x00: case 0x01: case 0x0B: case 0x13: case 0x14: case 0x15:
++    case 0x19: case 0x1B: case 0x1F:
+         return 1;
+     case 0x02: case 0x03: case 0x04: case 0x05: case 0x10: case 0x11:
+-    case 0x1C: case 0x1D:
++    case 0x16: case 0x17: case 0x18: case 0x1A: case 0x1C: case 0x1D:
++    case 0x20: case 0x27: case 0x28: case 0x29:
+         return 2;
+     default:
+         return 4;
+@@ -2401,6 +2478,44 @@ uint32_t nv2a_backend_stage_bytes(const Nv2aStage *st)
+     return tex_face_stride(&t) * (st->cube ? 6u : 1u);
+ }
+ 
++void nv2a_backend_decode_stage_level(const Nv2aStage *st, uint32_t face,
++                                     uint32_t level, uint32_t *argb_out)
++{
++    Texture t;
++    uint32_t u, v, off, lv, w, h;
++    uint32_t block = d3d8_format_dxt_block_bytes(st->color);
++
++    memset(&t, 0, sizeof t);
++    t.width = st->width;
++    t.height = st->height;
++    t.pitch = st->pitch;
++    t.color = st->color;
++    t.levels = st->levels;
++    t.palette = st->palette;
++    t.cube = (int)st->cube;
++    t.addr_u = t.addr_v = 3;
++    off = st->cube ? face * tex_face_stride(&t) : 0;
++    /* The levels follow each other inside a face (tex_face_stride). */
++    for (lv = 0; lv < level; lv++) {
++        uint32_t lw = (st->width >> lv) ? (st->width >> lv) : 1;
++        uint32_t lh = (st->height >> lv) ? (st->height >> lv) : 1;
++        off += block ? ((lw + 3) / 4) * ((lh + 3) / 4) * block
++                     : lw * lh * tex_texel_bytes(st->color);
++    }
++    w = (st->width >> level) ? (st->width >> level) : 1;
++    h = (st->height >> level) ? (st->height >> level) : 1;
++    t.offset = st->offset + off;
++    t.width = w;
++    t.height = h;
++    tex_update_valid(&t);
++    for (v = 0; v < h; v++)
++        for (u = 0; u < w; u++) {
++            uint32_t *o = &argb_out[(size_t)v * w + u];
++            if (!sample_tex(&t, 0, u, v, o))
++                *o = 0xFFFFFFFFu;
++        }
++}
++
+ void nv2a_backend_decode_stage(const Nv2aStage *st, uint32_t face,
+                                uint32_t *argb_out)
+ {
+diff --git a/src/vulkan/nv2a_vk.c b/src/vulkan/nv2a_vk.c
+index b41873a..0753df2 100644
+--- a/src/vulkan/nv2a_vk.c
++++ b/src/vulkan/nv2a_vk.c
+@@ -105,7 +105,7 @@ typedef struct {
+     VkImage image;
+     VkDeviceMemory mem;
+     VkImageView view;       /* 2D, or cube for a cube texture */
+-    uint32_t w, h, layers;
++    uint32_t w, h, layers, mips;
+     VkFormat fmt;
+ } Img;
+ 
+@@ -193,8 +193,9 @@ static void end_rendering(void)
+     }
+ }
+ 
+-static int img_create(Img *im, uint32_t w, uint32_t h, uint32_t layers,
+-                      VkFormat fmt, VkImageUsageFlags usage, int cube)
++static int img_create_mips(Img *im, uint32_t w, uint32_t h, uint32_t layers,
++                           uint32_t mips, VkFormat fmt, VkImageUsageFlags usage,
++                           int cube)
+ {
+     VkImageCreateInfo ii = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+     VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+@@ -215,7 +216,7 @@ static int img_create(Img *im, uint32_t w, uint32_t h, uint32_t layers,
+     ii.extent.width = w;
+     ii.extent.height = h;
+     ii.extent.depth = 1;
+-    ii.mipLevels = 1;
++    ii.mipLevels = mips ? mips : 1;
+     ii.arrayLayers = layers;
+     ii.samples = VK_SAMPLE_COUNT_1_BIT;
+     ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+@@ -233,12 +234,13 @@ static int img_create(Img *im, uint32_t w, uint32_t h, uint32_t layers,
+     vi.viewType = cube ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D;
+     vi.format = fmt;
+     vi.subresourceRange.aspectMask = aspect;
+-    vi.subresourceRange.levelCount = 1;
++    vi.subresourceRange.levelCount = ii.mipLevels;
+     vi.subresourceRange.layerCount = layers;
+     VK_CHECK(vkCreateImageView(s_dev, &vi, NULL, &im->view));
+     im->w = w;
+     im->h = h;
+     im->layers = layers;
++    im->mips = ii.mipLevels;
+     im->fmt = fmt;
+ 
+     /* Into GENERAL once, where it stays. */
+@@ -256,6 +258,12 @@ static int img_create(Img *im, uint32_t w, uint32_t h, uint32_t layers,
+     return 1;
+ }
+ 
++static int img_create(Img *im, uint32_t w, uint32_t h, uint32_t layers,
++                      VkFormat fmt, VkImageUsageFlags usage, int cube)
++{
++    return img_create_mips(im, w, h, layers, 1, fmt, usage, cube);
++}
++
+ /* Images retired while the command buffer may still use them. */
+ static Img s_dead[256];
+ static int s_ndead;
+@@ -313,7 +321,7 @@ static uint64_t hash_bytes(uint64_t h, const uint8_t *p, size_t n)
+ /* ---- Surfaces ------------------------------------------------------- */
+ 
+ typedef struct {
+-    uint32_t va, pitch, bpp, swz_w, swz_h;   /* key */
++    uint32_t va, pitch, bpp, swz_w, swz_h, cfmt;   /* key */
+     uint32_t w, h;                           /* image size in pixels */
+     Img color;
+     uint64_t guest_hash;     /* guest bytes when they last matched the image */
+@@ -476,11 +484,18 @@ static void surf_resolve(Surf *s)
+     flush();
+ }
+ 
+-static VkFormat surf_format(uint32_t bpp)
++static int s_a1r5g5b5_ok;      /* the device renders A1R5G5B5 */
++
++static VkFormat surf_format(uint32_t bpp, uint32_t cfmt)
+ {
+     /* The NV2A's 32-bit surfaces are ARGB in a dword -- B, G, R, A bytes --
+-     * and the 16-bit one the rasteriser writes is R5G6B5. */
+-    return bpp == 4 ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R5G6B5_UNORM_PACK16;
++     * and its 16-bit ones R5G6B5 (format 3) or X1R5G5B5 (1 and 2), which is
++     * A1R5G5B5's bit layout with the top bit unused. */
++    if (bpp == 4)
++        return VK_FORMAT_B8G8R8A8_UNORM;
++    if ((cfmt == 1 || cfmt == 2) && s_a1r5g5b5_ok)
++        return VK_FORMAT_A1R5G5B5_UNORM_PACK16;
++    return VK_FORMAT_R5G6B5_UNORM_PACK16;
+ }
+ 
+ /* The image for the surface being drawn into, `need_h` rows tall at least,
+@@ -509,7 +524,9 @@ static Surf *surf_get(const Nv2aSurface *ns, uint32_t need_h)
+         Surf *c = &s_surfs[i];
+         if (c->color.image && c->va == ns->color_va && c->pitch == ns->pitch
+             && c->bpp == ns->bytes_per_pixel && c->swz_w == ns->swz_log_w
+-            && c->swz_h == ns->swz_log_h) {
++            && c->swz_h == ns->swz_log_h
++            && surf_format(c->bpp, c->cfmt) == surf_format(ns->bytes_per_pixel,
++                                                           ns->color_format)) {
+             s = c;
+             break;
+         }
+@@ -536,6 +553,7 @@ static Surf *surf_get(const Nv2aSurface *ns, uint32_t need_h)
+         s->bpp = ns->bytes_per_pixel;
+         s->swz_w = ns->swz_log_w;
+         s->swz_h = ns->swz_log_h;
++        s->cfmt = ns->color_format;
+         s->w = w;
+         /* Linear surfaces: room to grow without a rebuild per row. */
+         s->h = ns->swz_log_w ? h : ((h + 31u) & ~31u);
+@@ -546,7 +564,7 @@ static Surf *surf_get(const Nv2aSurface *ns, uint32_t need_h)
+             if (!nv2a_backend_guest_span_ok(s->va, (uint32_t)surf_span(s)))
+                 return NULL;
+         }
+-        if (!img_create(&s->color, s->w, s->h, 1, surf_format(s->bpp),
++        if (!img_create(&s->color, s->w, s->h, 1, surf_format(s->bpp, s->cfmt),
+                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+                         | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                         | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+@@ -803,43 +821,76 @@ static int resolve_overlaps(uint32_t va, uint32_t bytes)
+     return any;
+ }
+ 
++/* How many mip levels of a stage to upload: what FORMAT says it stores,
++ * down to 1x1 at most (a linear texture has only level 0). */
++static uint32_t stage_mips(const Nv2aStage *st)
++{
++    uint32_t n = 1, m = st->width > st->height ? st->width : st->height;
++    if (!st->normalized || st->levels <= 1)
++        return 1;
++    while (m > 1) { m >>= 1; n++; }
++    return st->levels < n ? st->levels : n;
++}
++
+ static int tex_upload(Tex *t, const Nv2aStage *st)
+ {
+-    uint32_t faces = st->cube ? 6u : 1u, f;
+-    size_t px = (size_t)st->width * st->height, bytes = px * 4 * faces;
++    uint32_t faces = st->cube ? 6u : 1u, mips = stage_mips(st), f, lv;
++    size_t total = 0, at;
+     VkDeviceSize off;
+-    VkBufferImageCopy r;
++    VkBufferImageCopy r[16];
+ 
+-    if (bytes > s_rup.size)
++    for (lv = 0; lv < mips; lv++) {
++        size_t lw = (st->width >> lv) ? (st->width >> lv) : 1;
++        size_t lh = (st->height >> lv) ? (st->height >> lv) : 1;
++        total += lw * lh * faces;
++    }
++    if (total * 4 > s_rup.size || mips > 16)
+         return 0;
+-    if (s_decode_cap < px * faces) {
++    if (s_decode_cap < total) {
+         free(s_decode);
+-        s_decode = (uint32_t *)malloc(px * faces * 4);
+-        s_decode_cap = s_decode ? px * faces : 0;
++        s_decode = (uint32_t *)malloc(total * 4);
++        s_decode_cap = s_decode ? total : 0;
+         if (!s_decode)
+             return 0;
+     }
+-    for (f = 0; f < faces; f++)
+-        nv2a_backend_decode_stage(st, f, s_decode + px * f);
+-    off = ring_take(&s_rup, bytes, 16);
++    /* Level by level, each with its faces: one copy region per level. */
++    at = 0;
++    for (lv = 0; lv < mips; lv++) {
++        size_t lw = (st->width >> lv) ? (st->width >> lv) : 1;
++        size_t lh = (st->height >> lv) ? (st->height >> lv) : 1;
++        for (f = 0; f < faces; f++) {
++            nv2a_backend_decode_stage_level(st, f, lv, s_decode + at);
++            at += lw * lh;
++        }
++    }
++    off = ring_take(&s_rup, total * 4, 16);
+     if (off == UINT64_MAX) {
+         flush();
+-        off = ring_take(&s_rup, bytes, 16);
++        off = ring_take(&s_rup, total * 4, 16);
+         if (off == UINT64_MAX)
+             return 0;
+     }
+-    memcpy(s_rup.map + off, s_decode, bytes);
++    memcpy(s_rup.map + off, s_decode, total * 4);
++    if (t->img.image && t->img.mips != mips)
++        img_retire(&t->img);
+     if (!t->img.image
+-        && !img_create(&t->img, st->width, st->height, faces,
+-                       VK_FORMAT_B8G8R8A8_UNORM,
+-                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+-                       (int)st->cube))
++        && !img_create_mips(&t->img, st->width, st->height, faces, mips,
++                            VK_FORMAT_B8G8R8A8_UNORM,
++                            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++                            (int)st->cube))
+         return 0;
++    at = 0;
++    for (lv = 0; lv < mips; lv++) {
++        uint32_t lw = (st->width >> lv) ? (st->width >> lv) : 1;
++        uint32_t lh = (st->height >> lv) ? (st->height >> lv) : 1;
++        r[lv] = copy_region(lw, lh, faces, off + at * 4, VK_IMAGE_ASPECT_COLOR_BIT);
++        r[lv].imageSubresource.mipLevel = lv;
++        at += (size_t)lw * lh * faces;
++    }
+     end_rendering();
+     barrier_all();
+-    r = copy_region(st->width, st->height, faces, off, VK_IMAGE_ASPECT_COLOR_BIT);
+     vkCmdCopyBufferToImage(cmd(), s_rup.buf, t->img.image, VK_IMAGE_LAYOUT_GENERAL,
+-                           1, &r);
++                           mips, r);
+     barrier_all();
+     s_tex_uploads++;
+     return 1;
+@@ -866,6 +917,7 @@ static Surf *drawn_source(const Nv2aStage *st)
+     for (i = 0; i < VK_MAX_SURFACES; i++) {
+         Surf *s = &s_surfs[i];
+         if (!s->color.image || s->va != st->offset || (int)s->bpp != bpp
++            || (bpp == 2 && s->color.fmt != VK_FORMAT_R5G6B5_UNORM_PACK16)
+             || (s->swz_w != 0) != (swz && st->normalized)
+             || s->w != st->width || s->h != st->height)
+             continue;
+@@ -1018,9 +1070,12 @@ static VkSamplerAddressMode addr_mode(uint32_t m)
+     }
+ }
+ 
+-static VkSampler sampler_get(int linear, uint32_t au, uint32_t av)
++/* mag/min: linear filtering; mip: 0 level 0 only, 1 nearest level, 2
++ * blend between levels. */
++static VkSampler sampler_get(int mag, int min, int mip, uint32_t au, uint32_t av)
+ {
+-    uint32_t key = (uint32_t)linear | (au & 0xFF) << 8 | (av & 0xFF) << 16;
++    uint32_t key = (uint32_t)mag | (uint32_t)min << 1 | (uint32_t)mip << 2
++                 | (au & 0xFF) << 8 | (av & 0xFF) << 16;
+     VkSamplerCreateInfo si = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+     VkSampler smp;
+     int i;
+@@ -1028,12 +1083,13 @@ static VkSampler sampler_get(int linear, uint32_t au, uint32_t av)
+     for (i = 0; i < s_nsamplers; i++)
+         if (s_samplers[i].key == key)
+             return s_samplers[i].s;
+-    si.magFilter = si.minFilter = linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+-    si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
++    si.magFilter = mag ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
++    si.minFilter = min ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
++    si.mipmapMode = mip == 2 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+     si.addressModeU = addr_mode(au);
+     si.addressModeV = addr_mode(av);
+     si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+-    si.maxLod = 0.0f;
++    si.maxLod = mip ? VK_LOD_CLAMP_NONE : 0.0f;
+     if (vkCreateSampler(s_dev, &si, NULL, &smp) != VK_SUCCESS)
+         return VK_NULL_HANDLE;
+     if (s_nsamplers < VK_MAX_SAMPLERS) {
+@@ -1271,6 +1327,8 @@ typedef struct {
+     float    fogc[4];
+     float    tscale[4][4];
+     float    border[4][4];
++    float    bump[4][4];
++    float    bumpls[4][4];
+ } VkDraw;
+ 
+ static float zmax_of(uint32_t zeta_format)
+@@ -1446,12 +1504,22 @@ static void stage_descriptors(const Nv2aFullBatch *b, VkDescriptorImageInfo img2
+         const Nv2aStage *sg = &b->stage[st];
+         uint32_t mode = b->use_rc ? (b->rc->stage_program >> (st * 5)) & 0x1F
+                                   : (st == 0 ? 1u : 0u);
+-        Img *im = (mode == 1 || mode == 2 || mode == 3) ? tex_get(sg) : NULL;
+-        int linear, cube = im && sg->cube;
++        Img *im = (mode == 1 || mode == 2 || mode == 3 || mode == 6 || mode == 7)
++                ? tex_get(sg) : NULL;
++        int cube = im && sg->cube, lmag, lmin, mip;
+         uint32_t mag = (sg->filter >> 24) & 0xF, min = (sg->filter >> 16) & 0xFF;
+ 
+-        linear = b->use_rc && (mag == 2 || min == 2 || min == 4 || min == 6);
+-        img2d[st].sampler = imgcube[st].sampler = sampler_get(linear, sg->addr_u, sg->addr_v);
++        /* SET_TEXTURE_FILTER: MAG 1 box, 2 tent (bilinear), 4 convolution;
++         * MIN 1/2 box/tent on level 0, 3/4 box/tent on the nearest level,
++         * 5/6 box/tent blended between levels (6 is trilinear), 7
++         * convolution on level 0. The pre-transformed path samples nearest,
++         * as the executor does. */
++        lmag = b->use_rc && (mag == 2 || mag == 4);
++        lmin = b->use_rc && (min == 2 || min == 4 || min == 6 || min == 7);
++        mip = !b->use_rc || !im || im->mips <= 1 ? 0
++            : (min == 3 || min == 4) ? 1 : (min == 5 || min == 6) ? 2 : 0;
++        img2d[st].sampler = imgcube[st].sampler =
++            sampler_get(lmag, lmin, mip, sg->addr_u, sg->addr_v);
+         img2d[st].imageLayout = imgcube[st].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+         img2d[st].imageView = (im && !cube) ? im->view : s_white2d.view;
+         imgcube[st].imageView = cube ? im->view : s_whitecube.view;
+@@ -1497,7 +1565,11 @@ static void fill_draw_uniforms(VkDraw *u, const Nv2aFullBatch *b,
+         u->tscale[st][0] = (has && !sg->normalized && sg->width) ? 1.0f / (float)sg->width : 1.0f;
+         u->tscale[st][1] = (has && !sg->normalized && sg->height) ? 1.0f / (float)sg->height : 1.0f;
+         nv2a_rc_unpack(sg->border, u->border[st]);
++        memcpy(u->bump[st], sg->bump_mat, 16);
++        u->bumpls[st][0] = sg->bump_scale;
++        u->bumpls[st][1] = sg->bump_offset;
+     }
++    u->misc[3] = b->stage_input;
+     memcpy(u->fogc, b->fog_color, 16);
+ }
+ 
+@@ -2055,6 +2127,13 @@ static int create_device(void)
+     return s_push_desc != NULL;
+ }
+ 
++static void pick_colour_formats(void)
++{
++    VkFormatProperties fp;
++    vkGetPhysicalDeviceFormatProperties(s_phys, VK_FORMAT_A1R5G5B5_UNORM_PACK16, &fp);
++    s_a1r5g5b5_ok = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) != 0;
++}
++
+ static int pick_depth_format(void)
+ {
+     static const VkFormat cands[] = {
+@@ -2180,6 +2259,7 @@ int nv2a_vk_install(void)
+         fprintf(stderr, "[VK] no usable Vulkan device; the CPU rasteriser draws\n");
+         return 0;
+     }
++    pick_colour_formats();
+     /* Program batches need clip distances (the near plane) and the vertex
+      * ring as one storage buffer; RECOMP_VK_CPU_VSH=1 keeps them on the CPU. */
+     {
+diff --git a/src/vulkan/shaders/nv2a.frag b/src/vulkan/shaders/nv2a.frag
+index ea36aa9..4237cf8 100644
+--- a/src/vulkan/shaders/nv2a.frag
++++ b/src/vulkan/shaders/nv2a.frag
+@@ -31,6 +31,8 @@ layout(set = 0, binding = 0, std140) uniform Draw {
+     vec4  fogc;     /* fog colour */
+     vec4  tscale[4];/* coordinate to 0..1 (1 / size for linear textures) */
+     vec4  border[4];
++    vec4  bump[4];  /* BUMP_ENV_MAT 00, 01, 10, 11 */
++    vec4  bumpls[4];/* BUMP_ENV_SCALE, _OFFSET */
+ } u;
+ 
+ layout(set = 0, binding = 1) uniform sampler2D s_2d[4];
+@@ -52,9 +54,26 @@ vec4 texel2d(int st, vec2 c)
+     return texture(s_2d[st], n);
+ }
+ 
+-/* What texture stage st contributes, by its SHADER_STAGE_PROGRAM mode.
+- * False when a clip-plane stage kills the pixel. */
+-bool stage_fetch(int st, vec4 c, out vec4 r)
++/* A signed byte stored as an unsigned channel (xemu psh.c sign3): the du/dv
++ * a bump map holds. */
++float sbyte(float x)
++{
++    x = floor(x * 255.0 + 0.5);
++    return (x >= 128.0 ? x - 256.0 : x) / 127.0;
++}
++
++/* The stage a dependent stage reads (SET_SHADER_OTHER_STAGE_INPUT). */
++int stage_input(int st)
++{
++    if (st == 2) return int((u.misc.w >> 16) & 0xFu);
++    if (st == 3) return int((u.misc.w >> 20) & 0xFu);
++    return 0;
++}
++
++/* What texture stage st contributes, by its SHADER_STAGE_PROGRAM mode, given
++ * what the stages before it produced. False when a clip-plane stage kills
++ * the pixel. */
++bool stage_fetch(int st, vec4 c, vec4 t[4], out vec4 r)
+ {
+     uint mode = (u.fin.w >> (5 * st)) & 0x1Fu;
+     float q = c.w != 0.0 ? c.w : 1.0;
+@@ -77,8 +96,18 @@ bool stage_fetch(int st, vec4 c, out vec4 r)
+             if (ge ? c[j] >= 0.0 : c[j] < 0.0)
+                 return false;
+         }
++    } else if ((mode == 6u || mode == 7u) && st > 0) {  /* BUMPENVMAP (_LUM) */
++        /* The input stage's (b, g) is (du, dv); the stage's matrix makes it
++         * an offset of this stage's coordinates (xemu psh.c). */
++        vec4 tin = t[min(stage_input(st), st - 1)];
++        vec2 d = vec2(sbyte(tin.b), sbyte(tin.g));
++        vec4 m = u.bump[st];
++        vec2 off = vec2(m.x * d.x + m.z * d.y, m.y * d.x + m.w * d.y);
++        r = texel2d(st, c.xy + off * (u.tscale[st].x == 1.0 ? vec2(1.0) : 1.0 / u.tscale[st].xy));
++        if (mode == 7u)                                 /* times scale * L + offset */
++            r.rgb *= clamp(u.bumpls[st].x * tin.r + u.bumpls[st].y, 0.0, 1.0);
+     }
+-    /* ponytail: bump-env and dot-product modes read zero, as on the CPU. */
++    /* ponytail: the dot-product modes read zero, as on the CPU. */
+     return true;
+ }
+ 
+@@ -227,10 +256,14 @@ void main()
+     vec4 col;
+ 
+     if (u.mode.x != 0u) {
+-        vec4 tc[4] = vec4[4](v_t0, v_t1, v_t2, v_t3), t[4];
+-        for (int st = 0; st < 4; st++)
+-            if (!stage_fetch(st, tc[st], t[st]))
++        vec4 tc[4] = vec4[4](v_t0, v_t1, v_t2, v_t3);
++        vec4 t[4] = vec4[4](vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0));
++        for (int st = 0; st < 4; st++) {
++            vec4 r;
++            if (!stage_fetch(st, tc[st], t, r))
+                 discard;
++            t[st] = r;
++        }
+         col = combine(v_d0, v_d1, vec4(u.fogc.rgb, v_fog), t);
+     } else {
+         /* Stage 0 nearest times diffuse (a stage that samples nothing has a

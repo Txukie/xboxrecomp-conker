@@ -25,6 +25,12 @@ void conker_host_print_native_stack(const char *tag, int max_frames);
  * POSIX xbox_path_init() creates whatever save directory it is given. */
 void conker_host_default_save_dir(char *buf, size_t size);
 
+/* Write the path of the settings file (Recomp Options) into buf, creating
+ * its directory: $XDG_CONFIG_HOME/conker-recomp/settings.cfg (or
+ * ~/.config/...), ~/Library/Application Support/ConkerRecomp on macOS,
+ * %LOCALAPPDATA%\ConkerRecomp on Windows. Empty on failure. */
+void conker_host_config_path(char *buf, size_t size);
+
 /* Set an environment variable unless the user already set it. */
 void conker_host_setenv_default(const char *name, const char *value);
 

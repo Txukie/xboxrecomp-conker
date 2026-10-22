@@ -10,14 +10,17 @@
 #define RECOMP_GENERATED_CODE
 #include "recomp_types.h"
 #include "conker_host.h"
+#include "conker_settings.h"
 
 static void conker_sub_0047C29B(void);
+recomp_func_t conker_menu_lookup(uint32_t xbox_va);     /* conker_menu.c */
+void conker_menu_keep_demo_item(void);
 
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
 {
     if (xbox_va == 0x0047C29Bu)
         return conker_sub_0047C29B;
-    return NULL;
+    return conker_menu_lookup(xbox_va);
 }
 
 static void conker_sub_0047C29B(void)
@@ -134,6 +137,7 @@ void sub_0053C190_enter(void)
     const uint32_t device = MEM32(CONKER_D3D_DEVICE_PTR);
     const uint32_t semaphore = device ? MEM32(device + 0x30) : 0;
 
+    conker_menu_keep_demo_item();
     if (semaphore && semaphore != s_semaphore) {
         s_semaphore = semaphore;
         nv2a_pb_set_semaphore_target(semaphore);
@@ -290,34 +294,14 @@ void conker_trace_point(uint32_t xbox_va)
  * sets from CONKER_ASPECT), so the 3D comes out unstretched. 2D overlays
  * drawn in screen space are stretched with it.
  *
- * CONKER_ASPECT: "16:9", "16:10", "21:9", "4:3" or a ratio (1.7778). Unset,
- * the picture is the original 4:3. */
-static float conker_hor_plus(void)
-{
-    static float scale = -1.0f;
-    if (scale < 0.0f) {
-        const char *e = getenv("CONKER_ASPECT");
-        char *end = NULL;
-        double a = 0.0;
-        if (e && *e) {
-            a = strtod(e, &end);
-            if (end && *end == ':') {
-                double b = strtod(end + 1, NULL);
-                a = b > 0.0 ? a / b : 0.0;
-            }
-        }
-        scale = (a > 0.25 && a < 8.0) ? (float)(a / (4.0 / 3.0)) : 0.0f;
-        if (scale > 0.0f)
-            fprintf(stderr, "[CONKER] widescreen: aspect %.4f, horizontal view x%.4f\n",
-                    a, scale);
-    }
-    return scale;
-}
+ * The shape is Recomp Options' Aspect Ratio (conker_settings.c; CONKER_ASPECT
+ * picks one at start), and changes while the game runs: the camera takes the
+ * new angle at its next update. 4:3 is the original picture. */
 
 /* sub_000645C0(player edx, horizontal angle xmm1, vertical angle xmm0). */
 void sub_000645C0_enter(void)
 {
-    float s = conker_hor_plus();
+    float s = conker_settings_hor_plus();
     if (s > 0.0f)
         g_xmm1.f[0] *= s;
 }

@@ -19,8 +19,9 @@
 | Código recompilado | ✅ Regenerado con v0.16.0 (20.029 funciones, 20 sin resolver) |
 | Vídeo de introducción, menús, perfiles | ✅ Se ven y se controlan (teclado o mando) |
 | Partida nueva (Game 1) | ✅ Llega a las escenas iniciales; el juego en sí está poco probado |
-| Renderizado Vulkan | ✅ Píxeles y vertex programs en la GPU; ~30 fps fijos, como en la consola |
-| Pantalla panorámica | ✅ `CONKER_ASPECT=16:9` (Hor+); los vídeos conservan su 4:3 con barras negras; los elementos 2D del menú se estiran |
+| Renderizado Vulkan | ✅ Píxeles y vertex programs en la GPU; 30 fps como en la consola, o hasta 60/90/120; resolución interna de 1X a 10X |
+| Recomp Options | ✅ En Options del menú principal: modo de ventana, proporción, resolución, resolución de render, VSync y límite de fps; se guardan en `settings.cfg` |
+| Pantalla panorámica | ✅ Recomp Options o `CONKER_ASPECT=16:9` (Hor+); los vídeos conservan su 4:3 con barras negras; los elementos 2D del menú se estiran |
 | Vídeos (FMV) | ✅ Decodificación y colores comprobados contra ffmpeg con Vulkan |
 | Backend Metal | 🔴 Todavía no |
 | Problemas conocidos | Con el rasterizador de CPU los vídeos salen lavados; cargas de nivel lentas (~30 s); la emulación USB a veces deja de leer el mando |
@@ -45,7 +46,7 @@ más lento.
 
 ```sh
 cmake --build work/conker/project/build --target appimage
-./appimage/Conker-Recomp-0.1.1-x86_64.AppImage /ruta/a/Conker
+./appimage/Conker-Recomp-0.1.3-x86_64.AppImage /ruta/a/Conker
 ```
 
 El objetivo deja la AppImage en `appimage/`, en la raíz del repositorio
@@ -66,6 +67,17 @@ la versión 1.9.0 y se comprueba su SHA-256.
 
 ### Controles y opciones
 
+- **Recomp Options**: en el menú principal, Options tiene una tercera entrada
+  bajo Vibration e Invert Aim. Con A se abren sus ajustes (arriba/abajo para
+  elegir, izquierda/derecha o A para cambiar el valor, B para volver):
+  Display Mode (Windowed, Fullscreen, Borderless Fullscreen), Aspect Ratio
+  (4:3, 16:9, 16:10, 21:9, 32:9), Resolution (las del monitor), Render
+  Resolution (Original (1X) a 10X, solo con Vulkan), VSync y FPS Limit (30,
+  60, 90, 120). Se aplican al momento y se guardan en
+  `~/.config/conker-recomp/settings.cfg` (`$XDG_CONFIG_HOME` si existe;
+  `%LOCALAPPDATA%\ConkerRecomp` en Windows), que se lee al arrancar. Por
+  encima de 30 fps el juego va a la velocidad correcta (mide su propio
+  tiempo por fotograma); cuántos fps alcanza depende del equipo.
 - Teclado (con la ventana abierta): Intro = START, Z = A; también sirven los
   mandos que reconoce SDL.
 - `RECOMP_RENDERER`: `vulkan` (por defecto) dibuja en la GPU; si no hay un

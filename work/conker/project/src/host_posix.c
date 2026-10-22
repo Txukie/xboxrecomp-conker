@@ -9,6 +9,7 @@
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -92,6 +93,28 @@ void conker_host_default_save_dir(char *buf, size_t size)
         snprintf(buf, size, "%s/.local/share/conker-recomp/saves",
                  home ? home : ".");
 #endif
+}
+
+void conker_host_config_path(char *buf, size_t size)
+{
+    const char *home = getenv("HOME");
+    char dir[1024];
+#if defined(__APPLE__)
+    snprintf(dir, sizeof dir, "%s/Library/Application Support/ConkerRecomp",
+             home ? home : ".");
+#else
+    const char *xdg = getenv("XDG_CONFIG_HOME");
+    char parent[1024];
+    if (xdg && *xdg) {
+        snprintf(dir, sizeof dir, "%s/conker-recomp", xdg);
+    } else {
+        snprintf(parent, sizeof parent, "%s/.config", home ? home : ".");
+        mkdir(parent, 0755);
+        snprintf(dir, sizeof dir, "%s/conker-recomp", parent);
+    }
+#endif
+    mkdir(dir, 0755);
+    snprintf(buf, size, "%s/settings.cfg", dir);
 }
 
 void conker_host_setenv_default(const char *name, const char *value)

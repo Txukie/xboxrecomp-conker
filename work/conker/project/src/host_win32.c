@@ -89,6 +89,18 @@ void conker_host_default_save_dir(char *buf, size_t size)
     SHCreateDirectoryExA(NULL, buf, NULL);
 }
 
+void conker_host_config_path(char *buf, size_t size)
+{
+    char base[MAX_PATH], dir[MAX_PATH];
+    if (!SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, base))) {
+        snprintf(buf, size, "settings.cfg");
+        return;
+    }
+    snprintf(dir, sizeof dir, "%s\\ConkerRecomp", base);
+    SHCreateDirectoryExA(NULL, dir, NULL);
+    snprintf(buf, size, "%s\\settings.cfg", dir);
+}
+
 void conker_host_setenv_default(const char *name, const char *value)
 {
     if (!getenv(name))

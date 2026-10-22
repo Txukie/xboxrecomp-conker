@@ -1,0 +1,1447 @@
+diff --git a/src/input/xinput_device.c b/src/input/xinput_device.c
+index 750186d..a761d79 100644
+--- a/src/input/xinput_device.c
++++ b/src/input/xinput_device.c
+@@ -49,6 +49,10 @@ static void keyboard_merge(XBOX_INPUT_STATE *pState)
+     pState->dwPacketNumber = kb.dwPacketNumber;
+ }
+ 
++/* Each backend builds the state; xbox_InputGetState (at the end) hands it
++ * through the filter. */
++static DWORD input_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState);
++
+ /* ======================================================================== */
+ #if defined(_WIN32)
+ /* ====================  XInput backend  ================================== */
+@@ -72,7 +76,7 @@ void xbox_InputInit(void)
+     }
+ }
+ 
+-DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
++static DWORD input_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState)
+ {
+     XINPUT_STATE xi_state;
+     DWORD result;
+@@ -247,7 +251,7 @@ void xbox_InputInit(void)
+     open_controllers();
+ }
+ 
+-DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
++static DWORD input_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState)
+ {
+     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
+         return ERROR_DEVICE_NOT_CONNECTED;
+@@ -348,3 +352,31 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
+ }
+ 
+ #endif /* _WIN32 */
++
++static xbox_InputFilterFn volatile s_input_filter;
++
++void xbox_InputSetFilter(xbox_InputFilterFn fn)
++{
++    s_input_filter = fn;
++}
++
++void xbox_InputFilterState(DWORD dwPort, XBOX_INPUT_STATE *pState, int connected)
++{
++    xbox_InputFilterFn f = s_input_filter;
++
++    if (f && pState && dwPort < XBOX_MAX_CONTROLLERS)
++        f(dwPort, pState, connected);
++}
++
++DWORD xbox_InputGetStateUnfiltered(DWORD dwPort, XBOX_INPUT_STATE *pState)
++{
++    return input_get_state(dwPort, pState);
++}
++
++DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
++{
++    DWORD rc = input_get_state(dwPort, pState);
++
++    xbox_InputFilterState(dwPort, pState, rc == ERROR_SUCCESS);
++    return rc;
++}
+diff --git a/src/input/xinput_xbox.h b/src/input/xinput_xbox.h
+index 4779275..2be89e4 100644
+--- a/src/input/xinput_xbox.h
++++ b/src/input/xinput_xbox.h
+@@ -94,6 +94,22 @@ void xbox_InputInit(void);
+  */
+ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState);
+ 
++/**
++ * A hook on every state the title reads: called with the state just built
++ * (connected: the call succeeds) and free to change it. A host-side menu
++ * drawn over the title reads the pad here and hands the title a pad at
++ * rest while it has the controller. One filter; NULL removes it. It runs
++ * on whichever thread asks for the state (the USB model's, usually), once
++ * per state the title gets: xbox_InputGetState runs it, and a consumer that
++ * adds to the state first (the USB pad's scripted and synthetic presses)
++ * takes the state unfiltered and runs the filter on the final one.
++ */
++typedef void (*xbox_InputFilterFn)(DWORD dwPort, XBOX_INPUT_STATE *pState,
++                                   int connected);
++void xbox_InputSetFilter(xbox_InputFilterFn fn);
++DWORD xbox_InputGetStateUnfiltered(DWORD dwPort, XBOX_INPUT_STATE *pState);
++void xbox_InputFilterState(DWORD dwPort, XBOX_INPUT_STATE *pState, int connected);
++
+ /**
+  * Set controller vibration.
+  */
+diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
+index 91b908c..702f842 100644
+--- a/src/kernel/nv2a_backend.h
++++ b/src/kernel/nv2a_backend.h
+@@ -275,4 +275,9 @@ void nv2a_pb_set_semaphore_target(uint32_t guest_va);
+  * the walk replays old commands. NULL removes the hook. */
+ void nv2a_pb_set_swmethod_hook(void (*hook)(uint32_t param));
+ 
++/* Cap the flip rate at fps on the host clock instead of the title's
++ * presentation interval (needs RECOMP_FLIP_PACING); 0 restores the title's
++ * interval. For a title that times its frames on a clock. */
++void nv2a_pb_exec_set_frame_limit(unsigned fps);
++
+ #endif /* NV2A_BACKEND_H */
+diff --git a/src/kernel/nv2a_flip_hold.c b/src/kernel/nv2a_flip_hold.c
+index 4d4710f..ae151f0 100644
+--- a/src/kernel/nv2a_flip_hold.c
++++ b/src/kernel/nv2a_flip_hold.c
+@@ -38,8 +38,13 @@ int xbox_FlipHoldStall(XboxFlipHold *h, uint32_t count, uint64_t now_ns,
+     int immediate = 0;
+ 
+     /* A second stall in one walk: the first was never polled, so nothing
+-     * waited on it. Its target still counts as that flip's vblank. */
+-    if (h->held)
++     * waited on it. Its target still counts as that flip's vblank (or its
++     * time, under a cap). */
++    if (h->held && h->timed) {
++        h->held = 0;
++        h->timed = 0;
++        h->last_ns = h->target_ns;
++    } else if (h->held)
+         release(h, now_ns, 0);
+     if (h->have_swap) {
+         interval = h->swap_interval;
+@@ -57,6 +62,28 @@ int xbox_FlipHoldStall(XboxFlipHold *h, uint32_t count, uint64_t now_ns,
+     h->swap_immediate = 0;
+     h->iv[interval < 3 ? interval : 3]++;
+ 
++    if (h->period_ns) {
++        uint64_t t = h->last_ns + h->period_ns;
++        /* The vblank rule starts afresh when the cap goes. */
++        h->have_last = 0;
++        if (!h->have_last_ns || !clock_ok || (int64_t)(now_ns - t) >= 0) {
++            /* On time, or late by less than a period: keep the cadence.
++             * Later than that, start it again from now. */
++            h->last_ns = h->have_last_ns && clock_ok && now_ns - t < h->period_ns
++                         ? t : now_ns;
++            h->have_last_ns = 1;
++            return 0;
++        }
++        h->held = 1;
++        h->timed = 1;
++        h->target_ns = t;
++        h->stall_count = count;
++        h->held_since_ns = now_ns;
++        h->holds++;
++        return 1;
++    }
++    h->have_last_ns = 0;
++
+     if (!interval || !h->have_last || !clock_ok) {
+         h->have_last = 1;
+         h->last_flip = count;
+@@ -83,6 +110,17 @@ int xbox_FlipHoldPoll(XboxFlipHold *h, uint32_t count, uint64_t now_ns,
+ {
+     if (!h->held)
+         return 0;
++    if (h->timed) {
++        if ((int64_t)(now_ns - h->target_ns) < 0
++            && now_ns - h->held_since_ns < XBOX_FLIP_HOLD_MAX_NS)
++            return 1;
++        h->last_ns = h->target_ns;
++        h->held = 0;
++        h->timed = 0;
++        if (now_ns > h->held_since_ns)
++            h->held_ns += now_ns - h->held_since_ns;
++        return 0;
++    }
+     if ((int32_t)(count - h->target) >= 0) {
+         release(h, now_ns, 1);
+         return 0;
+@@ -106,9 +144,18 @@ int xbox_FlipHoldPoll(XboxFlipHold *h, uint32_t count, uint64_t now_ns,
+     return 1;
+ }
+ 
++void xbox_FlipHoldSetRate(XboxFlipHold *h, unsigned fps)
++{
++    h->period_ns = fps ? 1000000000ull / fps : 0;
++}
++
+ void xbox_FlipHoldCancel(XboxFlipHold *h, uint64_t now_ns)
+ {
+-    if (h->held)
++    if (h->held && h->timed) {
++        h->held = 0;
++        h->timed = 0;
++        h->last_ns = now_ns;
++    } else if (h->held)
+         release(h, now_ns, 1);
+     h->have_swap = 0;
+     h->swap_immediate = 0;
+diff --git a/src/kernel/nv2a_flip_hold.h b/src/kernel/nv2a_flip_hold.h
+index eab9165..6f1cf02 100644
+--- a/src/kernel/nv2a_flip_hold.h
++++ b/src/kernel/nv2a_flip_hold.h
+@@ -57,6 +57,12 @@ typedef struct {
+     uint32_t target;
+     uint32_t stall_count;
+     uint64_t held_since_ns;
++    /* A frame-rate cap on the host clock instead of the title's interval
++     * (period_ns != 0, xbox_FlipHoldSetRate): a flip completes once
++     * period_ns has passed since the last one, vblanks or not. */
++    uint64_t period_ns;
++    int      have_last_ns, timed;
++    uint64_t last_ns, target_ns;
+     /* Statistics, for the [GPU] report; the caller resets them. */
+     uint32_t holds, timeouts, clock_stops, nonop, iv[4];
+     uint64_t held_ns;
+@@ -78,6 +84,12 @@ int xbox_FlipHoldStall(XboxFlipHold *h, uint32_t count, uint64_t now_ns,
+ int xbox_FlipHoldPoll(XboxFlipHold *h, uint32_t count, uint64_t now_ns,
+                       int clock_ok);
+ 
++/* Cap the flip rate at fps on the host clock, ignoring the interval the
++ * title asks for (a settings menu's 60/90/120 FPS); 0 goes back to the
++ * title's interval on the vblank count. A title that times its frames on a
++ * clock rather than counting them runs at the new rate unchanged. */
++void xbox_FlipHoldSetRate(XboxFlipHold *h, unsigned fps);
++
+ /* Drop a pending hold without waiting (a walk that lost its place). */
+ void xbox_FlipHoldCancel(XboxFlipHold *h, uint64_t now_ns);
+ 
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index 6a01526..f3d39a1 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -3634,6 +3634,7 @@ static void raster_batch_program(void)
+  * after a second of frames without one, so a fade or a frame the player
+  * skips does not make the picture change shape. */
+ volatile int g_xbox_display_video;
++volatile double g_xbox_display_aspect = -1.0;   /* display_aspect.h */
+ static int s_frame_video, s_video_hold;
+ 
+ static void note_video_batch(void)
+@@ -4296,6 +4297,17 @@ int nv2a_pb_exec_flip_pacing(void)
+     return mode;
+ }
+ 
++/* A frame-rate cap on the host clock (nv2a_flip_hold.h), 0 for the title's
++ * own interval. Takes effect at the next flip. Only under flip pacing. */
++void nv2a_pb_exec_set_frame_limit(unsigned fps)
++{
++    xbox_FlipHoldSetRate(&s_flip_hold, fps);
++    if (fps)
++        fprintf(stderr, "  [GPU] frame limit %u fps\n", fps);
++    else
++        fprintf(stderr, "  [GPU] frame limit: the title's interval\n");
++}
++
+ /* The guest vblank count, and whether it is a running clock: vblanks are on
+  * and the count moved within XBOX_FLIP_CLOCK_STALE_NS. Without it a hold
+  * would only ever end on its timeout. */
+diff --git a/src/usb/usb_gamepad.c b/src/usb/usb_gamepad.c
+index bd00f3f..727be7b 100644
+--- a/src/usb/usb_gamepad.c
++++ b/src/usb/usb_gamepad.c
+@@ -556,6 +556,35 @@ static void pad_script_apply(int pad, uint8_t *out)
+     }
+ }
+ 
++/* The input filter (xbox_InputSetFilter) on the report as the title will get
++ * it, scripted and synthetic presses included: once, here. */
++static void report_filter(int pad, uint8_t *out)
++{
++    XBOX_INPUT_STATE st;
++    int16_t ax[4];
++    int i;
++
++    memset(&st, 0, sizeof st);
++    st.Gamepad.wButtons = (WORD)(out[2] | out[3] << 8);
++    for (i = 0; i < 8; i++)
++        st.Gamepad.bAnalogButtons[i] = out[4 + i];
++    memcpy(ax, &out[12], sizeof ax);
++    st.Gamepad.sThumbLX = ax[0];
++    st.Gamepad.sThumbLY = ax[1];
++    st.Gamepad.sThumbRX = ax[2];
++    st.Gamepad.sThumbRY = ax[3];
++    xbox_InputFilterState((DWORD)pad, &st, 1);
++    out[2] = (uint8_t)(st.Gamepad.wButtons & 0xFF);
++    out[3] = (uint8_t)(st.Gamepad.wButtons >> 8);
++    for (i = 0; i < 8; i++)
++        out[4 + i] = st.Gamepad.bAnalogButtons[i];
++    ax[0] = st.Gamepad.sThumbLX;
++    ax[1] = st.Gamepad.sThumbLY;
++    ax[2] = st.Gamepad.sThumbRX;
++    ax[3] = st.Gamepad.sThumbRY;
++    memcpy(&out[12], ax, sizeof ax);
++}
++
+ int usb_gamepad_report(int pad, uint8_t *out, int max)
+ {
+     XBOX_INPUT_STATE state;
+@@ -592,7 +621,7 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
+             unsigned long now = (unsigned long)GetTickCount();
+             if (now - last > 1000) {
+                 XBOX_INPUT_STATE probe;
+-                DWORD rc = xbox_InputGetState(0, &probe);
++                DWORD rc = xbox_InputGetStateUnfiltered(0, &probe);
+                 last = now;
+                 fprintf(stderr, "  [INPUT] kbd_env=%d window_has_RETURN=%d "
+                         "InputGetState=%lu buttons=0x%04X\n",
+@@ -608,9 +637,10 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
+     /* The synthetic press and the host pad drive pad n from host pad n. */
+     if (pad != 0)
+         synth = 0;
+-    if (xbox_InputGetState((DWORD)pad, &state) != 0) {
++    if (xbox_InputGetStateUnfiltered((DWORD)pad, &state) != 0) {
+         out[2] = synth;
+         pad_script_apply(pad, out);
++        report_filter(pad, out);
+         return 20;
+     }
+ 
+@@ -628,5 +658,6 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
+     out[18] = (uint8_t)(g->sThumbRY & 0xFF);
+     out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
+     pad_script_apply(pad, out);
++    report_filter(pad, out);
+     return 20;
+ }
+diff --git a/src/video/display_aspect.h b/src/video/display_aspect.h
+index 1d4ef4d..70c6a50 100644
+--- a/src/video/display_aspect.h
++++ b/src/video/display_aspect.h
+@@ -12,10 +12,16 @@
+ #include <stdint.h>
+ #include <stdlib.h>
+ 
+-/* Width over height, or 0 for "the frame's own". Read once. */
++/* The shape in force: > 0 a ratio, 0 the frame's own, < 0 not read from
++ * RECOMP_DISPLAY_ASPECT yet. nv2a_pb_exec.c holds it. */
++extern volatile double g_xbox_display_aspect;
++
++/* Width over height, or 0 for "the frame's own". RECOMP_DISPLAY_ASPECT is
++ * read once; xbox_SetDisplayAspect changes it while the title runs (a
++ * settings menu), and every presenter follows at its next frame. */
+ static inline double xbox_DisplayAspect(void)
+ {
+-    static double aspect = -1.0;
++    double aspect = g_xbox_display_aspect;
+     if (aspect < 0.0) {
+         const char *e = getenv("RECOMP_DISPLAY_ASPECT");
+         char *end = NULL;
+@@ -28,10 +34,17 @@ static inline double xbox_DisplayAspect(void)
+             }
+         }
+         aspect = a > 0.25 && a < 8.0 ? a : 0.0;
++        g_xbox_display_aspect = aspect;
+     }
+     return aspect;
+ }
+ 
++/* A ratio (16/9.0), or 0 for the frame's own shape. */
++static inline void xbox_SetDisplayAspect(double a)
++{
++    g_xbox_display_aspect = a > 0.25 && a < 8.0 ? a : 0.0;
++}
++
+ /* The width a frame w x h is shown at for its height (w itself unless a
+  * display aspect is set): the window's shape. */
+ static inline uint32_t xbox_DisplayWidth(uint32_t w, uint32_t h)
+diff --git a/src/video/fb_present.c b/src/video/fb_present.c
+index 1f43af5..5059760 100644
+--- a/src/video/fb_present.c
++++ b/src/video/fb_present.c
+@@ -651,4 +651,33 @@ void xbox_FramebufferWindowStart(void)
+         InterlockedExchange(&s_fb_running, 0);
+ }
+ 
++/* What fb_present_sdl.c does with a title's settings menu and frames above
++ * 640x480 is not done by the GDI window yet: it keeps its own size and
++ * shows each flip's 640x480 copy. */
++void xbox_FramebufferWindowPresentPixels(uint32_t fb_va, const void *px,
++                                         uint32_t w, uint32_t h,
++                                         uint32_t pitch, uint32_t bpp)
++{
++    (void)fb_va; (void)px; (void)w; (void)h; (void)pitch; (void)bpp;
++}
++
++void xbox_WindowSetMode(int mode, int width, int height)
++{
++    (void)mode; (void)width; (void)height;
++}
++
++void xbox_WindowSetVsync(int on) { (void)on; }
++
++int xbox_WindowResolutions(int (*wh)[2], int max)
++{
++    (void)wh; (void)max;
++    return 0;
++}
++
++int xbox_WindowDesktopSize(int *w, int *h)
++{
++    (void)w; (void)h;
++    return 0;
++}
++
+ #endif /* _WIN32: POSIX hosts get the SDL2 window in fb_present_sdl.c */
+diff --git a/src/video/fb_present_sdl.c b/src/video/fb_present_sdl.c
+index 696f9d5..549c35c 100644
+--- a/src/video/fb_present_sdl.c
++++ b/src/video/fb_present_sdl.c
+@@ -30,7 +30,14 @@
+  * lifted code cannot be stopped mid-flight. atexit handlers still run.
+  *
+  * Knobs: RECOMP_PRESENT_VSYNC=0 presents without waiting for the display;
+- * RECOMP_WINDOW_SCALE=<n> sizes the window (default 2).
++ * RECOMP_WINDOW_SCALE=<n> sizes the window (default 2). A title's settings
++ * menu changes the same things while it runs (xbox_WindowSetMode,
++ * xbox_WindowSetVsync); the main loop applies them at its next pass, and
++ * before the window opens they are what it opens with.
++ *
++ * A back end that renders above 640x480 hands the window its frame at that
++ * size (xbox_FramebufferWindowPresentPixels) in place of the 640x480 copy;
++ * the frame is shown at the same shape.
+  */
+ #if !defined(_WIN32)
+ 
+@@ -61,7 +68,7 @@ extern void xbox_InputControllersChanged(void);
+ struct fb_slot {
+     uint8_t *px;
+     size_t   cap;
+-    uint32_t bpp;
++    uint32_t bpp, w, h;
+ };
+ 
+ /* What the window takes from SDL, and gives back on every way out. */
+@@ -105,9 +112,11 @@ void xbox_FramebufferWindowStart(void) {}
+ 
+ /* The back slot is filled: make it the ready one. An unshown ready frame is
+  * overwritten (dropped), never waited for. */
+-static void publish(uint32_t bpp)
++static void publish(uint32_t bpp, uint32_t w, uint32_t h)
+ {
+     s_slot[s_back].bpp = bpp;          /* only this thread touches s_back */
++    s_slot[s_back].w = w;
++    s_slot[s_back].h = h;
+     pthread_mutex_lock(&s_lock);
+     {
+         int t = s_ready;
+@@ -150,7 +159,31 @@ static void present_copy(uint32_t fb_va, uint32_t pitch)
+     for (y = 0; y < FB_H; y++)
+         memcpy(s->px + (size_t)y * FB_W * bpp, src + (size_t)y * pitch,
+                (size_t)FB_W * bpp);
+-    publish(bpp);
++    publish(bpp, FB_W, FB_H);
++}
++
++/* The guest address of a frame handed over at the back end's own size, so
++ * the 640x480 copy of the same flip is not shown over it. Executor thread
++ * only: resolve (which presents the large frame) runs just before. */
++static uint32_t s_hires_va;
++
++static void present_pixels(const uint8_t *src, uint32_t w, uint32_t h,
++                           uint32_t pitch, uint32_t bpp)
++{
++    struct fb_slot *s = &s_slot[s_back];
++    size_t need = (size_t)w * h * bpp;
++    uint32_t y;
++
++    if (s->cap < need) {
++        uint8_t *n = (uint8_t *)realloc(s->px, need);
++        if (!n)
++            return;
++        s->px = n;
++        s->cap = need;
++    }
++    for (y = 0; y < h; y++)
++        memcpy(s->px + (size_t)y * w * bpp, src + (size_t)y * pitch, (size_t)w * bpp);
++    publish(bpp, w, h);
+ }
+ 
+ /* Called by the pushbuffer executor when the title flips. */
+@@ -159,6 +192,11 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
+     /* Dekker-style handshake with the close path: each side stores its own
+      * flag and then loads the other's, all seq_cst, so either the window sees
+      * this present in flight or this present sees the window closing. */
++    if (s_hires_va && s_hires_va == fb_va) {
++        s_hires_va = 0;               /* shown at full size already */
++        return;
++    }
++    s_hires_va = 0;
+     if (!__atomic_load_n(&s_running, __ATOMIC_SEQ_CST) || !fb_va || !pitch)
+         return;
+     __atomic_add_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
+@@ -167,6 +205,158 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
+     __atomic_sub_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
+ }
+ 
++/* A frame the back end rendered above 640x480 (w x h, bpp 2 = R5G6B5 or 4 =
++ * X8R8G8B8), for the flip of the surface at fb_va: shown instead of the
++ * 640x480 copy xbox_FramebufferWindowPresent would make of it. */
++void xbox_FramebufferWindowPresentPixels(uint32_t fb_va, const void *px,
++                                         uint32_t w, uint32_t h,
++                                         uint32_t pitch, uint32_t bpp)
++{
++    if (!__atomic_load_n(&s_running, __ATOMIC_SEQ_CST) || !px || !w || !h
++            || (bpp != 2 && bpp != 4))
++        return;
++    __atomic_add_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
++    if (__atomic_load_n(&s_running, __ATOMIC_SEQ_CST)) {
++        present_pixels((const uint8_t *)px, w, h, pitch, bpp);
++        s_hires_va = fb_va;
++    }
++    __atomic_sub_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
++}
++
++/* ── Window settings a title can change while it runs ─────────────────── */
++
++/* Requested by any thread, applied by the main loop when s_req_gen moves.
++ * Mode < 0 and vsync < 0 mean "as the environment says". */
++static volatile int s_req_mode = -1, s_req_w, s_req_h, s_req_vsync = -1;
++static volatile unsigned s_req_gen;
++static int s_res[64][2];
++static volatile int s_nres;
++static volatile int s_desk_w, s_desk_h;
++
++static void wake_main_loop(void)
++{
++    if (__atomic_load_n(&s_running, __ATOMIC_SEQ_CST)
++            && !__atomic_exchange_n(&s_wake_pending, 1, __ATOMIC_ACQ_REL)) {
++        SDL_Event ev;
++        memset(&ev, 0, sizeof ev);
++        ev.type = s_frame_event;
++        if (SDL_PushEvent(&ev) <= 0)
++            __atomic_store_n(&s_wake_pending, 0, __ATOMIC_RELEASE);
++    }
++}
++
++void xbox_WindowSetMode(int mode, int width, int height)
++{
++    s_req_w = width;
++    s_req_h = height;
++    s_req_mode = mode;
++    __atomic_add_fetch(&s_req_gen, 1, __ATOMIC_SEQ_CST);
++    wake_main_loop();
++}
++
++void xbox_WindowSetVsync(int on)
++{
++    s_req_vsync = on ? 1 : 0;
++    __atomic_add_fetch(&s_req_gen, 1, __ATOMIC_SEQ_CST);
++    wake_main_loop();
++}
++
++int xbox_WindowResolutions(int (*wh)[2], int max)
++{
++    int n = __atomic_load_n(&s_nres, __ATOMIC_ACQUIRE), i;
++    if (n > max)
++        n = max;
++    for (i = 0; i < n; i++) {
++        wh[i][0] = s_res[i][0];
++        wh[i][1] = s_res[i][1];
++    }
++    return n;
++}
++
++int xbox_WindowDesktopSize(int *w, int *h)
++{
++    if (!s_desk_w)
++        return 0;
++    *w = s_desk_w;
++    *h = s_desk_h;
++    return 1;
++}
++
++/* The display's modes as distinct sizes, largest first. */
++static void list_resolutions(SDL_Window *win)
++{
++    int d = SDL_GetWindowDisplayIndex(win), n, i, j, k = 0;
++    SDL_DisplayMode m;
++
++    if (d < 0)
++        d = 0;
++    if (SDL_GetDesktopDisplayMode(d, &m) == 0) {
++        s_desk_w = m.w;
++        s_desk_h = m.h;
++    }
++    n = SDL_GetNumDisplayModes(d);
++    for (i = 0; i < n && k < 64; i++) {
++        if (SDL_GetDisplayMode(d, i, &m) != 0 || m.w < 640 || m.h < 480)
++            continue;
++        for (j = 0; j < k; j++)
++            if (s_res[j][0] == m.w && s_res[j][1] == m.h)
++                break;
++        if (j < k)
++            continue;
++        /* Insertion by area, then width. */
++        for (j = k; j > 0 && ((long)s_res[j - 1][0] * s_res[j - 1][1] < (long)m.w * m.h
++                || ((long)s_res[j - 1][0] * s_res[j - 1][1] == (long)m.w * m.h
++                    && s_res[j - 1][0] < m.w)); j--) {
++            s_res[j][0] = s_res[j - 1][0];
++            s_res[j][1] = s_res[j - 1][1];
++        }
++        s_res[j][0] = m.w;
++        s_res[j][1] = m.h;
++        k++;
++    }
++    if (!k && s_desk_w) {
++        s_res[0][0] = s_desk_w;
++        s_res[0][1] = s_desk_h;
++        k = 1;
++    }
++    __atomic_store_n(&s_nres, k, __ATOMIC_RELEASE);
++}
++
++/* The requested mode, size and vsync, on the main thread. */
++static void apply_window_settings(SDL_Window *win, SDL_Renderer *ren, int *vsync)
++{
++    int mode = s_req_mode, w = s_req_w, h = s_req_h, v = s_req_vsync;
++
++    if (mode == 0) {
++        SDL_SetWindowFullscreen(win, 0);
++        if (w > 0 && h > 0) {
++            SDL_SetWindowSize(win, w, h);
++            SDL_SetWindowPosition(win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
++        }
++    } else if (mode == 1) {
++        SDL_DisplayMode want, got;
++        int d = SDL_GetWindowDisplayIndex(win);
++        memset(&want, 0, sizeof want);
++        want.w = w;
++        want.h = h;
++        if (w > 0 && h > 0 && SDL_GetClosestDisplayMode(d < 0 ? 0 : d, &want, &got))
++            SDL_SetWindowDisplayMode(win, &got);
++        else
++            SDL_SetWindowDisplayMode(win, NULL);
++        SDL_SetWindowFullscreen(win, SDL_WINDOW_FULLSCREEN);
++    } else if (mode == 2) {
++        SDL_SetWindowFullscreen(win, SDL_WINDOW_FULLSCREEN_DESKTOP);
++    }
++#if SDL_VERSION_ATLEAST(2, 0, 18)
++    if (v >= 0 && v != *vsync && SDL_RenderSetVSync(ren, v) == 0) {
++        *vsync = v;
++        fprintf(stderr, "  [FBWIN] vsync %s\n", v ? "on" : "off");
++    }
++#else
++    (void)ren; (void)v; (void)vsync;
++#endif
++}
++
+ /* Title bar: "<XBE title> | FPS: n | draws: n", as the GDI window shows it.
+  * Written by the loader and the flip, read once a second by the main
+  * thread; a torn read shows one stale value for a second. */
+@@ -310,7 +500,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+     SDL_Window *win;
+     SDL_Renderer *ren;
+     SDL_Texture *tex = NULL;
+-    uint32_t tex_bpp = 0;
++    uint32_t tex_bpp = 0, tex_w = 0, tex_h = 0;
++    unsigned applied_gen = 0;
+     uint64_t shown_seq = 0, t_title = 0, flips_title = 0;
+     const char *e;
+     int vsync, scale, quit = 0, guest_done = 0, dirty = 1;
+@@ -324,6 +515,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+ 
+     e = getenv("RECOMP_PRESENT_VSYNC");
+     vsync = !e || env_on("RECOMP_PRESENT_VSYNC");
++    if (s_req_vsync >= 0)
++        vsync = s_req_vsync;
+     e = getenv("RECOMP_WINDOW_SCALE");
+     scale = e ? atoi(e) : 2;
+     if (scale < 1 || scale > 8)
+@@ -335,9 +528,15 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+                 SDL_GetError());
+         return guest_main();
+     }
+-    win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+-                           (int)xbox_DisplayWidth(FB_W, FB_H) * scale, (int)FB_H * scale,
+-                           SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
++    {
++        int w = (int)xbox_DisplayWidth(FB_W, FB_H) * scale, h = (int)FB_H * scale;
++        if (s_req_mode == 0 && s_req_w > 0 && s_req_h > 0) {
++            w = s_req_w;
++            h = s_req_h;
++        }
++        win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
++                               w, h, SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
++    }
+     ren = win ? SDL_CreateRenderer(win, -1,
+                                    vsync ? SDL_RENDERER_PRESENTVSYNC : 0)
+               : NULL;
+@@ -370,6 +569,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+     }
+     s_frame_event = s_guest_done_event + 1;
+     s_guest_main = guest_main;
++    list_resolutions(win);
++    applied_gen = __atomic_load_n(&s_req_gen, __ATOMIC_SEQ_CST);
++    if (s_req_mode > 0)
++        apply_window_settings(win, ren, &vsync);
+     /* This thread pumps SDL events from here on, which also updates the
+      * game controllers; the input layer then only reads them. */
+     xbox_InputSetMainPump(1);
+@@ -389,7 +592,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+         SDL_Event ev;
+         uint64_t seq, now;
+         const uint8_t *px = NULL;
+-        uint32_t bpp = 0, pitch = 0;
++        uint32_t bpp = 0, pitch = 0, fw = FB_W, fh = FB_H;
++        unsigned gen;
+ 
+         /* Before the first flip, poll at the display rate: the window then
+          * reads the display surface itself. After, the flip's event wakes
+@@ -415,6 +619,13 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+             } while (SDL_PollEvent(&ev));
+         }
+ 
++        gen = __atomic_load_n(&s_req_gen, __ATOMIC_SEQ_CST);
++        if (gen != applied_gen) {
++            applied_gen = gen;
++            apply_window_settings(win, ren, &vsync);
++            dirty = 1;
++        }
++
+         pthread_mutex_lock(&s_lock);
+         seq = s_ready_seq;
+         if (seq != shown_seq) {
+@@ -428,7 +639,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+             shown_seq = seq;
+             px = s_slot[s_front].px;
+             bpp = s_slot[s_front].bpp;
+-            pitch = FB_W * bpp;
++            fw = s_slot[s_front].w;
++            fh = s_slot[s_front].h;
++            pitch = fw * bpp;
+         } else if (!shown_seq && s_fb_va && s_fb_pitch) {
+             /* No flip yet: the display surface, as the GDI window reads it. */
+             bpp = s_fb_pitch / FB_W;
+@@ -437,14 +650,16 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+                 px = (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
+         }
+         if (px) {
+-            if (!tex || bpp != tex_bpp) {
++            if (!tex || bpp != tex_bpp || fw != tex_w || fh != tex_h) {
+                 if (tex)
+                     SDL_DestroyTexture(tex);
+                 tex = SDL_CreateTexture(ren, bpp == 4 ? SDL_PIXELFORMAT_RGB888
+                                                       : SDL_PIXELFORMAT_RGB565,
+                                         SDL_TEXTUREACCESS_STREAMING,
+-                                        (int)FB_W, (int)FB_H);
++                                        (int)fw, (int)fh);
+                 tex_bpp = bpp;
++                tex_w = fw;
++                tex_h = fh;
+             }
+             if (tex)
+                 SDL_UpdateTexture(tex, NULL, px, (int)pitch);
+@@ -471,6 +686,13 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+             dst.y = (oh - dst.h) / 2;
+             SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+             SDL_RenderClear(ren);
++#if SDL_VERSION_ATLEAST(2, 0, 12)
++            /* A frame larger than its rectangle (rendered above 640x480) is
++             * filtered down; the 640x480 one keeps its sharp pixels. */
++            if (tex)
++                SDL_SetTextureScaleMode(tex, (int)tex_w > dst.w ? SDL_ScaleModeLinear
++                                                                : SDL_ScaleModeNearest);
++#endif
+             if (tex)
+                 SDL_RenderCopy(ren, tex, NULL, &dst);
+             window_shot(ren);
+diff --git a/src/video/video_player.h b/src/video/video_player.h
+index a5b912c..c3229f6 100644
+--- a/src/video/video_player.h
++++ b/src/video/video_player.h
+@@ -67,6 +67,22 @@ int  xbox_FramebufferDumpBmp(const char *path);
+  * UTF-16 title (40 chars max); the stats come from each flip. */
+ void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars);
+ void xbox_FramebufferWindowFrameStats(uint32_t draws);
++/* A frame rendered above 640x480 by the back end, for the flip of the
++ * surface at fb_va: shown in place of that flip's 640x480 copy. */
++void xbox_FramebufferWindowPresentPixels(uint32_t fb_va, const void *px,
++                                         uint32_t w, uint32_t h,
++                                         uint32_t pitch, uint32_t bpp);
++
++/* Window settings a title's menu can change while it runs; the window
++ * applies them at its next pass (or opens with them). Mode: 0 windowed at
++ * width x height (0 keeps the size), 1 fullscreen in the display mode
++ * nearest width x height, 2 borderless fullscreen at the desktop's size. */
++void xbox_WindowSetMode(int mode, int width, int height);
++void xbox_WindowSetVsync(int on);
++/* The display's resolutions, largest first, once the window is open (0
++ * before); and the desktop's own size. */
++int  xbox_WindowResolutions(int (*wh)[2], int max);
++int  xbox_WindowDesktopSize(int *w, int *h);
+ 
+ #if !defined(_WIN32)
+ /* POSIX hosts: the framebuffer window needs the process main thread (AppKit
+diff --git a/src/vulkan/nv2a_vk.c b/src/vulkan/nv2a_vk.c
+index 0753df2..36ffa19 100644
+--- a/src/vulkan/nv2a_vk.c
++++ b/src/vulkan/nv2a_vk.c
+@@ -15,8 +15,18 @@
+  * (frames in flight, per-image barriers, optimal layouts, a memory
+  * allocator instead of one allocation per image) once the picture matches.
+  *
++ * Render scale (nv2a_vk_set_render_scale): every surface's image, and the
++ * depth buffer drawn with it, is scale times the surface's guest size.
++ * Viewport and scissor follow; vertices are placed in the surface's own
++ * pixels as before, so nothing upstream knows. Guest memory still holds the
++ * surface at its own size: uploads and readbacks go through a companion
++ * image at that size and a blit (up, nearest; down, linear). Visibility
++ * counts are divided back down. The surface a flip shows is also read back
++ * whole and handed to the framebuffer window at the larger size.
++ *
+  * Everything here runs on the NV2A poll thread (or before it starts), one
+- * call at a time, so nothing is locked.
++ * call at a time, so nothing is locked (but nv2a_vk_set_render_scale, which
++ * only asks).
+  */
+ #include "nv2a_vk.h"
+ 
+@@ -59,6 +69,14 @@ static const uint32_t k_vsh_spv[] =
+ 
+ static int s_verbose, s_stencil = 1;
+ 
++/* The render scale surfaces and zetas are built at, and one asked for since
++ * (taken at the next flip). A format the device cannot blit stays at 1, as
++ * does a surface that would pass s_max_dim. */
++static unsigned s_scale = 1;
++static volatile unsigned s_scale_req;
++static uint32_t s_max_dim = VK_MAX_TEX_DIM;
++static int s_blit_bgra, s_blit_565, s_blit_1555, s_zblit;
++
+ #define VK_CHECK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { \
+     fprintf(stderr, "[VK] %s failed: %d (%s:%d)\n", #x, (int)r_, __FILE__, __LINE__); \
+     return 0; } } while (0)
+@@ -322,8 +340,11 @@ static uint64_t hash_bytes(uint64_t h, const uint8_t *p, size_t n)
+ 
+ typedef struct {
+     uint32_t va, pitch, bpp, swz_w, swz_h, cfmt;   /* key */
+-    uint32_t w, h;                           /* image size in pixels */
++    uint32_t w, h;                           /* guest size in pixels */
++    uint32_t sc;                             /* image = sc * (w, h) */
+     Img color;
++    Img lo;                  /* sc > 1: the guest-sized image uploads and
++                              * readbacks go through */
+     uint64_t guest_hash;     /* guest bytes when they last matched the image */
+     uint32_t checked_frame;
+     int gpu_dirty;           /* drawn since guest memory last matched */
+@@ -334,7 +355,9 @@ typedef struct {
+ 
+ typedef struct {
+     uint32_t va;
+-    Img depth;
++    Img depth;               /* sc * its guest size */
++    Img lo;                  /* sc > 1: guest-sized, for readbacks */
++    uint32_t sc;
+     uint32_t last_use;
+     /* How the zeta surface lies in guest memory (Z24S8: depth << 8 |
+      * stencil, a dword per pixel; Z16: a word), how many rows of it the
+@@ -357,7 +380,9 @@ typedef struct { Surf *s; VkDeviceSize off; } Readback;
+ static Readback s_reads[VK_MAX_SURFACES];
+ static int s_nreads;
+ 
+-typedef struct { Zeta *z; VkDeviceSize depth_off, stencil_off; uint32_t w, h; } ZetaReadback;
++/* step > 1: the full-size depth read back, every step-th texel taken (a
++ * device that cannot blit depth); stride is its row length. */
++typedef struct { Zeta *z; VkDeviceSize depth_off, stencil_off; uint32_t w, h, step, stride; } ZetaReadback;
+ static ZetaReadback s_zreads[VK_MAX_ZETAS];
+ static int s_nzreads;
+ 
+@@ -395,6 +420,59 @@ static VkBufferImageCopy copy_region(uint32_t w, uint32_t h, uint32_t layers,
+     return r;
+ }
+ 
++/* ---- Render scale --------------------------------------------------- */
++
++static int fmt_scales(VkFormat f)
++{
++    return f == VK_FORMAT_B8G8R8A8_UNORM ? s_blit_bgra
++         : f == VK_FORMAT_R5G6B5_UNORM_PACK16 ? s_blit_565
++         : f == VK_FORMAT_A1R5G5B5_UNORM_PACK16 ? s_blit_1555 : 0;
++}
++
++/* The scale a w x h image of format f is built at. */
++static uint32_t pick_scale(uint32_t w, uint32_t h, VkFormat f)
++{
++    uint32_t sc = s_scale;
++    if (sc <= 1 || !fmt_scales(f))
++        return 1;
++    while (sc > 1 && (w * sc > s_max_dim || h * sc > s_max_dim))
++        sc--;
++    return sc;
++}
++
++/* All of src (sw x sh) onto all of dst (dw x dh). */
++static void blit(VkImage src, VkImage dst, uint32_t sw, uint32_t sh,
++                 uint32_t dw, uint32_t dh, VkImageAspectFlags aspect, VkFilter filter)
++{
++    VkImageBlit r;
++    memset(&r, 0, sizeof r);
++    r.srcSubresource.aspectMask = r.dstSubresource.aspectMask = aspect;
++    r.srcSubresource.layerCount = r.dstSubresource.layerCount = 1;
++    r.srcOffsets[1].x = (int32_t)sw;
++    r.srcOffsets[1].y = (int32_t)sh;
++    r.srcOffsets[1].z = 1;
++    r.dstOffsets[1].x = (int32_t)dw;
++    r.dstOffsets[1].y = (int32_t)dh;
++    r.dstOffsets[1].z = 1;
++    end_rendering();
++    barrier_all();
++    vkCmdBlitImage(cmd(), src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL,
++                   1, &r, filter);
++    barrier_all();
++}
++
++/* A guest-sized companion image, made (or remade) to w x h of fmt. */
++static int lo_get(Img *lo, uint32_t w, uint32_t h, VkFormat fmt)
++{
++    if (lo->image && (lo->w != w || lo->h != h || lo->fmt != fmt))
++        img_retire(lo);
++    if (!lo->image
++        && !img_create(lo, w, h, 1, fmt,
++                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, 0))
++        return 0;
++    return 1;
++}
++
+ /* Guest memory into the image. */
+ static void surf_upload(Surf *s)
+ {
+@@ -418,9 +496,18 @@ static void surf_upload(Surf *s)
+     end_rendering();
+     barrier_all();
+     r = copy_region(s->w, s->h, 1, off, VK_IMAGE_ASPECT_COLOR_BIT);
+-    vkCmdCopyBufferToImage(cmd(), s_rup.buf, s->color.image,
+-                           VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+-    barrier_all();
++    if (s->sc > 1) {
++        if (!lo_get(&s->lo, s->w, s->h, s->color.fmt))
++            return;
++        vkCmdCopyBufferToImage(cmd(), s_rup.buf, s->lo.image,
++                               VK_IMAGE_LAYOUT_GENERAL, 1, &r);
++        blit(s->lo.image, s->color.image, s->w, s->h, s->color.w, s->color.h,
++             VK_IMAGE_ASPECT_COLOR_BIT, VK_FILTER_NEAREST);
++    } else {
++        vkCmdCopyBufferToImage(cmd(), s_rup.buf, s->color.image,
++                               VK_IMAGE_LAYOUT_GENERAL, 1, &r);
++        barrier_all();
++    }
+     s->version = ++s_writes;
+ }
+ 
+@@ -445,8 +532,17 @@ static void surf_queue_readback(Surf *s)
+     end_rendering();
+     barrier_all();
+     r = copy_region(s->w, s->h, 1, off, VK_IMAGE_ASPECT_COLOR_BIT);
+-    vkCmdCopyImageToBuffer(cmd(), s->color.image, VK_IMAGE_LAYOUT_GENERAL,
+-                           s_rrd.buf, 1, &r);
++    if (s->sc > 1) {
++        if (!lo_get(&s->lo, s->w, s->h, s->color.fmt))
++            return;
++        blit(s->color.image, s->lo.image, s->color.w, s->color.h, s->w, s->h,
++             VK_IMAGE_ASPECT_COLOR_BIT, VK_FILTER_LINEAR);
++        vkCmdCopyImageToBuffer(cmd(), s->lo.image, VK_IMAGE_LAYOUT_GENERAL,
++                               s_rrd.buf, 1, &r);
++    } else {
++        vkCmdCopyImageToBuffer(cmd(), s->color.image, VK_IMAGE_LAYOUT_GENERAL,
++                               s_rrd.buf, 1, &r);
++    }
+     barrier_all();
+     s_reads[s_nreads].s = s;
+     s_reads[s_nreads].off = off;
+@@ -537,6 +633,7 @@ static Surf *surf_get(const Nv2aSurface *ns, uint32_t need_h)
+         surf_resolve(s);
+         if (s_rt == s) { end_rendering(); s_rt = NULL; }
+         img_retire(&s->color);
++        img_retire(&s->lo);
+         lru = s;
+         s = NULL;
+     }
+@@ -546,6 +643,7 @@ static Surf *surf_get(const Nv2aSurface *ns, uint32_t need_h)
+             surf_resolve(s);
+             if (s_rt == s) { end_rendering(); s_rt = NULL; }
+             img_retire(&s->color);
++            img_retire(&s->lo);
+         }
+         memset(s, 0, sizeof *s);
+         s->va = ns->color_va;
+@@ -564,7 +662,9 @@ static Surf *surf_get(const Nv2aSurface *ns, uint32_t need_h)
+             if (!nv2a_backend_guest_span_ok(s->va, (uint32_t)surf_span(s)))
+                 return NULL;
+         }
+-        if (!img_create(&s->color, s->w, s->h, 1, surf_format(s->bpp, s->cfmt),
++        s->sc = pick_scale(s->w, s->h, surf_format(s->bpp, s->cfmt));
++        if (!img_create(&s->color, s->w * s->sc, s->h * s->sc, 1,
++                        surf_format(s->bpp, s->cfmt),
+                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+                         | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                         | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+@@ -615,7 +715,9 @@ static Surf *surf_get(const Nv2aSurface *ns, uint32_t need_h)
+     return s;
+ }
+ 
+-static Zeta *zeta_get(uint32_t va, uint32_t w, uint32_t h)
++/* The depth buffer at va, for a colour image at scale sc: w x h guest pixels
++ * at least (640x480 at least), sc times that in the image. */
++static Zeta *zeta_get(uint32_t va, uint32_t w, uint32_t h, uint32_t sc)
+ {
+     Zeta *z = NULL, *lru = NULL;
+     int i;
+@@ -629,11 +731,14 @@ static Zeta *zeta_get(uint32_t va, uint32_t w, uint32_t h)
+         if (!lru || !c->depth.image || (lru->depth.image && c->last_use < lru->last_use))
+             lru = c;
+     }
+-    if (z && (z->depth.w < w || z->depth.h < h)) {
++    if (z && (z->sc != sc || z->depth.w < w * sc || z->depth.h < h * sc)) {
+         if (s_rt_z == z) { end_rendering(); s_rt_z = NULL; }
+-        w = w > z->depth.w ? w : z->depth.w;
+-        h = h > z->depth.h ? h : z->depth.h;
++        if (z->sc == sc) {
++            w = w > z->depth.w / sc ? w : z->depth.w / sc;
++            h = h > z->depth.h / sc ? h : z->depth.h / sc;
++        }
+         img_retire(&z->depth);
++        img_retire(&z->lo);
+         lru = z;
+         z = NULL;
+     }
+@@ -644,13 +749,16 @@ static Zeta *zeta_get(uint32_t va, uint32_t w, uint32_t h)
+         if (z->depth.image) {
+             if (s_rt_z == z) { end_rendering(); s_rt_z = NULL; }
+             img_retire(&z->depth);
++            img_retire(&z->lo);
+         }
+         memset(z, 0, sizeof *z);
+         z->va = va;
++        z->sc = sc;
+         if (w < 640) w = 640;
+         if (h < 480) h = 480;
+-        if (!img_create(&z->depth, w, h, 1, s_depth_fmt,
++        if (!img_create(&z->depth, w * sc, h * sc, 1, s_depth_fmt,
+                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
++                        | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                         | VK_IMAGE_USAGE_TRANSFER_DST_BIT, 0)) {
+             memset(z, 0, sizeof *z);
+             return NULL;
+@@ -683,8 +791,8 @@ static void begin_rendering(Surf *s, Zeta *z)
+     ca.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+     ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+     ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+-    ri.renderArea.extent.width = s->w;
+-    ri.renderArea.extent.height = s->h;
++    ri.renderArea.extent.width = s->color.w;
++    ri.renderArea.extent.height = s->color.h;
+     ri.layerCount = 1;
+     ri.colorAttachmentCount = 1;
+     ri.pColorAttachments = &ca;
+@@ -736,10 +844,13 @@ static uint32_t zeta_span(const Zeta *z)
+  * and with nothing written there it read whatever the memory held. */
+ static void zeta_queue_readback(Zeta *z)
+ {
+-    uint32_t bpp = z->zfmt == 1 ? 2u : 4u, w, h, i;
++    uint32_t bpp = z->zfmt == 1 ? 2u : 4u, w, h, i, step = 1, cw, ch;
+     VkDeviceSize doff, soff = 0;
+     VkBufferImageCopy r[2];
++    VkImage src = z->depth.image;
+     int with_stencil = s_depth_fmt != VK_FORMAT_D32_SFLOAT;
++    const VkImageAspectFlags ds = VK_IMAGE_ASPECT_DEPTH_BIT
++                                | (with_stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+ 
+     for (i = 0; i < (uint32_t)s_nzreads; i++)
+         if (s_zreads[i].z == z)
+@@ -747,23 +858,52 @@ static void zeta_queue_readback(Zeta *z)
+     if (!zeta_span(z) || !nv2a_backend_guest_span_ok(z->va, zeta_span(z)))
+         return;
+     w = z->pitch / bpp;
+-    if (w > z->depth.w) w = z->depth.w;
+-    h = z->rows < z->depth.h ? z->rows : z->depth.h;
+-    doff = ring_take(&s_rrd, (VkDeviceSize)w * h * 4, 16);
++    if (w > z->depth.w / z->sc) w = z->depth.w / z->sc;
++    h = z->rows < z->depth.h / z->sc ? z->rows : z->depth.h / z->sc;
++    end_rendering();
++    if (z->sc > 1) {
++        /* To guest size on the GPU (nearest: depth is not filtered), or,
++         * where depth cannot be blitted, every sc-th texel on the CPU. */
++        if (s_zblit && lo_get(&z->lo, z->depth.w / z->sc, z->depth.h / z->sc, s_depth_fmt)) {
++            VkImageBlit b;
++            memset(&b, 0, sizeof b);
++            b.srcSubresource.aspectMask = b.dstSubresource.aspectMask = ds;
++            b.srcSubresource.layerCount = b.dstSubresource.layerCount = 1;
++            b.srcOffsets[1].x = (int32_t)(w * z->sc);
++            b.srcOffsets[1].y = (int32_t)(h * z->sc);
++            b.srcOffsets[1].z = 1;
++            b.dstOffsets[1].x = (int32_t)w;
++            b.dstOffsets[1].y = (int32_t)h;
++            b.dstOffsets[1].z = 1;
++            barrier_all();
++            vkCmdBlitImage(cmd(), z->depth.image, VK_IMAGE_LAYOUT_GENERAL, z->lo.image,
++                           VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
++            src = z->lo.image;
++        } else {
++            step = z->sc;
++        }
++    }
++    cw = w * step;
++    ch = h * step;
++    doff = ring_take(&s_rrd, (VkDeviceSize)cw * ch * 4, 16);
+     if (with_stencil && doff != UINT64_MAX)
+-        soff = ring_take(&s_rrd, (VkDeviceSize)w * h, 16);
++        soff = ring_take(&s_rrd, (VkDeviceSize)cw * ch, 16);
+     if (doff == UINT64_MAX || soff == UINT64_MAX || s_nzreads == VK_MAX_ZETAS) {
+-        flush();
+-        doff = ring_take(&s_rrd, (VkDeviceSize)w * h * 4, 16);
+-        soff = with_stencil ? ring_take(&s_rrd, (VkDeviceSize)w * h, 16) : 0;
+-        if (doff == UINT64_MAX || soff == UINT64_MAX)
++        flush();             /* a blit into lo went with it, and stays there */
++        doff = ring_take(&s_rrd, (VkDeviceSize)cw * ch * 4, 16);
++        soff = with_stencil ? ring_take(&s_rrd, (VkDeviceSize)cw * ch, 16) : 0;
++        if (doff == UINT64_MAX || soff == UINT64_MAX) {
++            static int warned;
++            if (!warned++)
++                fprintf(stderr, "[VK] depth at %ux%u does not fit the readback ring;"
++                                " guest memory keeps the old depth\n", cw, ch);
+             return;
++        }
+     }
+-    end_rendering();
+     barrier_all();
+-    r[0] = copy_region(w, h, 1, doff, VK_IMAGE_ASPECT_DEPTH_BIT);
+-    r[1] = copy_region(w, h, 1, soff, VK_IMAGE_ASPECT_STENCIL_BIT);
+-    vkCmdCopyImageToBuffer(cmd(), z->depth.image, VK_IMAGE_LAYOUT_GENERAL, s_rrd.buf,
++    r[0] = copy_region(cw, ch, 1, doff, VK_IMAGE_ASPECT_DEPTH_BIT);
++    r[1] = copy_region(cw, ch, 1, soff, VK_IMAGE_ASPECT_STENCIL_BIT);
++    vkCmdCopyImageToBuffer(cmd(), src, VK_IMAGE_LAYOUT_GENERAL, s_rrd.buf,
+                            with_stencil ? 2 : 1, r);
+     barrier_all();
+     s_zreads[s_nzreads].z = z;
+@@ -771,6 +911,8 @@ static void zeta_queue_readback(Zeta *z)
+     s_zreads[s_nzreads].stencil_off = with_stencil ? soff : UINT64_MAX;
+     s_zreads[s_nzreads].w = w;
+     s_zreads[s_nzreads].h = h;
++    s_zreads[s_nzreads].step = step;
++    s_zreads[s_nzreads].stride = cw;
+     s_nzreads++;
+ }
+ 
+@@ -783,14 +925,15 @@ static void zeta_write_guest(const ZetaReadback *zr)
+ 
+     for (y = 0; y < zr->h; y++) {
+         uint8_t *row = guest(z->va + y * z->pitch);
+-        for (x = 0; x < zr->w; x++) {
+-            float f = d[(size_t)y * zr->w + x];
++        size_t src = (size_t)y * zr->step * zr->stride;
++        for (x = 0; x < zr->w; x++, src += zr->step) {
++            float f = d[src];
+             f = f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
+             if (z->zfmt == 1) {
+                 ((uint16_t *)row)[x] = (uint16_t)(f * 65535.0f + 0.5f);
+             } else {
+                 uint32_t d24 = (uint32_t)(f * 16777215.0f + 0.5f);
+-                ((uint32_t *)row)[x] = d24 << 8 | (st ? st[(size_t)y * zr->w + x] : 0u);
++                ((uint32_t *)row)[x] = d24 << 8 | (st ? st[src] : 0u);
+             }
+         }
+     }
+@@ -935,11 +1078,13 @@ static Img *tex_from_surface(Tex *t, const Nv2aStage *st, Surf *s)
+ {
+     VkImageCopy r;
+ 
+-    if (t->img.image && (t->img.w != s->w || t->img.h != s->h || t->img.fmt != s->color.fmt))
++    /* At the surface's image size: a scaled surface samples scaled. */
++    if (t->img.image && (t->img.w != s->color.w || t->img.h != s->color.h
++                         || t->img.fmt != s->color.fmt))
+         img_retire(&t->img);
+     if (!t->img.image) {
+         VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+-        if (!img_create(&t->img, s->w, s->h, 1, s->color.fmt,
++        if (!img_create(&t->img, s->color.w, s->color.h, 1, s->color.fmt,
+                         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, 0))
+             return NULL;
+         /* X8R8G8B8 reads alpha 1, whatever the surface's alpha byte holds. */
+@@ -964,8 +1109,8 @@ static Img *tex_from_surface(Tex *t, const Nv2aStage *st, Surf *s)
+         memset(&r, 0, sizeof r);
+         r.srcSubresource.aspectMask = r.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+         r.srcSubresource.layerCount = r.dstSubresource.layerCount = 1;
+-        r.extent.width = s->w;
+-        r.extent.height = s->h;
++        r.extent.width = s->color.w;
++        r.extent.height = s->color.h;
+         r.extent.depth = 1;
+         end_rendering();
+         barrier_all();
+@@ -1291,8 +1436,12 @@ static void flush(void)
+         if (vkGetQueryPoolResults(s_dev, s_qpool, s_q_discard, n, sizeof res, res,
+                                   sizeof res[0], VK_QUERY_RESULT_64_BIT
+                                   | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS)
+-            for (k = 0; k < n; k++)
+-                s_report_acc += res[k];
++            for (k = 0; k < n; k++) {
++                /* Pixels at the scale drawn, back to the title's pixels;
++                 * a few still count as one. */
++                uint64_t v = res[k] / ((uint64_t)s_scale * s_scale);
++                s_report_acc += (res[k] && !v) ? 1 : v;
++            }
+     }
+     if (s_q_used)
+         vkResetQueryPool(s_dev, s_qpool, 0, s_q_used);
+@@ -1343,20 +1492,21 @@ static void set_dynamic_state(VkCommandBuffer c, const Surf *s,
+     VkViewport vp;
+     VkRect2D sc;
+     float bc[4];
+-    int32_t x0 = (int32_t)ns->clip_x, y0 = (int32_t)ns->clip_y;
+-    int32_t x1 = x0 + (int32_t)ns->width, y1 = y0 + (int32_t)ns->height;
++    const int32_t k = (int32_t)s->sc, iw = (int32_t)s->color.w, ih = (int32_t)s->color.h;
++    int32_t x0 = (int32_t)ns->clip_x * k, y0 = (int32_t)ns->clip_y * k;
++    int32_t x1 = x0 + (int32_t)ns->width * k, y1 = y0 + (int32_t)ns->height * k;
+     int stencil = has_z && s_stencil && rs->stencil_enable
+                && s_depth_fmt != VK_FORMAT_D32_SFLOAT;
+ 
+     vp.x = 0.0f;
+     vp.y = 0.0f;
+-    vp.width = (float)s->w;
+-    vp.height = (float)s->h;
++    vp.width = (float)iw;
++    vp.height = (float)ih;
+     vp.minDepth = 0.0f;
+     vp.maxDepth = 1.0f;
+     vkCmdSetViewport(c, 0, 1, &vp);
+-    if (x1 > (int32_t)s->w) x1 = (int32_t)s->w;
+-    if (y1 > (int32_t)s->h) y1 = (int32_t)s->h;
++    if (x1 > iw) x1 = iw;
++    if (y1 > ih) y1 = ih;
+     if (x1 < x0) x1 = x0;
+     if (y1 < y0) y1 = y0;
+     sc.offset.x = x0;
+@@ -1413,7 +1563,7 @@ static Zeta *zeta_for(const Nv2aRenderState *rs, const Surf *s, int need)
+ 
+     if (!rs->zeta_va && !need)
+         return NULL;
+-    z = zeta_get(rs->zeta_va, s->w, s->h);
++    z = zeta_get(rs->zeta_va, s->w, s->h, s->sc);
+     if (z) {
+         z->pitch = rs->zeta_pitch;
+         z->zfmt = rs->zeta_format;
+@@ -1471,16 +1621,16 @@ static void vk_clear(const Nv2aSurface *ns, const Nv2aRenderState *rs,
+     }
+     if (!n)
+         return;
+-    x1 = ns->clip_x + ns->width;
+-    y1 = ns->clip_y + ns->height;
+-    if (x1 > s->w) x1 = s->w;
+-    if (y1 > s->h) y1 = s->h;
+-    if (x1 <= ns->clip_x || y1 <= ns->clip_y)
++    x1 = (ns->clip_x + ns->width) * s->sc;
++    y1 = (ns->clip_y + ns->height) * s->sc;
++    if (x1 > s->color.w) x1 = s->color.w;
++    if (y1 > s->color.h) y1 = s->color.h;
++    if (x1 <= ns->clip_x * s->sc || y1 <= ns->clip_y * s->sc)
+         return;
+-    rect.rect.offset.x = (int32_t)ns->clip_x;
+-    rect.rect.offset.y = (int32_t)ns->clip_y;
+-    rect.rect.extent.width = x1 - ns->clip_x;
+-    rect.rect.extent.height = y1 - ns->clip_y;
++    rect.rect.offset.x = (int32_t)(ns->clip_x * s->sc);
++    rect.rect.offset.y = (int32_t)(ns->clip_y * s->sc);
++    rect.rect.extent.width = x1 - ns->clip_x * s->sc;
++    rect.rect.extent.height = y1 - ns->clip_y * s->sc;
+     rect.baseArrayLayer = 0;
+     rect.layerCount = 1;
+     vkCmdClearAttachments(cmd(), n, at, 1, &rect);
+@@ -1927,9 +2077,32 @@ static uint32_t vk_report_read(void)
+  * Nothing says when the CPU will look, so every drawn surface goes back by
+  * the flip, as it would have been in guest memory all along on the console.
+  * RECOMP_VK_RESOLVE=shown writes back only the surface being shown. */
++/* The frame a flip shows, at its scaled size, for the framebuffer window
++ * (fb_present_sdl.c): read back whole into its own buffer, which grows to
++ * the largest frame asked for. */
++static Ring s_pres;
++
++static int pres_reserve(VkDeviceSize bytes)
++{
++    if (s_pres.buf && s_pres.size >= bytes)
++        return 1;
++    if (s_pres.buf) {
++        flush();
++        vkUnmapMemory(s_dev, s_pres.mem);
++        vkDestroyBuffer(s_dev, s_pres.buf, NULL);
++        vkFreeMemory(s_dev, s_pres.mem, NULL);
++        memset(&s_pres, 0, sizeof s_pres);
++    }
++    return ring_create(&s_pres, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++}
++
+ static void vk_resolve(uint32_t va)
+ {
++    extern void xbox_FramebufferWindowPresentPixels(uint32_t, const void *, uint32_t,
++                                                    uint32_t, uint32_t, uint32_t);
+     static int shown_only = -1;
++    Surf *shown = NULL;
++    uint32_t pw = 0, ph = 0;
+     int i, any = 0;
+ 
+     if (shown_only < 0) {
+@@ -1942,16 +2115,73 @@ static void vk_resolve(uint32_t va)
+             surf_queue_readback(s);
+             any = 1;
+         }
++        if (s->color.image && s->va == va && s->sc > 1
++            && (!shown || s->last_use > shown->last_use))
++            shown = s;
++    }
++    /* The window shows the top-left 640x480 of the surface. */
++    if (shown) {
++        pw = (shown->w < 640 ? shown->w : 640) * shown->sc;
++        ph = (shown->h < 480 ? shown->h : 480) * shown->sc;
++        if (pres_reserve((VkDeviceSize)pw * ph * shown->bpp)) {
++            VkBufferImageCopy r = copy_region(pw, ph, 1, 0, VK_IMAGE_ASPECT_COLOR_BIT);
++            end_rendering();
++            barrier_all();
++            vkCmdCopyImageToBuffer(cmd(), shown->color.image, VK_IMAGE_LAYOUT_GENERAL,
++                                   s_pres.buf, 1, &r);
++            barrier_all();
++            any = 1;
++        } else {
++            shown = NULL;
++        }
+     }
+     if (any)
+         flush();
++    if (shown)
++        xbox_FramebufferWindowPresentPixels(va, s_pres.map, pw, ph, pw * shown->bpp,
++                                            shown->bpp);
++}
++
++/* A new render scale, at a flip: what the GPU drew goes to guest memory,
++ * every surface and depth buffer goes, and they come back at the new size
++ * from guest memory as they are next drawn into. Depth is not written back:
++ * it only goes to guest memory when a texture is about to read it, and the
++ * memory under a depth buffer may hold something else by now (writing it
++ * there anyway corrupted the front end). The new ones start cleared, as a
++ * frame's depth does. */
++static void scale_change(unsigned to)
++{
++    int i;
++
++    for (i = 0; i < VK_MAX_SURFACES; i++)
++        if (s_surfs[i].color.image && s_surfs[i].gpu_dirty)
++            surf_queue_readback(&s_surfs[i]);
++    flush();
++    for (i = 0; i < VK_MAX_SURFACES; i++) {
++        img_retire(&s_surfs[i].color);
++        img_retire(&s_surfs[i].lo);
++        memset(&s_surfs[i], 0, sizeof s_surfs[i]);
++    }
++    for (i = 0; i < VK_MAX_ZETAS; i++) {
++        img_retire(&s_zetas[i].depth);
++        img_retire(&s_zetas[i].lo);
++        memset(&s_zetas[i], 0, sizeof s_zetas[i]);
++    }
++    s_rt = NULL;
++    s_rt_z = NULL;
++    s_resolve_gen++;
++    fprintf(stderr, "[VK] render scale %ux (%ux%u)\n", to, 640 * to, 480 * to);
++    s_scale = to;
+ }
+ 
+ static void vk_flip(void)
+ {
++    unsigned req = s_scale_req;
+     int i;
+ 
+     flush();
++    if (req && req != s_scale)
++        scale_change(req);
+     s_frame++;
+     /* Drop textures nothing has drawn with for a while. */
+     for (i = 0; i < s_ntex; i++)
+@@ -2127,11 +2357,31 @@ static int create_device(void)
+     return s_push_desc != NULL;
+ }
+ 
++/* Whether a format can be blitted both ways, and filtered (render scale). */
++static int fmt_blits(VkFormat f, int linear)
++{
++    VkFormatProperties fp;
++    VkFormatFeatureFlags want = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT
++        | (linear ? VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT : 0);
++    vkGetPhysicalDeviceFormatProperties(s_phys, f, &fp);
++    return (fp.optimalTilingFeatures & want) == want;
++}
++
+ static void pick_colour_formats(void)
+ {
+     VkFormatProperties fp;
++    VkPhysicalDeviceProperties p;
+     vkGetPhysicalDeviceFormatProperties(s_phys, VK_FORMAT_A1R5G5B5_UNORM_PACK16, &fp);
+     s_a1r5g5b5_ok = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) != 0;
++    s_blit_bgra = fmt_blits(VK_FORMAT_B8G8R8A8_UNORM, 1);
++    s_blit_565 = fmt_blits(VK_FORMAT_R5G6B5_UNORM_PACK16, 1);
++    s_blit_1555 = fmt_blits(VK_FORMAT_A1R5G5B5_UNORM_PACK16, 1);
++    s_zblit = fmt_blits(s_depth_fmt, 0);
++    vkGetPhysicalDeviceProperties(s_phys, &p);
++    s_max_dim = p.limits.maxImageDimension2D;
++    if (s_verbose)
++        fprintf(stderr, "[VK] scalable: B8G8R8A8 %d R5G6B5 %d A1R5G5B5 %d depth %d, images to %u\n",
++                s_blit_bgra, s_blit_565, s_blit_1555, s_zblit, s_max_dim);
+ }
+ 
+ static int pick_depth_format(void)
+@@ -2269,8 +2519,24 @@ int nv2a_vk_install(void)
+             || getenv("RECOMP_VK_CPU_VSH"))
+             s_backend.draw_program = NULL;
+     }
++    /* Nothing is built yet: a scale asked for already applies from the
++     * start (RECOMP_VK_SCALE, or the title's settings). */
++    e = getenv("RECOMP_VK_SCALE");
++    if (e && *e)
++        nv2a_vk_set_render_scale((unsigned)atoi(e));
++    if (s_scale_req)
++        s_scale = s_scale_req;
+     nv2a_backend_register(&s_backend);
+-    fprintf(stderr, "[VK] rendering on the GPU (depth format %d, vertex programs on the %s)\n",
+-            (int)s_depth_fmt, s_backend.draw_program ? "GPU" : "CPU");
++    fprintf(stderr, "[VK] rendering on the GPU (depth format %d, vertex programs on the %s,"
++            " scale %ux)\n", (int)s_depth_fmt, s_backend.draw_program ? "GPU" : "CPU", s_scale);
+     return 1;
+ }
++
++void nv2a_vk_set_render_scale(unsigned scale)
++{
++    if (scale < 1)
++        scale = 1;
++    if (scale > 10)
++        scale = 10;
++    s_scale_req = scale;
++}
+diff --git a/src/vulkan/nv2a_vk.h b/src/vulkan/nv2a_vk.h
+index df17f1b..46af1a7 100644
+--- a/src/vulkan/nv2a_vk.h
++++ b/src/vulkan/nv2a_vk.h
+@@ -36,6 +36,12 @@ extern "C" {
+  * title starts submitting work. */
+ int nv2a_vk_install(void);
+ 
++/* Render at scale x 640x480 (1..10): every surface the title draws into is
++ * kept at that size on the GPU, guest memory still gets it at its own size,
++ * and the framebuffer window is handed the frame at the larger size. Takes
++ * effect at the next flip. RECOMP_VK_SCALE sets it at start. */
++void nv2a_vk_set_render_scale(unsigned scale);
++
+ #ifdef __cplusplus
+ }
+ #endif

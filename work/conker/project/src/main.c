@@ -19,6 +19,7 @@
 
 #include <xbox/xboxrecomp.h>
 #include "conker_host.h"
+#include "conker_settings.h"
 #include "ohci.h"
 #ifdef CONKER_HAVE_VULKAN
 #include "nv2a_vk.h"
@@ -143,6 +144,11 @@ static int conker_boot(void)
         return 1;
     }
     g_xbox_mem_offset = xbox_GetMemoryOffset();
+    /* Recomp Options in the front end's Options page (conker_menu.c). */
+    {
+        extern void conker_menu_install(void);
+        conker_menu_install();
+    }
     /* The USB host controllers' registers are trapped once guest memory is
      * mapped; nothing happens unless RECOMP_USB is set. */
     xbox_OhciInit();
@@ -244,10 +250,11 @@ int main(int argc, char **argv)
     conker_host_setenv_default("RECOMP_AC97_READY", "1");
     conker_host_setenv_default("RECOMP_USB", "1");
     conker_host_setenv_default("RECOMP_KEYBOARD", "1");
-    /* CONKER_ASPECT widens the projection (recomp_manual.c, Hor+); the
-     * window then shows the 640x480 frame at that shape. */
-    if (getenv("CONKER_ASPECT") && *getenv("CONKER_ASPECT"))
-        conker_host_setenv_default("RECOMP_DISPLAY_ASPECT", getenv("CONKER_ASPECT"));
+    /* Recomp Options (the front end's Options page): the cfg file sets the
+     * window, aspect (Hor+, recomp_manual.c), render scale and frame limit
+     * before anything opens; the submenu takes the pad while it shows. */
+    conker_settings_load();
+    conker_settings_install_input();
 
     if (!s_game_dir || !*s_game_dir)
         s_game_dir = CONKER_DEFAULT_GAME_DIR;
