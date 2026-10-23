@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 # The release version: the AppImage is named after it, and the executable
-# prints it. 0.1.x until the next milestone.
-project(conker_recomp VERSION 0.1.4 LANGUAGES C)
+# prints it.
+project(conker_recomp VERSION 0.2.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -110,6 +110,8 @@ if(CONKER_BUILD_GAME)
         src/recomp_manual.c
         src/conker_menu.c
         src/conker_settings.c
+        src/conker_install.c
+        src/conker_mods.c
         ${CONKER_HOST_SOURCES}
         ${RECOMP_GEN_SOURCES}
     )
@@ -164,6 +166,31 @@ if(CONKER_BUILD_GAME)
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 endif()
 
+# ── First-launch setup window (Qt 6) ───────────────────────────────────
+# conker-setup asks for the player's disc and installs it
+# (src/conker_install.c); the game runs it from beside itself when it finds
+# no game files. Without Qt the game asks through zenity/kdialog instead.
+include(CheckLanguage)
+if(NOT WIN32)
+    check_language(CXX)
+endif()
+if(NOT WIN32 AND CMAKE_CXX_COMPILER)
+    enable_language(CXX)
+    find_package(Qt6 QUIET COMPONENTS Widgets)
+    if(Qt6_FOUND)
+        set(CMAKE_AUTORCC ON)
+        add_executable(conker-setup
+            src/setup/conker_setup.cpp src/setup/setup.qrc src/conker_install.c)
+        target_link_libraries(conker-setup PRIVATE Qt6::Widgets)
+        set_target_properties(conker-setup PROPERTIES
+            CXX_STANDARD 17
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+        message(STATUS "conker-setup: Qt ${Qt6_VERSION}")
+    else()
+        message(STATUS "conker-setup: no Qt 6 Widgets, not built")
+    endif()
+endif()
+
 # ── AppImage (Linux) ───────────────────────────────────────────────────
 # `cmake --build <build> --target appimage` packs the executable into
 # CONKER_APPIMAGE_DIR/Conker-Recomp-<version>-x86_64.AppImage (by default
@@ -174,12 +201,19 @@ if(TARGET conker_recomp AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
         "${CMAKE_CURRENT_SOURCE_DIR}/../../../appimage" ABSOLUTE)
     set(CONKER_APPIMAGE_DIR "${_appimage_default}" CACHE PATH
         "Where the appimage target writes the AppImage")
+    set(_setup_file "")
+    set(_setup_dep "")
+    if(TARGET conker-setup)
+        set(_setup_file "$<TARGET_FILE:conker-setup>")
+        set(_setup_dep conker-setup)
+    endif()
     add_custom_target(appimage
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${CONKER_APPIMAGE_DIR}"
         COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/../packaging/appimage/build-appimage.sh"
                 "$<TARGET_FILE:conker_recomp>" "${CMAKE_BINARY_DIR}/appimage"
                 "${CONKER_APPIMAGE_DIR}" "${PROJECT_VERSION}"
-        DEPENDS conker_recomp
+                "${_setup_file}"
+        DEPENDS conker_recomp ${_setup_dep}
         COMMENT "Packing Conker-Recomp-${PROJECT_VERSION}-x86_64.AppImage"
         VERBATIM)
 endif()
@@ -192,6 +226,8 @@ add_library(conker_host_check OBJECT
     src/recomp_manual.c
     src/conker_menu.c
     src/conker_settings.c
+    src/conker_install.c
+    src/conker_mods.c
     ${CONKER_HOST_SOURCES}
 )
 target_include_directories(conker_host_check PRIVATE

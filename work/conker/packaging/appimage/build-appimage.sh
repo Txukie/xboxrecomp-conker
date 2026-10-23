@@ -1,13 +1,15 @@
 #!/bin/sh
-# build-appimage.sh BINARY WORK_DIR OUTPUT_DIR VERSION
+# build-appimage.sh BINARY WORK_DIR OUTPUT_DIR VERSION [SETUP]
 #
 # Packs the Linux build of conker_recomp into
 # OUTPUT_DIR/Conker-Recomp-VERSION-x86_64.AppImage, assembling it in WORK_DIR.
 # Run through the CMake target (`cmake --build <build> --target appimage`),
-# which passes all four (VERSION is the CMake project version).
+# which passes them (VERSION is the CMake project version; SETUP the
+# first-launch window, conker-setup, when Qt 6 was found).
 #
 # Bundled: the binary, AppRun, the desktop entry and icon, and the libraries
-# a desktop may lack (SDL2, libepoxy, OpenSSL's libcrypto). Not bundled, on
+# a desktop may lack (SDL2, libepoxy, OpenSSL's libcrypto). With SETUP also
+# conker-setup, the Qt it links and Qt's X11/Wayland plugins. Not bundled, on
 # purpose: glibc, the Vulkan loader and GPU drivers, which have to match the
 # host -- so the AppImage runs on distributions with a glibc at least as new
 # as the build machine's.
@@ -20,6 +22,7 @@ bin=$1
 out=$2
 dest=$3
 version=$4
+setup=${5:-}
 here=$(cd "$(dirname "$0")" && pwd)
 appdir="$out/AppDir"
 image="$dest/Conker-Recomp-$version-x86_64.AppImage"
@@ -50,6 +53,35 @@ ldd "$bin" | awk '/=> \// { print $1, $3 }' | while read -r name path; do
             echo "build-appimage: bundled $name" ;;
     esac
 done
+
+# The setup window and what it needs: Qt and the libraries Qt pulls in that
+# a system may lack, and its platform plugins (found through qt.conf). The
+# libraries every desktop has, or that have to be the host's (glibc, GL,
+# the X11 and Wayland client libraries, fonts), stay out.
+if [ -n "$setup" ] && [ -x "$setup" ]; then
+    cp "$setup" "$appdir/usr/bin/conker-setup"
+    qtplugins=$(dirname "$(dirname "$(find /usr/lib /usr/lib64 -path '*qt6/plugins/platforms/libqxcb.so' 2>/dev/null | head -1)")")
+    mkdir -p "$appdir/usr/plugins"
+    for d in platforms/libqxcb.so platforms/libqwayland.so platforms/libqoffscreen.so \
+             platformthemes/libqxdgdesktopportal.so xcbglintegrations \
+             wayland-decoration-client wayland-graphics-integration-client \
+             wayland-shell-integration; do
+        [ -e "$qtplugins/$d" ] || continue
+        mkdir -p "$appdir/usr/plugins/$(dirname "$d")"
+        cp -rL "$qtplugins/$d" "$appdir/usr/plugins/$(dirname "$d")/"
+    done
+    printf '[Paths]\nPrefix = ..\nPlugins = plugins\n' > "$appdir/usr/bin/qt.conf"
+    keep_out='^(linux-vdso|ld-linux[-a-z0-9_]*|libc|libm|libdl|libpthread|librt|libresolv|libutil|libGL|libEGL|libGLX|libGLdispatch|libOpenGL|libvulkan|libdrm|libgbm|libX11|libX11-xcb|libxcb|libXau|libXdmcp|libwayland-client|libwayland-cursor|libwayland-egl|libfontconfig|libfreetype|libexpat|libz|libasound|libpulse|libudev|libsystemd)\.so'
+    { echo "$appdir/usr/bin/conker-setup"; find "$appdir/usr/plugins" -name '*.so'; } |
+    while read -r f; do ldd "$f"; done | awk '/=> \// { print $1, $3 }' | sort -u |
+    while read -r name path; do
+        name=${name##*/}
+        echo "$name" | grep -Eq "$keep_out" && continue
+        [ -e "$appdir/usr/lib/$name" ] && continue
+        cp -L "$path" "$appdir/usr/lib/$name"
+    done
+    echo "build-appimage: bundled conker-setup and $(ls "$appdir/usr/lib" | wc -l) libraries"
+fi
 
 tool=${APPIMAGETOOL:-}
 if [ -z "$tool" ]; then

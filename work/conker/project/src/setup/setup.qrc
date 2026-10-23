@@ -1,0 +1,5 @@
+<!DOCTYPE RCC><RCC version="1.0">
+<qresource>
+    <file alias="conker.png">../../../packaging/appimage/conker-recomp.png</file>
+</qresource>
+</RCC>

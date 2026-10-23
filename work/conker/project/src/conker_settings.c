@@ -20,6 +20,7 @@
 
 #include "conker_settings.h"
 #include "conker_host.h"
+#include "conker_mods.h"
 #include "xinput_xbox.h"
 #include "video_player.h"
 #include "display_aspect.h"
@@ -47,12 +48,16 @@ static volatile int s_res_w, s_res_h;    /* 0: the window's default size */
 static volatile int s_scale = 1;
 static volatile int s_vsync = 1;
 static volatile int s_fps = 30;
+static volatile int s_skip_cutscenes;    /* LT skips every cutscene, seen or not */
 static volatile float s_hor_plus;
 
 static const char *const k_labels[CONKER_OPT_COUNT] = {
     "Display Mode", "Aspect Ratio", "Resolution",
-    "Render Resolution", "VSync", "FPS Limit",
+    "Render Resolution", "VSync", "FPS Limit", "Allow Skip Cutscenes", "Uncensor",
 };
+/* Uncensor: left and right pick, A carries it out (conker_mods.c). */
+static const char *const k_uncensor[CONKER_UNCENSOR_CHOICES] = { "Disable", "Enable", "Update" };
+static volatile int s_uncensor = -1;     /* the choice showing; -1: the mod's state */
 
 /* The default window: what fb_present_sdl.c opens without a size, twice
  * 640x480 at the display's shape. */
@@ -88,6 +93,7 @@ static void save(void)
     fprintf(f, "render_scale=%d\n", s_scale);
     fprintf(f, "vsync=%s\n", s_vsync ? "on" : "off");
     fprintf(f, "fps_limit=%d\n", s_fps);
+    fprintf(f, "skip_cutscenes=%s\n", s_skip_cutscenes ? "yes" : "no");
     fclose(f);
 }
 
@@ -124,6 +130,8 @@ static void parse_line(char *line)
             s_scale = i;
     } else if (!strcmp(key, "vsync")) {
         s_vsync = strcmp(val, "off") != 0;
+    } else if (!strcmp(key, "skip_cutscenes")) {
+        s_skip_cutscenes = !strcmp(val, "yes");
     } else if (!strcmp(key, "fps_limit")) {
         i = atoi(val);
         for (int k = 0; k < N_FPS; k++)
@@ -277,6 +285,17 @@ void conker_options_value(int row, char *buf, size_t size)
     case CONKER_OPT_FPS:
         snprintf(buf, size, "%d FPS", s_fps);
         break;
+    case CONKER_OPT_SKIP_CUTSCENES:
+        snprintf(buf, size, "%s", s_skip_cutscenes ? "Yes" : "No");
+        break;
+    case CONKER_OPT_UNCENSOR: {
+        char status[96];
+        int c = s_uncensor < 0 ? conker_mods_uncensor_choice() : s_uncensor;
+        conker_mods_uncensor_status(status, sizeof status);
+        /* What happened last, while there is something to tell. */
+        snprintf(buf, size, "%s", status[0] ? status : k_uncensor[c]);
+        break;
+    }
     default:
         if (size)
             buf[0] = 0;
@@ -334,10 +353,30 @@ static void change(int row, int dir)
         s_fps = k_fps[wrap((i < N_FPS ? i : 0) + dir, N_FPS)];
         apply_fps();
         break;
+    case CONKER_OPT_SKIP_CUTSCENES:
+        s_skip_cutscenes = !s_skip_cutscenes;
+        break;
+    case CONKER_OPT_UNCENSOR:
+        if (s_uncensor < 0)
+            s_uncensor = conker_mods_uncensor_choice();
+        s_uncensor = wrap(s_uncensor + dir, CONKER_UNCENSOR_CHOICES);
+        conker_mods_uncensor_clear_status();
+        return;                         /* nothing to save: A carries it out */
     default:
         return;
     }
     save();
+}
+
+/* A on a row: what right does, except where A has its own meaning. */
+static void activate(int row)
+{
+    if (row == CONKER_OPT_UNCENSOR) {
+        conker_mods_uncensor_apply(s_uncensor < 0 ? conker_mods_uncensor_choice() : s_uncensor);
+        s_uncensor = -1;
+        return;
+    }
+    change(row, +1);
 }
 
 /* ── The pad ──────────────────────────────────────────────────────────── */
@@ -417,12 +456,54 @@ static void swallow_all(void)
         s_swallow[p] = 1;
 }
 
+/* ── Allow Skip Cutscenes ─────────────────────────────────────────────────
+ *
+ * Holding LT in a cutscene ends it once the cutscene counts as seen: the
+ * per-frame end test (sub_0004FF00) asks sub_0004EBE0, which reads a bit of
+ * the seen masks (0x765608, 64 bits per level, kept in the save) -- unless
+ * the byte at 0x7655E9 is set, when every cutscene counts as seen. Retail
+ * code only ever clears that byte (at each cutscene's start), and the only
+ * other reader skips marking the cutscene seen at its end. So while LT is
+ * held, and only then, the option sets it: the game's own hold-to-skip does
+ * the rest, and nothing lasting is written. */
+#define CUTSCENE_ALL_SEEN 0x007655E9u
+#define LT_PRESSED        30           /* analog threshold, of 255 */
+
+extern ptrdiff_t g_xbox_mem_offset;
+static unsigned s_lt_held;             /* ports with LT down */
+static int s_all_seen_set;
+
+static void skip_cutscenes_filter(DWORD port, const XBOX_INPUT_STATE *st, int connected)
+{
+    volatile uint8_t *flag;
+    unsigned bit = 1u << port;
+
+    if (connected && st->Gamepad.bAnalogButtons[6] > LT_PRESSED)
+        s_lt_held |= bit;
+    else
+        s_lt_held &= ~bit;
+    if (!g_xbox_mem_offset)
+        return;
+    flag = (volatile uint8_t *)(g_xbox_mem_offset + CUTSCENE_ALL_SEEN);
+    if (s_skip_cutscenes && s_lt_held) {
+        if (!s_all_seen_set)
+            fprintf(stderr, "[CONKER] LT held: cutscenes can be skipped\n");
+        *flag = 1;
+        s_all_seen_set = 1;
+    } else if (s_all_seen_set) {
+        *flag = 0;
+        s_all_seen_set = 0;
+    }
+}
+
 static void input_filter(DWORD port, XBOX_INPUT_STATE *st, int connected)
 {
     uint64_t now = now_ms();
     unsigned bits, pressed, dirs;
     int page = now - s_page_ms < PAGE_FRESH_MS;
 
+    if (port < PORTS)
+        skip_cutscenes_filter(port, st, connected);
     if (!connected || port >= PORTS)
         return;
     bits = pad_bits(st);
@@ -484,7 +565,7 @@ static void input_filter(DWORD port, XBOX_INPUT_STATE *st, int connected)
     else if (dirs & P_RIGHT)
         change(s_row, +1);
     else if (pressed & P_A)
-        change(s_row, +1);
+        activate(s_row);
 }
 
 void conker_settings_install_input(void)

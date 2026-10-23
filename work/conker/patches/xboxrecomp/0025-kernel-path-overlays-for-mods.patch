@@ -1,0 +1,100 @@
+diff --git a/src/kernel/kernel.h b/src/kernel/kernel.h
+index 4a6389d..3f8633d 100644
+--- a/src/kernel/kernel.h
++++ b/src/kernel/kernel.h
+@@ -541,6 +541,17 @@ void xbox_kernel_set_ordinal_remap(const unsigned short *map, int count);
+ /* Initialize path translation with base directories */
+ void xbox_path_init(const char* game_dir, const char* save_dir);
+ 
++/*
++ * Overlay folders on the game directory (mods): a file a title opens from the
++ * game directory (D:, \Device\CdRom0) is taken from the first overlay that
++ * has it, at the same relative path (case folded as for the game directory).
++ * Only existing files are redirected; folders, listings and new files stay
++ * the game directory's. dirs[0] wins over dirs[1] and so on. Call before the
++ * title runs; at most XBOX_PATH_MAX_OVERLAYS are kept.
++ */
++#define XBOX_PATH_MAX_OVERLAYS 16
++void xbox_path_set_overlays(const char* const* dirs, int count);
++
+ /*
+  * Character type of a translated host path. The Win32 file APIs take wide
+  * chars; POSIX takes bytes. kernel_path.c and kernel_file.c are split on
+diff --git a/src/kernel/kernel_path.c b/src/kernel/kernel_path.c
+index d3e7941..fa182d5 100644
+--- a/src/kernel/kernel_path.c
++++ b/src/kernel/kernel_path.c
+@@ -38,6 +38,27 @@ static int match_prefix(const char* path, const char* prefix)
+     return i;
+ }
+ 
++/* Overlay folders on the game directory (xbox_path_set_overlays). */
++static char s_overlay[XBOX_PATH_MAX_OVERLAYS][MAX_PATH];
++static int  s_overlay_count;
++
++void xbox_path_set_overlays(const char* const* dirs, int count)
++{
++    int i, n = 0;
++    for (i = 0; i < count && n < XBOX_PATH_MAX_OVERLAYS; i++) {
++        size_t len;
++        if (!dirs[i] || !dirs[i][0])
++            continue;
++        snprintf(s_overlay[n], MAX_PATH, "%s", dirs[i]);
++        len = strlen(s_overlay[n]);
++        while (len > 1 && (s_overlay[n][len - 1] == '/' || s_overlay[n][len - 1] == '\\'))
++            s_overlay[n][--len] = '\0';
++        xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Overlay %d: %s", n, s_overlay[n]);
++        n++;
++    }
++    s_overlay_count = n;
++}
++
+ /* A device-path translation rule, shared by both backends. */
+ typedef struct {
+     const char* prefix;     /* Xbox path prefix (backslash form)         */
+@@ -641,6 +662,19 @@ translate:
+             CreateDirectoryW(dir_path, NULL);
+         } else {
+             swprintf_s(host_path_buf, buf_size, L"%s\\%s", base_dir, remainder_wide);
++            /* A mod's copy of a game file wins (xbox_path_set_overlays). */
++            if (base_dir == s_game_dir && remainder_wide[0]) {
++                for (int k = 0; k < s_overlay_count; k++) {
++                    WCHAR alt[MAX_PATH];
++                    DWORD attr;
++                    swprintf_s(alt, MAX_PATH, L"%S\\%s", s_overlay[k], remainder_wide);
++                    attr = GetFileAttributesW(alt);
++                    if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
++                        wcsncpy_s(host_path_buf, buf_size, alt, _TRUNCATE);
++                        break;
++                    }
++                }
++            }
+         }
+ 
+         /* An empty remainder means the title opened the device itself, so
+@@ -955,6 +989,25 @@ translate:
+ 
+         fold_path_case(host_path_buf, strlen(base_dir) + (sub_dir ? strlen(sub_dir) : 0));
+ 
++        /* A mod's copy of a game file wins (xbox_path_set_overlays). */
++        if (base_dir == s_game_dir && !sub_dir && remainder_posix[0]) {
++            for (int k = 0; k < s_overlay_count; k++) {
++                char alt[MAX_PATH];
++                struct stat st;
++                size_t n;
++                snprintf(alt, sizeof(alt), "%s/%s", s_overlay[k], remainder_posix);
++                n = strlen(alt);
++                while (n > 1 && alt[n - 1] == '/')
++                    alt[--n] = '\0';
++                fold_path_case(alt, strlen(s_overlay[k]));
++                if (stat(alt, &st) == 0 && S_ISREG(st.st_mode)) {
++                    XBOX_TRACE(XBOX_LOG_PATH, "%s -> overlay %s", xbox_path, alt);
++                    snprintf(host_path_buf, buf_size, "%s", alt);
++                    break;
++                }
++            }
++        }
++
+         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
+         /* As the Win32 backend does: the bridge reads back the host path
+          * the call it just made translated (the missing-file report, the

@@ -1,12 +1,15 @@
 #!/bin/sh
 # Conker recomp AppImage entry point.
 #
-#   Conker-Recomp-x86_64.AppImage [game-directory] [save-directory]
+#   Conker-Recomp-x86_64.AppImage [game] [save-directory]
 #
-# The game directory is the extracted disc (it holds default.xbe); the AppImage
-# carries no game data. Without an argument it is CONKER_GAME_DIR, then
-# $XDG_DATA_HOME/conker-recomp/game (~/.local/share/conker-recomp/game).
-# Saves go to $XDG_DATA_HOME/conker-recomp/saves unless a second argument or
+# The AppImage carries no game data. On the first launch a setup window asks
+# for your copy of the game -- a disc image (.iso, also a Redump dump, or the
+# .7z/.zip holding it) or the folder of an extracted disc -- and installs an
+# image into $XDG_DATA_HOME/conker-recomp/game (~/.local/share/...), where
+# every later launch finds it. A first argument (a game folder or an image)
+# or CONKER_GAME_DIR names the game instead. Saves go to
+# $XDG_DATA_HOME/conker-recomp/saves unless a second argument or
 # CONKER_SAVE_DIR says otherwise.
 #
 # Defaults set here, each overridable from the environment: the game window
@@ -17,27 +20,4 @@ export LD_LIBRARY_PATH="$here/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export RECOMP_FB_WINDOW="${RECOMP_FB_WINDOW:-1}"
 export RECOMP_RENDERER="${RECOMP_RENDERER:-vulkan}"
 
-data="${XDG_DATA_HOME:-$HOME/.local/share}/conker-recomp"
-game="${1:-${CONKER_GAME_DIR:-}}"
-[ $# -gt 0 ] && shift
-if [ -z "$game" ] && [ -f "$data/game/default.xbe" ]; then
-    game="$data/game"
-fi
-
-if [ -z "$game" ] || [ ! -f "$game/default.xbe" ]; then
-    msg="Conker: no extracted game found${game:+ in $game}.
-Pass the folder that holds default.xbe as the first argument, set
-CONKER_GAME_DIR, or put the extracted disc in $data/game."
-    echo "$msg" >&2
-    # Started from a file manager there is no terminal to read that in.
-    if [ ! -t 2 ]; then
-        if command -v zenity >/dev/null 2>&1; then
-            zenity --error --title="Conker" --text="$msg" 2>/dev/null
-        elif command -v kdialog >/dev/null 2>&1; then
-            kdialog --title "Conker" --error "$msg" 2>/dev/null
-        fi
-    fi
-    exit 1
-fi
-
-exec "$here/usr/bin/conker_recomp" "$game" "$@"
+exec "$here/usr/bin/conker_recomp" "$@"

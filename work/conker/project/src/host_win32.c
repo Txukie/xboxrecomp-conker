@@ -89,6 +89,19 @@ void conker_host_default_save_dir(char *buf, size_t size)
     SHCreateDirectoryExA(NULL, buf, NULL);
 }
 
+void conker_host_exe_dir(char *buf, size_t size)
+{
+    DWORD n = size ? GetModuleFileNameA(NULL, buf, (DWORD)size) : 0;
+    char *slash;
+    if (n == 0 || n >= size) {
+        if (size)
+            buf[0] = 0;
+        return;
+    }
+    if ((slash = strrchr(buf, '\\')))
+        slash[1] = 0;
+}
+
 void conker_host_config_path(char *buf, size_t size)
 {
     char base[MAX_PATH], dir[MAX_PATH];

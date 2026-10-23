@@ -12,6 +12,10 @@
 #include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 
 #include <xbox/xboxrecomp.h>
 #include "conker_host.h"
@@ -93,6 +97,28 @@ void conker_host_default_save_dir(char *buf, size_t size)
         snprintf(buf, size, "%s/.local/share/conker-recomp/saves",
                  home ? home : ".");
 #endif
+}
+
+void conker_host_exe_dir(char *buf, size_t size)
+{
+    char *slash;
+    ssize_t n = -1;
+#if defined(__APPLE__)
+    uint32_t len = (uint32_t)size;
+    if (size && _NSGetExecutablePath(buf, &len) == 0)
+        n = (ssize_t)strlen(buf);
+#else
+    if (size)
+        n = readlink("/proc/self/exe", buf, size - 1);
+#endif
+    if (n <= 0) {
+        if (size)
+            buf[0] = 0;
+        return;
+    }
+    buf[n] = 0;
+    if ((slash = strrchr(buf, '/')))
+        slash[1] = 0;
 }
 
 void conker_host_config_path(char *buf, size_t size)

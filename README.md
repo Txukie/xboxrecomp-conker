@@ -20,7 +20,9 @@
 | Vídeo de introducción, menús, perfiles | ✅ Se ven y se controlan (teclado o mando) |
 | Partida nueva (Game 1) | ✅ Llega a las escenas iniciales; el juego en sí está poco probado |
 | Renderizado Vulkan | ✅ Píxeles y vertex programs en la GPU; 30 fps como en la consola, o hasta 60/90/120; resolución interna de 1X a 10X |
-| Recomp Options | ✅ En Options del menú principal: modo de ventana, proporción, resolución, resolución de render, VSync y límite de fps; se guardan en `settings.cfg` |
+| Primer arranque | ✅ Una ventana pide la ISO (también Redump, o el .7z/.zip) o la carpeta extraída y la instala |
+| Recomp Options | ✅ En Options del menú principal: modo de ventana, proporción, resolución, resolución de render, VSync, límite de fps, Allow Skip Cutscenes y Uncensor; se guardan en `settings.cfg` |
+| Mods | ✅ Carpetas en `~/.local/share/conker-recomp/mods` que sustituyen archivos del juego sin tocarlo; se activan y desactivan sin borrarlas |
 | Pantalla panorámica | ✅ Recomp Options o `CONKER_ASPECT=16:9` (Hor+); los vídeos conservan su 4:3 con barras negras; los elementos 2D del menú se estiran |
 | Vídeos (FMV) | ✅ Decodificación y colores comprobados contra ffmpeg con Vulkan |
 | Backend Metal | 🔴 Todavía no |
@@ -28,9 +30,8 @@
 
 ## Prueba rápida
 
-Necesitas una copia **extraída** de un disco que poseas legalmente (la carpeta
-debe contener `default.xbe`; la ISO no se carga directamente, extráela por
-ejemplo con `extract-xiso`).
+Necesitas una copia de un disco que poseas legalmente: la ISO (se instala la
+primera vez) o la carpeta extraída que contiene `default.xbe`.
 
 ```sh
 git clone --recurse-submodules <este repositorio>
@@ -46,7 +47,7 @@ más lento.
 
 ```sh
 cmake --build work/conker/project/build --target appimage
-./appimage/Conker-Recomp-0.1.4-x86_64.AppImage /ruta/a/Conker
+./appimage/Conker-Recomp-0.2.0-x86_64.AppImage
 ```
 
 El objetivo deja la AppImage en `appimage/`, en la raíz del repositorio
@@ -54,12 +55,19 @@ El objetivo deja la AppImage en `appimage/`, en la raíz del repositorio
 en `project(conker_recomp VERSION …)` de `work/conker/project/CMakeLists.txt`,
 y el ejecutable la muestra al arrancar.
 
-La AppImage no contiene datos del juego. Sin argumento busca el disco extraído
-en `CONKER_GAME_DIR` o en `~/.local/share/conker-recomp/game`. Las partidas se
-guardan en `~/.local/share/conker-recomp/saves`. Abre la ventana y usa Vulkan
-por defecto (si no hay un dispositivo Vulkan utilizable, dibuja la CPU).
+La AppImage no contiene datos del juego. La primera vez que se abre, una
+ventana pide tu copia: una imagen de disco (`.iso` o `.xiso`, también un volcado
+completo de Redump, o el `.7z`/`.zip` que la contiene) o la carpeta de un disco
+extraído (con `default.xbe`). Una imagen se instala una sola vez (unos 4,5 GB)
+en `~/.local/share/conker-recomp/game`; una carpeta se usa donde está y se
+recuerda. Solo se acepta la versión USA de la que se recompiló el código. Un
+primer argumento (carpeta o imagen) o `CONKER_GAME_DIR` indican el juego sin
+preguntar. Las partidas se guardan en `~/.local/share/conker-recomp/saves`.
+Abre la ventana y usa Vulkan por defecto (si no hay un dispositivo Vulkan
+utilizable, dibuja la CPU).
 
-Lleva SDL2, libepoxy y libcrypto; glibc, el cargador de Vulkan y los drivers de
+Lleva SDL2, libepoxy, libcrypto y, para la ventana de instalación, Qt 6;
+glibc, el cargador de Vulkan y los drivers de
 la GPU son los del sistema. Como se compila en Arch, necesita glibc 2.43 o
 posterior. Para distribuciones más antiguas hay que compilarla en una con una
 glibc más vieja. `appimagetool` se toma del `PATH`; si no está, se descarga
@@ -78,6 +86,22 @@ la versión 1.9.0 y se comprueba su SHA-256.
   `%LOCALAPPDATA%\ConkerRecomp` en Windows), que se lee al arrancar. Por
   encima de 30 fps el juego va a la velocidad correcta (mide su propio
   tiempo por fotograma); cuántos fps alcanza depende del equipo.
+- **Allow Skip Cutscenes** (en Recomp Options, No por defecto): con Yes, mantener
+  LT pulsado un segundo salta cualquier escena, aunque no se haya visto antes
+  (normalmente solo se pueden saltar las ya vistas). Las escenas que el juego
+  nunca deja saltar, como las de la introducción, siguen igual.
+- **Uncensor** (en Recomp Options): activa el
+  [parche de descensura](https://gamebanana.com/mods/697391) (textos y audio).
+  Con izquierda/derecha se elige Enable, Disable o Update y con A se aplica.
+  Enable lo descarga de GameBanana la primera vez (unos 250 MB; hacen falta
+  `curl` y `bsdtar` o `7z` en el sistema), Disable lo desactiva sin borrarlo y
+  Update busca una versión nueva. Los cambios se aplican al reiniciar el juego.
+- **Mods**: cada carpeta en `~/.local/share/conker-recomp/mods/` es un mod con
+  la misma estructura que la carpeta del juego (por ejemplo
+  `mods/mimod/dvddata/aid/text/...`); sus archivos sustituyen a los del juego,
+  que no se modifican. Un mod con un archivo `.disabled` dentro está
+  desactivado. Si cambia el conjunto de mods activos, al arrancar se vacía la
+  caché del juego (`saves/Cache`).
 - Teclado (con la ventana abierta): Intro = START, Z = A; también sirven los
   mandos que reconoce SDL.
 - `RECOMP_RENDERER`: `vulkan` (por defecto) dibuja en la GPU; si no hay un

@@ -31,6 +31,10 @@ void conker_host_default_save_dir(char *buf, size_t size);
  * %LOCALAPPDATA%\ConkerRecomp on Windows. Empty on failure. */
 void conker_host_config_path(char *buf, size_t size);
 
+/* The folder holding the executable, ending in a separator (empty when it
+ * cannot be found). */
+void conker_host_exe_dir(char *buf, size_t size);
+
 /* Set an environment variable unless the user already set it. */
 void conker_host_setenv_default(const char *name, const char *value);
 

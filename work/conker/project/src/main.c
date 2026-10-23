@@ -19,6 +19,8 @@
 
 #include <xbox/xboxrecomp.h>
 #include "conker_host.h"
+#include "conker_install.h"
+#include "conker_mods.h"
 #include "conker_settings.h"
 #include "ohci.h"
 #ifdef CONKER_HAVE_VULKAN
@@ -26,8 +28,6 @@
 #endif
 
 #define CONKER_ENTRY_POINT 0x0042F0E9u
-/* Used when neither argv[1] nor CONKER_GAME_DIR names the extracted disc. */
-#define CONKER_DEFAULT_GAME_DIR "game_files/Conker"
 
 #ifndef MAX_PATH
 #define MAX_PATH 260
@@ -216,9 +216,9 @@ static int conker_boot(void)
 
 int main(int argc, char **argv)
 {
-    static char default_save[MAX_PATH];
+    static char default_save[4096], data_dir[4096], exe_dir[4096], game_dir[4096];
+    char *slash;
 
-    s_game_dir = argc > 1 ? argv[1] : getenv("CONKER_GAME_DIR");
     s_save_path = argc > 2 ? argv[2] : getenv("CONKER_SAVE_DIR");
 
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -256,12 +256,22 @@ int main(int argc, char **argv)
     conker_settings_load();
     conker_settings_install_input();
 
-    if (!s_game_dir || !*s_game_dir)
-        s_game_dir = CONKER_DEFAULT_GAME_DIR;
-    if (!s_save_path || !*s_save_path) {
-        conker_host_default_save_dir(default_save, sizeof(default_save));
+    /* The game: the argument, CONKER_GAME_DIR, the copy installed on first
+     * launch, or the setup window asks for the player's disc and installs
+     * it (conker_install.c). The data folder is the one above saves/. */
+    conker_host_default_save_dir(default_save, sizeof(default_save));
+    snprintf(data_dir, sizeof data_dir, "%s", default_save);
+    if ((slash = strrchr(data_dir, '/')) || (slash = strrchr(data_dir, '\\')))
+        *slash = 0;
+    conker_host_exe_dir(exe_dir, sizeof exe_dir);
+    if (conker_find_game(argc > 1 ? argv[1] : NULL, data_dir, exe_dir,
+                         game_dir, sizeof game_dir) != 0)
+        return 1;
+    s_game_dir = game_dir;
+    if (!s_save_path || !*s_save_path)
         s_save_path = default_save;
-    }
+    /* Mods in <data>/mods, laid over the game's files (conker_mods.c). */
+    conker_mods_init(data_dir, s_save_path);
 
 #if defined(_WIN32)
     return conker_boot();
