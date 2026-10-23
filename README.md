@@ -111,6 +111,14 @@ Dependencias, variables de entorno y cómo regenerar el código:
   recuperadas a mano con el generador anterior.
 - `docs/technical/porting.md`: estado y plan multiplataforma.
 
+## Créditos
+
+- [Txukie](https://github.com/Txukie): autor del proyecto.
+- [codepdbh](https://github.com/codepdbh): contribuciones.
+- Claude (Anthropic), mediante Claude Code: coautor de los commits
+  (`Co-Authored-By: Claude`), del análisis del juego, de los parches del
+  toolkit y de las versiones publicadas.
+
 ## Aviso legal
 
 Este repositorio no incluye la ISO, `default.xbe`, assets ni partidas del juego.
