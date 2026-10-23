@@ -1,0 +1,1210 @@
+diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
+index 702f842..5939029 100644
+--- a/src/kernel/nv2a_backend.h
++++ b/src/kernel/nv2a_backend.h
+@@ -92,7 +92,7 @@ typedef struct {
+     uint32_t stencil_enable, stencil_func, stencil_ref, stencil_func_mask;
+     uint32_t stencil_write_mask, stencil_fail, stencil_zfail, stencil_zpass;
+     /* SET_ZPASS_PIXEL_COUNT_ENABLE: this draw's passing pixels count towards
+-     * the next GET_REPORT (report_read below). Zeta format, SURFACE_FORMAT
++     * the next GET_REPORT (report_mark below). Zeta format, SURFACE_FORMAT
+      * bits 4-7: 1 Z16 (window z 0..0xFFFF), 2 Z24S8 (0..0xFFFFFF). */
+     uint32_t zpass_enable, zeta_format;
+     /* SET_SURFACE_PITCH's top half: bytes per row of the zeta surface, for a
+@@ -210,13 +210,18 @@ typedef struct {
+     void (*flip)(void);
+     /* Optional, for a back end that keeps surfaces off guest memory.
+      * draw_full: set instead of draw to receive Nv2aFullBatch.
+-     * report_clear/report_read: CLEAR_REPORT_VALUE, and the passing-pixel
+-     *   count since then that GET_REPORT writes (may wait for the GPU).
++     * report_clear/report_mark/report_value: CLEAR_REPORT_VALUE; at
++     *   GET_REPORT, a token for the passing-pixel count since then, taken
++     *   without waiting; and that count, waiting for the GPU if it has not
++     *   got there. The executor asks for the values only when the title
++     *   could tell -- at the next semaphore release or flip -- so reports
++     *   cost one wait for many instead of one each.
+      * resolve: write the surface at this guest address back to guest memory;
+      *   called before a flip shows it. */
+     void (*draw_full)(const Nv2aSurface *s, const Nv2aFullBatch *b);
+     void (*report_clear)(void);
+-    uint32_t (*report_read)(void);
++    uint32_t (*report_mark)(void);
++    uint32_t (*report_value)(uint32_t token);
+     void (*resolve)(uint32_t color_va);
+     /* draw_program: vertex-program batches, transformed by the back end.
+      * Optional; without it they arrive through draw_full, transformed. */
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index f3d39a1..7673520 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -2508,6 +2508,39 @@ void nv2a_backend_decode_stage_level(const Nv2aStage *st, uint32_t face,
+     t.width = w;
+     t.height = h;
+     tex_update_valid(&t);
++    /* The common formats straight from memory: a level's load decoded every
++     * texel through sample_tex (wrap, block cache, the format switch), and a
++     * level change brings thousands of textures and all their mips. */
++    {
++        const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset() + t.offset;
++        uint32_t bytes = block ? ((w + 3) / 4) * ((h + 3) / 4) * block
++                               : (tex_size_from_format(st->color) ? w * h * tex_texel_bytes(st->color)
++                                                                  : st->pitch * h);
++        if (t.valid && guest_span_ok(t.offset, bytes)) {
++            if (block) {
++                for (v = 0; v < h; v++)
++                    for (u = 0; u < w; u++)
++                        if (!d3d8_dxt_decode_texel(mem, st->color, u, v, w,
++                                                   &argb_out[(size_t)v * w + u]))
++                            argb_out[(size_t)v * w + u] = 0xFFFFFFFFu;
++                return;
++            }
++            if ((st->color == 0x06 || st->color == 0x07) && w * h > 1) {
++                xbox_unswizzle_rect(argb_out, mem, w, h, 4);
++                if (st->color == 0x07)
++                    for (u = 0; u < w * h; u++) argb_out[u] |= 0xFF000000u;
++                return;
++            }
++            if (st->color == 0x12 || st->color == 0x1E) {
++                for (v = 0; v < h; v++) {
++                    memcpy(&argb_out[(size_t)v * w], mem + (size_t)v * st->pitch, (size_t)w * 4);
++                    if (st->color == 0x1E)
++                        for (u = 0; u < w; u++) argb_out[(size_t)v * w + u] |= 0xFF000000u;
++                }
++                return;
++            }
++        }
++    }
+     for (v = 0; v < h; v++)
+         for (u = 0; u < w; u++) {
+             uint32_t *o = &argb_out[(size_t)v * w + u];
+@@ -4352,6 +4385,32 @@ static void flip_hold_report(void)
+     h->held_ns = 0;
+ }
+ 
++/* Visibility-test reports a back end is still counting (GET_REPORT with
++ * report_mark). The 16 bytes D3D polls -- timestamp, pixel count, 0 for
++ * done -- are written by reports_drain, at the points the title can observe
++ * GPU progress: a semaphore release (D3D's fences, BlockOnTime) and a flip.
++ * Written at each GET_REPORT, every visibility test was a full wait for the
++ * GPU: Conker's game runs ~27 a frame, and its loads, which insert a fence
++ * per step, spent most of their time waiting. Until written, a report reads
++ * as incomplete, as on the console while the GPU has not got there. */
++#define NV_MAX_PENDING_REPORTS 256
++static struct { uint32_t at, token; uint64_t stamp; } s_reports[NV_MAX_PENDING_REPORTS];
++static int s_nreports;
++
++static void reports_drain(void)
++{
++    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
++    int i;
++
++    for (i = 0; i < s_nreports; i++) {
++        uint32_t count = s_backend->report_value(s_reports[i].token);
++        memcpy(mem + s_reports[i].at, &s_reports[i].stamp, 8);
++        memcpy(mem + s_reports[i].at + 8, &count, 4);
++        memset(mem + s_reports[i].at + 12, 0, 4);
++    }
++    s_nreports = 0;
++}
++
+ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+ {
+     static int inited;
+@@ -4361,6 +4420,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+      * held 0xFF000000 at times, which put the write outside guest memory). */
+     if (subch == 0 && method == 0x1D70 && s_sem_va) {
+         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
++        /* Everything before the release is done, reports included. */
++        if (s_nreports)
++            reports_drain();
+         *(volatile uint32_t *)(mem + s_sem_va) = param;
+         return;
+     }
+@@ -4540,6 +4602,18 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+         s_gpu.zpass_enable = param;
+         break;
+     case 0x17D0: {                                /* GET_REPORT */
++        if (s_backend && s_backend->report_mark) {
++            /* The GPU counts; the report is written when the title could
++             * see it (reports_drain), not here, so the back end does not
++             * wait for the GPU at every visibility test. */
++            if (s_nreports == NV_MAX_PENDING_REPORTS)
++                reports_drain();
++            s_reports[s_nreports].at = dma_resolve(param & 0x00FFFFFFu);
++            s_reports[s_nreports].stamp = (uint64_t)s_gpu.reports++ * 1000u;
++            s_reports[s_nreports].token = s_backend->report_mark();
++            s_nreports++;
++            break;
++        }
+         /* The GPU's answer to a visibility test: 16 bytes at the report
+          * DMA offset -- a timestamp, the pixel count, and 0 for "done".
+          * Never written, a title polling it (D3D's GetVisibilityTestResult
+@@ -4550,8 +4624,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+         uint32_t at = dma_resolve(param & 0x00FFFFFFu);
+         uint64_t stamp = (uint64_t)s_gpu.reports++ * 1000u;
+-        if (s_backend && s_backend->report_read)   /* the GPU counted */
+-            s_gpu.zpass_count = s_backend->report_read();
+         memcpy(mem + at, &stamp, 8);
+         memcpy(mem + at + 8, &s_gpu.zpass_count, 4);
+         memset(mem + at + 12, 0, 4);
+@@ -4678,6 +4750,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+         return;
+ 
+     case NV097_FLIP_STALL: {
++        if (s_nreports)
++            reports_drain();
+         /* The flip is measured from the vblank the title swapped in (the
+          * walk's start, s_walk_vbl); the hold's clock starts here, before
+          * the present below: a vsynced present can hold this thread for a
+diff --git a/src/vulkan/nv2a_vk.c b/src/vulkan/nv2a_vk.c
+index 36ffa19..ce5345c 100644
+--- a/src/vulkan/nv2a_vk.c
++++ b/src/vulkan/nv2a_vk.c
+@@ -62,7 +62,6 @@ static const uint32_t k_vsh_spv[] =
+ #define VK_MAX_ZETAS    16
+ #define VK_MAX_TEXTURES 4096
+ #define VK_MAX_SAMPLERS 64
+-#define VK_MAX_PIPES    256
+ #define VK_MAX_TEX_DIM  4096
+ /* A texture nothing drew with for this many flips is dropped. */
+ #define VK_TEX_IDLE_FLIPS 600
+@@ -112,6 +111,25 @@ typedef struct {
+ 
+ static Ring s_rv, s_ru, s_rup, s_rrd;
+ 
++/* Two submission slots, each with its own command buffer and vertex,
++ * uniform and upload rings; s_cmd, s_fence, s_pool and s_rv/s_ru/s_rup are
++ * the current slot's. When a ring fills, soft_flush submits the slot and
++ * goes on recording into the other one, waiting only if the GPU still has
++ * that one -- so the CPU records while the GPU draws. Waiting for the whole
++ * submission at every full ring had the two take turns: Conker's loading
++ * screens, a fence per step, spent half their time with one of them idle.
++ * flush() still waits for everything: query results, readbacks and image
++ * deletion need the GPU to be done. */
++typedef struct {
++    VkCommandPool pool;
++    VkCommandBuffer cmd;
++    VkFence fence;
++    Ring rv, ru, rup;
++    int busy;
++} Slot;
++static Slot s_slot[2];
++static int s_cur;
++
+ /* Program batches' constants and program, as last copied to s_ru (a flush
+  * rewinds the ring and forgets them). */
+ #define NV2A_VSH_SLOTS_VK 136
+@@ -203,6 +221,34 @@ static void barrier_all(void)
+                          0, NULL);
+ }
+ 
++/* Between two render passes: what the earlier ones drew (colour, depth,
++ * stencil) is visible to the next one's attachments and to its fragment
++ * shaders' texture reads. That is the only dependency passes have on each
++ * other -- uploads and readbacks put barrier_all around themselves -- and a
++ * full memory barrier there flushed and invalidated every cache of the GPU
++ * at every pass: a loading screen that draws two passes per step spent
++ * ~100 us of GPU time per step on it, whatever the passes drew. */
++static void barrier_passes(void)
++{
++    VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
++    mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
++                     | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
++    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT
++                     | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
++                     | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
++                     | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT
++                     | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
++    vkCmdPipelineBarrier(cmd(),
++                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
++                         | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
++                         | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
++                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
++                         | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
++                         | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
++                         | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
++                         0, 1, &mb, 0, NULL, 0, NULL);
++}
++
+ static void end_rendering(void)
+ {
+     if (s_rendering) {
+@@ -295,6 +341,7 @@ static void img_destroy_now(Img *im)
+ }
+ 
+ static void flush(void);
++static void soft_flush(void);
+ 
+ static void img_retire(Img *im)
+ {
+@@ -351,6 +398,11 @@ typedef struct {
+     int force_upload;
+     uint32_t last_use;
+     uint32_t version;        /* new at every write: draw, clear, upload */
++    /* Sampling the image directly (surf_sample): a view that reads alpha 1,
++     * for X8R8G8B8 textures, made when first needed, and what tex_get hands
++     * back for it. */
++    VkImageView view_a1;
++    Img samp;
+ } Surf;
+ 
+ typedef struct {
+@@ -482,7 +534,7 @@ static void surf_upload(Surf *s)
+     uint32_t y;
+ 
+     if (off == UINT64_MAX) {
+-        flush();
++        soft_flush();
+         off = ring_take(&s_rup, bytes, 16);
+         if (off == UINT64_MAX)
+             return;
+@@ -582,6 +634,23 @@ static void surf_resolve(Surf *s)
+ 
+ static int s_a1r5g5b5_ok;      /* the device renders A1R5G5B5 */
+ 
++/* A surface's image and its alpha-one view go once the command buffer is
++ * done with them. */
++static void surf_retire_image(Surf *s)
++{
++    if (s->view_a1) {
++        Img v;
++        memset(&v, 0, sizeof v);
++        v.view = s->view_a1;
++        v.image = VK_NULL_HANDLE;
++        s->view_a1 = VK_NULL_HANDLE;
++        if (s_ndead == (int)(sizeof s_dead / sizeof s_dead[0]))
++            flush();
++        s_dead[s_ndead++] = v;
++    }
++    img_retire(&s->color);
++}
++
+ static VkFormat surf_format(uint32_t bpp, uint32_t cfmt)
+ {
+     /* The NV2A's 32-bit surfaces are ARGB in a dword -- B, G, R, A bytes --
+@@ -632,7 +701,7 @@ static Surf *surf_get(const Nv2aSurface *ns, uint32_t need_h)
+     if (s && s->h < h) {                 /* taller than before: rebuild */
+         surf_resolve(s);
+         if (s_rt == s) { end_rendering(); s_rt = NULL; }
+-        img_retire(&s->color);
++        surf_retire_image(s);
+         img_retire(&s->lo);
+         lru = s;
+         s = NULL;
+@@ -642,7 +711,7 @@ static Surf *surf_get(const Nv2aSurface *ns, uint32_t need_h)
+         if (s->color.image) {
+             surf_resolve(s);
+             if (s_rt == s) { end_rendering(); s_rt = NULL; }
+-            img_retire(&s->color);
++            surf_retire_image(s);
+             img_retire(&s->lo);
+         }
+         memset(s, 0, sizeof *s);
+@@ -786,7 +855,7 @@ static void begin_rendering(Surf *s, Zeta *z)
+     if (s_rendering && s_rt == s && s_rt_z == z)
+         return;
+     end_rendering();
+-    barrier_all();
++    barrier_passes();
+     ca.imageView = s->color.view;
+     ca.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+     ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+@@ -1008,7 +1077,7 @@ static int tex_upload(Tex *t, const Nv2aStage *st)
+     }
+     off = ring_take(&s_rup, total * 4, 16);
+     if (off == UINT64_MAX) {
+-        flush();
++        soft_flush();
+         off = ring_take(&s_rup, total * 4, 16);
+         if (off == UINT64_MAX)
+             return 0;
+@@ -1074,6 +1143,38 @@ static Surf *drawn_source(const Nv2aStage *st)
+     return best;
+ }
+ 
++/* The guest address the current draw renders into: a stage that samples
++ * that surface reads a copy (tex_from_surface), any other surface directly
++ * (surf_sample). */
++static uint32_t s_draw_target_va;
++
++/* A surface's own image as a texture. Safe because every render pass begins
++ * with a full barrier, so what the passes before drew is visible, and the
++ * surface is not the one this draw renders into. Copying it each time it
++ * changed cost Conker's loading screens two full-screen copies and their
++ * barriers per step, thousands of steps a second. */
++static Img *surf_sample(Surf *s, const Nv2aStage *st)
++{
++    s->samp = s->color;
++    if (st->color == 0x07 || st->color == 0x1E) {   /* X8: alpha reads 1 */
++        if (!s->view_a1) {
++            VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
++            vi.image = s->color.image;
++            vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
++            vi.format = s->color.fmt;
++            vi.components.a = VK_COMPONENT_SWIZZLE_ONE;
++            vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++            vi.subresourceRange.levelCount = 1;
++            vi.subresourceRange.layerCount = 1;
++            if (vkCreateImageView(s_dev, &vi, NULL, &s->view_a1) != VK_SUCCESS)
++                s->view_a1 = VK_NULL_HANDLE;
++        }
++        if (s->view_a1)
++            s->samp.view = s->view_a1;
++    }
++    return &s->samp;
++}
++
+ static Img *tex_from_surface(Tex *t, const Nv2aStage *st, Surf *s)
+ {
+     VkImageCopy r;
+@@ -1175,7 +1276,8 @@ static Img *tex_get(const Nv2aStage *st)
+     }
+     t->last_use = s_frame;
+     if (src)
+-        return tex_from_surface(t, st, src);
++        return src->va == s_draw_target_va ? tex_from_surface(t, st, src)
++                                           : surf_sample(src, st);
+     if (t->img.image && t->hashed_frame == s_frame && t->hashed_gen == s_resolve_gen) {
+         s_tex_hits++;
+         return &t->img;
+@@ -1247,13 +1349,37 @@ static VkSampler sampler_get(int mag, int min, int mip, uint32_t au, uint32_t av
+ 
+ /* ---- Pipelines ------------------------------------------------------ */
+ 
++/* The fragment shader's specialisation constants (shaders/nv2a.frag
++ * constant_id): the combiner program and the switches around it. */
++enum {
++    VK_SPEC_CICW = 0, VK_SPEC_AICW = 8, VK_SPEC_COCW = 16, VK_SPEC_AOCW = 24,
++    VK_SPEC_FIN0 = 32, VK_SPEC_FIN1, VK_SPEC_CONTROL, VK_SPEC_STAGEPROG,
++    VK_SPEC_RC, VK_SPEC_ATEST, VK_SPEC_AFUNC, VK_SPEC_CLIPMODE, VK_SPEC_CUBE,
++    VK_SPEC_BORDER, VK_SPEC_STAGEIN, VK_SPEC_COUNT
++};
++
+ typedef struct {
+     uint32_t fmt, depth, blend, src, dst, eq, mask;
+     uint32_t vsh;            /* the vertex program runs here (nv2a_vsh.vert) */
++    uint32_t spec[VK_SPEC_COUNT];
+ } PipeKey;
+ 
+-static struct { PipeKey k; VkPipeline p; } s_pipes[VK_MAX_PIPES];
++/* Pipelines by key, open addressing: a frame looks one up per draw, and a
++ * title has hundreds of combiner programs. */
++#define VK_PIPE_SLOTS 4096
++static struct { PipeKey k; VkPipeline p; int used; } s_pipes[VK_PIPE_SLOTS];
+ static int s_npipes;
++static VkPipelineCache s_pcache;
++
++static uint32_t pipe_hash(const PipeKey *k)
++{
++    const uint32_t *w = (const uint32_t *)k;
++    uint32_t h = 2166136261u;
++    size_t i;
++    for (i = 0; i < sizeof *k / 4; i++)
++        h = (h ^ w[i]) * 16777619u;
++    return h;
++}
+ 
+ static VkBlendFactor blend_factor(uint32_t f)
+ {
+@@ -1317,9 +1443,26 @@ static VkPipeline pipe_get(const PipeKey *k)
+     VkPipeline p;
+     int i;
+ 
+-    for (i = 0; i < s_npipes; i++)
+-        if (!memcmp(&s_pipes[i].k, k, sizeof *k))
+-            return s_pipes[i].p;
++    VkSpecializationMapEntry me[VK_SPEC_COUNT];
++    VkSpecializationInfo spi;
++    uint32_t slot = pipe_hash(k) % VK_PIPE_SLOTS;
++
++    while (s_pipes[slot].used) {
++        if (!memcmp(&s_pipes[slot].k, k, sizeof *k))
++            return s_pipes[slot].p;
++        slot = (slot + 1) % VK_PIPE_SLOTS;
++    }
++    if (s_npipes >= VK_PIPE_SLOTS - 1)
++        return VK_NULL_HANDLE;
++    for (i = 0; i < VK_SPEC_COUNT; i++) {
++        me[i].constantID = (uint32_t)i;
++        me[i].offset = (uint32_t)(4 * i);
++        me[i].size = 4;
++    }
++    spi.mapEntryCount = VK_SPEC_COUNT;
++    spi.pMapEntries = me;
++    spi.dataSize = sizeof k->spec;
++    spi.pData = k->spec;
+ 
+     for (i = 0; i < 8; i++) {
+         va[i].location = (uint32_t)i;
+@@ -1369,6 +1512,7 @@ static VkPipeline pipe_get(const PipeKey *k)
+     st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+     st[1].module = s_fs;
+     st[1].pName = "main";
++    st[1].pSpecializationInfo = &spi;
+     pr.colorAttachmentCount = 1;
+     pr.pColorAttachmentFormats = &cfmt;
+     if (k->depth) {
+@@ -1388,24 +1532,83 @@ static VkPipeline pipe_get(const PipeKey *k)
+     gi.pColorBlendState = &cb;
+     gi.pDynamicState = &dy;
+     gi.layout = s_layout;
+-    if (vkCreateGraphicsPipelines(s_dev, VK_NULL_HANDLE, 1, &gi, NULL, &p) != VK_SUCCESS)
++    if (vkCreateGraphicsPipelines(s_dev, s_pcache, 1, &gi, NULL, &p) != VK_SUCCESS)
+         return VK_NULL_HANDLE;
+-    if (s_npipes < VK_MAX_PIPES) {
+-        s_pipes[s_npipes].k = *k;
+-        s_pipes[s_npipes].p = p;
+-        s_npipes++;
+-    }
++    s_pipes[slot].k = *k;
++    s_pipes[slot].p = p;
++    s_pipes[slot].used = 1;
++    s_npipes++;
+     return p;
+ }
+ 
+ /* ---- Visibility tests ----------------------------------------------- */
+ 
+-static uint32_t s_q_used, s_q_discard;
+-static uint64_t s_report_acc;
++/* Occlusion queries, one per draw that counts (zpass_enable), in the order
++ * recorded since the last flush. A report is the sum of the queries since
++ * CLEAR_REPORT_VALUE, which may span flushes: s_q_epoch is where the
++ * current count began in this command buffer, s_epoch_carry what the
++ * buffers before it added. GET_REPORT takes a mark of the range and reads
++ * nothing; the next flush turns every open mark into its value. */
++#define VK_MAX_MARKS 1024
++static uint32_t s_q_used, s_q_epoch;
++static uint64_t s_epoch_carry;
++static struct { uint32_t begin, end; uint64_t carry, value; int resolved; } s_marks[VK_MAX_MARKS];
++static uint32_t s_next_mark;
++static uint32_t s_open_marks[VK_MAX_MARKS];
++static uint32_t s_nopen;
+ 
+ /* ---- Flush ---------------------------------------------------------- */
+ 
+-static uint32_t s_flushes, s_draws, s_tris, s_prog_draws;
++static uint32_t s_flushes, s_soft_flushes, s_draws, s_tris, s_prog_draws;
++
++static void slot_save(void)
++{
++    Slot *c = &s_slot[s_cur];
++    c->rv = s_rv; c->ru = s_ru; c->rup = s_rup;
++}
++
++static void slot_load(void)
++{
++    Slot *c = &s_slot[s_cur];
++    s_cmd = c->cmd; s_fence = c->fence; s_pool = c->pool;
++    s_rv = c->rv; s_ru = c->ru; s_rup = c->rup;
++}
++
++static void soft_flush(void)
++{
++    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
++    Slot *n;
++
++    if (!s_recording)
++        return;
++    end_rendering();
++    s_rt = NULL;
++    s_rt_z = NULL;
++    vkEndCommandBuffer(s_cmd);
++    si.commandBufferCount = 1;
++    si.pCommandBuffers = &s_cmd;
++    if (vkQueueSubmit(s_queue, 1, &si, s_fence) != VK_SUCCESS) {
++        fprintf(stderr, "[VK] submit failed\n");
++        s_recording = 0;
++        flush();
++        return;
++    }
++    s_recording = 0;
++    s_slot[s_cur].busy = 1;
++    slot_save();
++    s_cur ^= 1;
++    n = &s_slot[s_cur];
++    if (n->busy) {
++        vkWaitForFences(s_dev, 1, &n->fence, VK_TRUE, UINT64_MAX);
++        vkResetFences(s_dev, 1, &n->fence);
++        vkResetCommandPool(s_dev, n->pool, 0);
++        n->busy = 0;
++    }
++    n->rv.used = n->ru.used = n->rup.used = 0;
++    slot_load();
++    s_kc_off = s_kp_off = UINT64_MAX;
++    s_soft_flushes++;
++}
+ 
+ static void flush(void)
+ {
+@@ -1430,22 +1633,46 @@ static void flush(void)
+     s_recording = 0;
+     s_flushes++;
+ 
+-    if (s_q_used > s_q_discard) {
+-        uint64_t res[VK_MAX_QUERIES];
+-        uint32_t n = s_q_used - s_q_discard, k;
+-        if (vkGetQueryPoolResults(s_dev, s_qpool, s_q_discard, n, sizeof res, res,
+-                                  sizeof res[0], VK_QUERY_RESULT_64_BIT
+-                                  | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS)
+-            for (k = 0; k < n; k++) {
++    {   /* the other slot's submission, if any, is done too */
++        Slot *o = &s_slot[s_cur ^ 1];
++        if (o->busy) {
++            vkWaitForFences(s_dev, 1, &o->fence, VK_TRUE, UINT64_MAX);
++            vkResetFences(s_dev, 1, &o->fence);
++            vkResetCommandPool(s_dev, o->pool, 0);
++            o->rv.used = o->ru.used = o->rup.used = 0;
++            o->busy = 0;
++        }
++    }
++
++    {
++        static uint64_t res[VK_MAX_QUERIES + 1];  /* prefix sums: res[k] = q[0..k) */
++        uint32_t k;
++
++        res[0] = 0;
++        if (s_q_used) {
++            if (vkGetQueryPoolResults(s_dev, s_qpool, 0, s_q_used, sizeof(uint64_t) * VK_MAX_QUERIES,
++                                      res + 1, sizeof res[0], VK_QUERY_RESULT_64_BIT
++                                      | VK_QUERY_RESULT_WAIT_BIT) != VK_SUCCESS)
++                memset(res + 1, 0, sizeof res[0] * s_q_used);
++            for (k = 1; k <= s_q_used; k++) {
+                 /* Pixels at the scale drawn, back to the title's pixels;
+                  * a few still count as one. */
+                 uint64_t v = res[k] / ((uint64_t)s_scale * s_scale);
+-                s_report_acc += (res[k] && !v) ? 1 : v;
++                res[k] = res[k - 1] + ((res[k] && !v) ? 1 : v);
+             }
++        }
++        for (k = 0; k < s_nopen; k++) {
++            uint32_t m = s_open_marks[k];
++            s_marks[m].value = s_marks[m].carry + res[s_marks[m].end] - res[s_marks[m].begin];
++            s_marks[m].resolved = 1;
++        }
++        s_nopen = 0;
++        s_epoch_carry += res[s_q_used] - res[s_q_epoch];
++        s_q_epoch = 0;
+     }
+     if (s_q_used)
+         vkResetQueryPool(s_dev, s_qpool, 0, s_q_used);
+-    s_q_used = s_q_discard = 0;
++    s_q_used = 0;
+ 
+     for (i = 0; i < s_nreads; i++)
+         surf_write_guest(s_reads[i].s, s_rrd.map + s_reads[i].off);
+@@ -1556,13 +1783,18 @@ static void set_dynamic_state(VkCommandBuffer c, const Surf *s,
+     (void)ns;
+ }
+ 
+-/* Whether a draw needs the depth/stencil attachment, and which. */
++/* Whether a draw needs the depth/stencil attachment, and which. A draw or
++ * clear that neither tests nor writes depth or stencil goes without the
++ * depth attachment, unless a pass that has it is already open on its
++ * surface (switching would only split the pass). Attached anyway, every
++ * loading-screen pass loaded and stored the 640x480 depth buffer for
++ * nothing. */
+ static Zeta *zeta_for(const Nv2aRenderState *rs, const Surf *s, int need)
+ {
+     Zeta *z;
+ 
+-    if (!rs->zeta_va && !need)
+-        return NULL;
++    if (!need)
++        return s_rendering && s_rt == s ? s_rt_z : NULL;
+     z = zeta_get(rs->zeta_va, s->w, s->h, s->sc);
+     if (z) {
+         z->pitch = rs->zeta_pitch;
+@@ -1724,9 +1956,31 @@ static void fill_draw_uniforms(VkDraw *u, const Nv2aFullBatch *b,
+ }
+ 
+ static void pipe_key(PipeKey *pk, const Surf *s, const Zeta *z,
+-                     const Nv2aRenderState *rs, int vsh)
++                     const Nv2aRenderState *rs, int vsh,
++                     const Nv2aFullBatch *b, const VkDraw *u)
+ {
++    int i;
++
+     memset(pk, 0, sizeof *pk);
++    if (b->use_rc) {
++        for (i = 0; i < 8; i++) {
++            pk->spec[VK_SPEC_CICW + i] = b->rc->color_icw[i];
++            pk->spec[VK_SPEC_AICW + i] = b->rc->alpha_icw[i];
++            pk->spec[VK_SPEC_COCW + i] = b->rc->color_ocw[i];
++            pk->spec[VK_SPEC_AOCW + i] = b->rc->alpha_ocw[i];
++        }
++        pk->spec[VK_SPEC_FIN0] = b->rc->final0;
++        pk->spec[VK_SPEC_FIN1] = b->rc->final1;
++        pk->spec[VK_SPEC_CONTROL] = b->rc->control;
++        pk->spec[VK_SPEC_STAGEPROG] = b->rc->stage_program;
++        pk->spec[VK_SPEC_CLIPMODE] = b->clip_plane_mode;
++        pk->spec[VK_SPEC_STAGEIN] = b->stage_input;
++        pk->spec[VK_SPEC_CUBE] = u->misc[1];
++    }
++    pk->spec[VK_SPEC_RC] = b->use_rc;
++    pk->spec[VK_SPEC_ATEST] = rs->alpha_test_enable != 0;
++    pk->spec[VK_SPEC_AFUNC] = rs->alpha_test_enable ? rs->alpha_func : 0;
++    pk->spec[VK_SPEC_BORDER] = u->misc[2];
+     pk->fmt = (uint32_t)s->color.fmt;
+     pk->depth = z != NULL;
+     pk->vsh = (uint32_t)vsh;
+@@ -1812,6 +2066,7 @@ static void vk_draw_full(const Nv2aSurface *ns, const Nv2aFullBatch *b)
+ 
+     if (!b->count || vbytes > s_rv.size)
+         return;
++    s_draw_target_va = ns->color_va;
+     stage_descriptors(b, img2d, imgcube);
+     s = surf_get(ns, ns->clip_y + ns->height);
+     if (!s)
+@@ -1825,7 +2080,10 @@ static void vk_draw_full(const Nv2aSurface *ns, const Nv2aFullBatch *b)
+     use_q = rs->zpass_enable != 0;
+     if (uoff == UINT64_MAX || voff == UINT64_MAX
+         || (use_q && s_q_used == VK_MAX_QUERIES)) {
+-        flush();
++        if (use_q && s_q_used == VK_MAX_QUERIES)
++            flush();
++        else
++            soft_flush();
+         /* The open pass is gone: take everything again. */
+         s = surf_get(ns, ns->clip_y + ns->height);
+         if (!s)
+@@ -1848,7 +2106,7 @@ static void vk_draw_full(const Nv2aSurface *ns, const Nv2aFullBatch *b)
+         p[2] = p[2] / zmax * wv;
+     }
+ 
+-    pipe_key(&pk, s, z, rs, 0);
++    pipe_key(&pk, s, z, rs, 0, b, (const VkDraw *)(s_ru.map + uoff));
+     pipe = pipe_get(&pk);
+     if (!pipe)
+         return;
+@@ -1895,6 +2153,7 @@ static void vk_draw_program(const Nv2aSurface *ns, const Nv2aProgramBatch *b)
+ 
+     if (!b->count || !b->ninst || b->ninst > NV2A_VSH_SLOTS_VK)
+         return;
++    s_draw_target_va = ns->color_va;
+     stage_descriptors(pix, img2d, imgcube);
+     s = surf_get(ns, ns->clip_y + ns->height);
+     if (!s)
+@@ -1969,7 +2228,10 @@ static void vk_draw_program(const Nv2aSurface *ns, const Nv2aProgramBatch *b)
+             break;
+         if (pass)
+             return;
+-        flush();
++        if (use_q && s_q_used == VK_MAX_QUERIES)
++            flush();
++        else
++            soft_flush();
+         s = surf_get(ns, ns->clip_y + ns->height);
+         if (!s)
+             return;
+@@ -2019,7 +2281,7 @@ static void vk_draw_program(const Nv2aSurface *ns, const Nv2aProgramBatch *b)
+     for (k = 0; k < b->count; k++)
+         ix[k] = b->indices[k] - b->min_index;
+ 
+-    pipe_key(&pk, s, z, rs, 1);
++    pipe_key(&pk, s, z, rs, 1, pix, (const VkDraw *)(s_ru.map + uoff));
+     pipe = pipe_get(&pk);
+     if (!pipe)
+         return;
+@@ -2058,15 +2320,32 @@ static void vk_draw_program(const Nv2aSurface *ns, const Nv2aProgramBatch *b)
+ 
+ static void vk_report_clear(void)
+ {
+-    s_report_acc = 0;
+-    s_q_discard = s_q_used;
++    s_q_epoch = s_q_used;
++    s_epoch_carry = 0;
++}
++
++static uint32_t vk_report_mark(void)
++{
++    uint32_t m = s_next_mark++ % VK_MAX_MARKS;
++
++    if (s_nopen == VK_MAX_MARKS)
++        flush();
++    s_marks[m].begin = s_q_epoch;
++    s_marks[m].end = s_q_used;
++    s_marks[m].carry = s_epoch_carry;
++    s_marks[m].resolved = s_q_epoch == s_q_used;
++    s_marks[m].value = s_epoch_carry;
++    if (!s_marks[m].resolved)
++        s_open_marks[s_nopen++] = m;
++    return m;
+ }
+ 
+-static uint32_t vk_report_read(void)
++static uint32_t vk_report_value(uint32_t m)
+ {
+-    if (s_q_used > s_q_discard)
++    m %= VK_MAX_MARKS;
++    if (!s_marks[m].resolved)
+         flush();
+-    return s_report_acc > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)s_report_acc;
++    return s_marks[m].value > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)s_marks[m].value;
+ }
+ 
+ /* Before a flip shows `va`: that surface, and every other one drawn since
+@@ -2191,9 +2470,9 @@ static void vk_flip(void)
+             i--;
+         }
+     if (s_verbose && s_frame % 300 == 0)
+-        fprintf(stderr, "[VK] flip %u: %u draws, %u tris, %u flushes, %d textures"
++        fprintf(stderr, "[VK] flip %u: %u draws, %u tris, %u flushes (+%u soft), %d textures"
+                         " (%u uploads, %u new, %u read back, %u copied, %u hits), %u program draws, %u alias syncs\n", s_frame,
+-                s_draws, s_tris, s_flushes, s_ntex, s_tex_uploads, s_tex_new, s_tex_rt,
++                s_draws, s_tris, s_flushes, s_soft_flushes, s_ntex, s_tex_uploads, s_tex_new, s_tex_rt,
+                 s_tex_copies, s_tex_hits, s_prog_draws, s_alias_syncs);
+ }
+ 
+@@ -2206,7 +2485,7 @@ static void vk_draw_unused(const Nv2aSurface *s, const Nv2aBatch *b)
+ 
+ static Nv2aBackend s_backend = {
+     vk_clear, vk_draw_unused, vk_flip,
+-    vk_draw_full, vk_report_clear, vk_report_read, vk_resolve,
++    vk_draw_full, vk_report_clear, vk_report_mark, vk_report_value, vk_resolve,
+     vk_draw_program,
+ };
+ 
+@@ -2422,12 +2701,14 @@ static int create_objects(void)
+ 
+     pi.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+     pi.queueFamilyIndex = s_qfam;
+-    VK_CHECK(vkCreateCommandPool(s_dev, &pi, NULL, &s_pool));
+-    ai.commandPool = s_pool;
+-    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+-    ai.commandBufferCount = 1;
+-    VK_CHECK(vkAllocateCommandBuffers(s_dev, &ai, &s_cmd));
+-    VK_CHECK(vkCreateFence(s_dev, &fi, NULL, &s_fence));
++    for (int k = 0; k < 2; k++) {
++        VK_CHECK(vkCreateCommandPool(s_dev, &pi, NULL, &s_slot[k].pool));
++        ai.commandPool = s_slot[k].pool;
++        ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++        ai.commandBufferCount = 1;
++        VK_CHECK(vkAllocateCommandBuffers(s_dev, &ai, &s_slot[k].cmd));
++        VK_CHECK(vkCreateFence(s_dev, &fi, NULL, &s_slot[k].fence));
++    }
+ 
+     memset(bind, 0, sizeof bind);
+     bind[0].binding = 0;
+@@ -2463,6 +2744,11 @@ static int create_objects(void)
+     sm.codeSize = sizeof k_frag_spv;
+     sm.pCode = k_frag_spv;
+     VK_CHECK(vkCreateShaderModule(s_dev, &sm, NULL, &s_fs));
++    {
++        VkPipelineCacheCreateInfo pc = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
++        if (vkCreatePipelineCache(s_dev, &pc, NULL, &s_pcache) != VK_SUCCESS)
++            s_pcache = VK_NULL_HANDLE;
++    }
+     sm.codeSize = sizeof k_vsh_spv;
+     sm.pCode = k_vsh_spv;
+     VK_CHECK(vkCreateShaderModule(s_dev, &sm, NULL, &s_vsh));
+@@ -2472,13 +2758,17 @@ static int create_objects(void)
+     VK_CHECK(vkCreateQueryPool(s_dev, &qp, NULL, &s_qpool));
+     vkResetQueryPool(s_dev, s_qpool, 0, VK_MAX_QUERIES);
+ 
+-    if (!ring_create(&s_rv, VK_RING_VERTS, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
+-                         | VK_BUFFER_USAGE_INDEX_BUFFER_BIT
+-                         | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+-        || !ring_create(&s_ru, VK_RING_UNIFORM, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)
+-        || !ring_create(&s_rup, VK_RING_UPLOAD, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)
+-        || !ring_create(&s_rrd, VK_RING_READ, VK_BUFFER_USAGE_TRANSFER_DST_BIT))
++    for (int k = 0; k < 2; k++)
++        if (!ring_create(&s_slot[k].rv, VK_RING_VERTS, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
++                                       | VK_BUFFER_USAGE_INDEX_BUFFER_BIT
++                                       | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
++            || !ring_create(&s_slot[k].ru, VK_RING_UNIFORM, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)
++            || !ring_create(&s_slot[k].rup, VK_RING_UPLOAD, VK_BUFFER_USAGE_TRANSFER_SRC_BIT))
++            return 0;
++    if (!ring_create(&s_rrd, VK_RING_READ, VK_BUFFER_USAGE_TRANSFER_DST_BIT))
+         return 0;
++    s_cur = 0;
++    slot_load();
+ 
+     /* What a stage with nothing usable samples. */
+     if (!img_create(&s_white2d, 1, 1, 1, VK_FORMAT_B8G8R8A8_UNORM,
+diff --git a/src/vulkan/shaders/nv2a.frag b/src/vulkan/shaders/nv2a.frag
+index 4237cf8..e4089bc 100644
+--- a/src/vulkan/shaders/nv2a.frag
++++ b/src/vulkan/shaders/nv2a.frag
+@@ -35,6 +35,59 @@ layout(set = 0, binding = 0, std140) uniform Draw {
+     vec4  bumpls[4];/* BUMP_ENV_SCALE, _OFFSET */
+ } u;
+ 
++/* The draw's combiner program and the switches around it, as specialisation
++ * constants (nv2a_vk.c VK_SPEC_*): the driver compiles a pipeline per
++ * program with every branch and register choice folded, where reading them
++ * from the uniform block made one shader interpret all of them per pixel --
++ * ~64 us for a full-screen quad. Constant colours stay in the block. */
++layout(constant_id = 0) const uint K_CICW0 = 0u;
++layout(constant_id = 1) const uint K_CICW1 = 0u;
++layout(constant_id = 2) const uint K_CICW2 = 0u;
++layout(constant_id = 3) const uint K_CICW3 = 0u;
++layout(constant_id = 4) const uint K_CICW4 = 0u;
++layout(constant_id = 5) const uint K_CICW5 = 0u;
++layout(constant_id = 6) const uint K_CICW6 = 0u;
++layout(constant_id = 7) const uint K_CICW7 = 0u;
++layout(constant_id = 8) const uint K_AICW0 = 0u;
++layout(constant_id = 9) const uint K_AICW1 = 0u;
++layout(constant_id = 10) const uint K_AICW2 = 0u;
++layout(constant_id = 11) const uint K_AICW3 = 0u;
++layout(constant_id = 12) const uint K_AICW4 = 0u;
++layout(constant_id = 13) const uint K_AICW5 = 0u;
++layout(constant_id = 14) const uint K_AICW6 = 0u;
++layout(constant_id = 15) const uint K_AICW7 = 0u;
++layout(constant_id = 16) const uint K_COCW0 = 0u;
++layout(constant_id = 17) const uint K_COCW1 = 0u;
++layout(constant_id = 18) const uint K_COCW2 = 0u;
++layout(constant_id = 19) const uint K_COCW3 = 0u;
++layout(constant_id = 20) const uint K_COCW4 = 0u;
++layout(constant_id = 21) const uint K_COCW5 = 0u;
++layout(constant_id = 22) const uint K_COCW6 = 0u;
++layout(constant_id = 23) const uint K_COCW7 = 0u;
++layout(constant_id = 24) const uint K_AOCW0 = 0u;
++layout(constant_id = 25) const uint K_AOCW1 = 0u;
++layout(constant_id = 26) const uint K_AOCW2 = 0u;
++layout(constant_id = 27) const uint K_AOCW3 = 0u;
++layout(constant_id = 28) const uint K_AOCW4 = 0u;
++layout(constant_id = 29) const uint K_AOCW5 = 0u;
++layout(constant_id = 30) const uint K_AOCW6 = 0u;
++layout(constant_id = 31) const uint K_AOCW7 = 0u;
++layout(constant_id = 32) const uint K_FIN0 = 0u;
++layout(constant_id = 33) const uint K_FIN1 = 0u;
++layout(constant_id = 34) const uint K_CONTROL = 0u;
++layout(constant_id = 35) const uint K_STAGEPROG = 0u;
++layout(constant_id = 36) const uint K_RC = 0u;
++layout(constant_id = 37) const uint K_ATEST = 0u;
++layout(constant_id = 38) const uint K_AFUNC = 0u;
++layout(constant_id = 39) const uint K_CLIPMODE = 0u;
++layout(constant_id = 40) const uint K_CUBE = 0u;
++layout(constant_id = 41) const uint K_BORDER = 0u;
++layout(constant_id = 42) const uint K_STAGEIN = 0u;
++uint k_cicw(int s) { switch (s) { case 0: return K_CICW0; case 1: return K_CICW1; case 2: return K_CICW2; case 3: return K_CICW3; case 4: return K_CICW4; case 5: return K_CICW5; case 6: return K_CICW6; case 7: return K_CICW7; } return 0u; }
++uint k_aicw(int s) { switch (s) { case 0: return K_AICW0; case 1: return K_AICW1; case 2: return K_AICW2; case 3: return K_AICW3; case 4: return K_AICW4; case 5: return K_AICW5; case 6: return K_AICW6; case 7: return K_AICW7; } return 0u; }
++uint k_cocw(int s) { switch (s) { case 0: return K_COCW0; case 1: return K_COCW1; case 2: return K_COCW2; case 3: return K_COCW3; case 4: return K_COCW4; case 5: return K_COCW5; case 6: return K_COCW6; case 7: return K_COCW7; } return 0u; }
++uint k_aocw(int s) { switch (s) { case 0: return K_AOCW0; case 1: return K_AOCW1; case 2: return K_AOCW2; case 3: return K_AOCW3; case 4: return K_AOCW4; case 5: return K_AOCW5; case 6: return K_AOCW6; case 7: return K_AOCW7; } return 0u; }
++
+ layout(set = 0, binding = 1) uniform sampler2D s_2d[4];
+ layout(set = 0, binding = 5) uniform samplerCube s_cube[4];
+ 
+@@ -45,7 +98,7 @@ uint word8(uvec4 v[2], int i) { return v[i >> 2][i & 3]; }
+ vec4 texel2d(int st, vec2 c)
+ {
+     vec2 n = c * u.tscale[st].xy;
+-    if (((u.misc.z >> st) & 1u) != 0u) {
++    if (((K_BORDER >> st) & 1u) != 0u) {
+         uint au = u.addr[st] & 0xFFu, av = (u.addr[st] >> 8) & 0xFFu;
+         if ((au == 4u && (n.x < 0.0 || n.x >= 1.0))
+          || (av == 4u && (n.y < 0.0 || n.y >= 1.0)))
+@@ -65,8 +118,8 @@ float sbyte(float x)
+ /* The stage a dependent stage reads (SET_SHADER_OTHER_STAGE_INPUT). */
+ int stage_input(int st)
+ {
+-    if (st == 2) return int((u.misc.w >> 16) & 0xFu);
+-    if (st == 3) return int((u.misc.w >> 20) & 0xFu);
++    if (st == 2) return int((K_STAGEIN >> 16) & 0xFu);
++    if (st == 3) return int((K_STAGEIN >> 20) & 0xFu);
+     return 0;
+ }
+ 
+@@ -75,7 +128,7 @@ int stage_input(int st)
+  * the pixel. */
+ bool stage_fetch(int st, vec4 c, vec4 t[4], out vec4 r)
+ {
+-    uint mode = (u.fin.w >> (5 * st)) & 0x1Fu;
++    uint mode = (K_STAGEPROG >> (5 * st)) & 0x1Fu;
+     float q = c.w != 0.0 ? c.w : 1.0;
+ 
+     r = vec4(0.0);
+@@ -84,7 +137,7 @@ bool stage_fetch(int st, vec4 c, vec4 t[4], out vec4 r)
+     } else if (mode == 1u || mode == 2u) {              /* PROJECT2D / 3D */
+         r = texel2d(st, c.xy / q);
+     } else if (mode == 3u) {                            /* CUBEMAP */
+-        if (((u.misc.y >> st) & 1u) != 0u)
++        if (((K_CUBE >> st) & 1u) != 0u)
+             r = texture(s_cube[st], c.xyz);
+         else
+             r = texel2d(st, c.xy);
+@@ -92,7 +145,7 @@ bool stage_fetch(int st, vec4 c, vec4 t[4], out vec4 r)
+         r = clamp(c, 0.0, 1.0);
+     } else if (mode == 5u) {                            /* CLIPPLANE */
+         for (int j = 0; j < 4; j++) {
+-            bool ge = ((u.misc.x >> (st * 4 + j)) & 1u) != 0u;
++            bool ge = ((K_CLIPMODE >> (st * 4 + j)) & 1u) != 0u;
+             if (ge ? c[j] >= 0.0 : c[j] < 0.0)
+                 return false;
+         }
+@@ -138,18 +191,71 @@ float map_out(float x, uint m)
+     return x;
+ }
+ 
+-vec4 R[16];
++/* The combiner registers, as sixteen variables rather than an array: the
++ * register a byte names is the same for every pixel of a draw, so a switch
++ * over them is a uniform branch, where an array indexed by it lived in
++ * scratch memory -- every combiner read and write a memory access, and a
++ * full-screen pass cost ~64 us on a desktop GPU. */
++vec4 R0, R1, R2, R3, R4, R5, R6, R7, R8, R9, R10, R11, R12, R13, R14, R15;
++
++vec4 rget(uint i)
++{
++    switch (i & 0xFu) {
++    case 0u: return R0;
++    case 1u: return R1;
++    case 2u: return R2;
++    case 3u: return R3;
++    case 4u: return R4;
++    case 5u: return R5;
++    case 6u: return R6;
++    case 7u: return R7;
++    case 8u: return R8;
++    case 9u: return R9;
++    case 10u: return R10;
++    case 11u: return R11;
++    case 12u: return R12;
++    case 13u: return R13;
++    case 14u: return R14;
++    case 15u: return R15;
++    }
++    return R0;
++}
++
++void rset(uint i, vec4 v)
++{
++    switch (i & 0xFu) {
++    case 0u: R0 = v; break;
++    case 1u: R1 = v; break;
++    case 2u: R2 = v; break;
++    case 3u: R3 = v; break;
++    case 4u: R4 = v; break;
++    case 5u: R5 = v; break;
++    case 6u: R6 = v; break;
++    case 7u: R7 = v; break;
++    case 8u: R8 = v; break;
++    case 9u: R9 = v; break;
++    case 10u: R10 = v; break;
++    case 11u: R11 = v; break;
++    case 12u: R12 = v; break;
++    case 13u: R13 = v; break;
++    case 14u: R14 = v; break;
++    case 15u: R15 = v; break;
++    }
++}
++
++void rset_rgb(uint i, vec3 v) { rset(i, vec4(v, rget(i).a)); }
++void rset_a(uint i, float a)  { rset(i, vec4(rget(i).rgb, a)); }
+ 
+ vec3 read_rgb(uint byte)
+ {
+-    vec4 r = R[byte & 0xFu];
++    vec4 r = rget(byte);
+     vec3 v = (byte & 0x10u) != 0u ? r.aaa : r.rgb;
+     return vec3(map_in(v.x, byte), map_in(v.y, byte), map_in(v.z, byte));
+ }
+ 
+ float read_alpha(uint byte)
+ {
+-    vec4 r = R[byte & 0xFu];
++    vec4 r = rget(byte);
+     return map_in((byte & 0x10u) != 0u ? r.a : r.b, byte);
+ }
+ 
+@@ -158,80 +264,91 @@ vec3 map_out3(vec3 v, uint m)
+     return clamp(vec3(map_out(v.x, m), map_out(v.y, m), map_out(v.z, m)), -1.0, 1.0);
+ }
+ 
++/* One general combiner stage. Called once per stage with constant arguments
++ * (combine), not from a loop: the compiler did not unroll the loop, so the
++ * stage number stayed a run-time value and every register the control words
++ * name became a 16-way select -- some 1500 of them per pixel. */
++void cstage(int s, uint icw, uint ocw, uint aicw, uint aocw, uint flags)
++{
++    uint fl = ocw >> 12, afl = aocw >> 12;
++    bool mux_cd;
++
++    R1 = u.f0[(flags & 0x010u) != 0u ? s : 0];
++    R2 = u.f1[(flags & 0x100u) != 0u ? s : 0];
++    mux_cd = (flags & 1u) != 0u ? R12.a >= 0.5
++                                : (int(R12.a * 255.0) & 1) != 0;
++
++    vec3 A = read_rgb(icw >> 24), B = read_rgb(icw >> 16);
++    vec3 C = read_rgb(icw >> 8), D = read_rgb(icw);
++    float aA = read_alpha(aicw >> 24), aB = read_alpha(aicw >> 16);
++    float aC = read_alpha(aicw >> 8), aD = read_alpha(aicw);
++
++    vec3 pab = (fl & 2u) != 0u ? vec3(dot(A, B)) : A * B;
++    vec3 pcd = (fl & 1u) != 0u ? vec3(dot(C, D)) : C * D;
++    vec3 sum = (fl & 4u) != 0u ? (mux_cd ? pcd : pab) : pab + pcd;
++    vec3 ab = map_out3(pab, fl & 0x38u);
++    vec3 cd = map_out3(pcd, fl & 0x38u);
++    vec3 ms = map_out3(sum, fl & 0x38u);
++
++    float qab = aA * aB, qcd = aC * aD;
++    float qs = (afl & 4u) != 0u ? (mux_cd ? qcd : qab) : qab + qcd;
++    float aab = clamp(map_out(qab, afl & 0x38u), -1.0, 1.0);
++    float acd = clamp(map_out(qcd, afl & 0x38u), -1.0, 1.0);
++    float ams = clamp(map_out(qs, afl & 0x38u), -1.0, 1.0);
++
++    uint d;
++    if ((d = (ocw >> 4) & 0xFu) != 0u) {
++        rset_rgb(d, ab);
++        if ((fl & 0x80u) != 0u) rset_a(d, ab.b);   /* blue to alpha */
++    }
++    if ((d = ocw & 0xFu) != 0u) {
++        rset_rgb(d, cd);
++        if ((fl & 0x40u) != 0u) rset_a(d, cd.b);
++    }
++    if ((d = (ocw >> 8) & 0xFu) != 0u)
++        rset_rgb(d, ms);
++    if ((d = (aocw >> 4) & 0xFu) != 0u) rset_a(d, aab);
++    if ((d = aocw & 0xFu) != 0u)        rset_a(d, acd);
++    if ((d = (aocw >> 8) & 0xFu) != 0u) rset_a(d, ams);
++    R0 = vec4(0.0);
++}
++
+ vec4 combine(vec4 v0, vec4 v1, vec4 fog, vec4 t[4])
+ {
+-    uint control = u.fin.z, n = min(control & 0xFFu, 8u), flags = control >> 8;
++    uint control = K_CONTROL, n = min(control & 0xFFu, 8u), flags = control >> 8;
+     vec4 o;
+ 
+-    for (int i = 0; i < 16; i++)
+-        R[i] = vec4(0.0);
+-    R[3] = fog;
+-    R[4] = v0;
+-    R[5] = v1;
+-    R[8] = t[0]; R[9] = t[1]; R[10] = t[2]; R[11] = t[3];
++    R0 = R1 = R2 = R6 = R7 = R12 = R13 = R14 = R15 = vec4(0.0);
++    R3 = fog;
++    R4 = v0;
++    R5 = v1;
++    R8 = t[0]; R9 = t[1]; R10 = t[2]; R11 = t[3];
+     /* r0.a starts as texture 0's alpha, or 1 with stage 0 off. */
+-    R[12].a = (u.fin.w & 0x1Fu) != 0u ? t[0].a : 1.0;
+-
+-    for (int s = 0; s < int(n); s++) {
+-        uint icw = word8(u.cicw, s), ocw = word8(u.cocw, s);
+-        uint aicw = word8(u.aicw, s), aocw = word8(u.aocw, s);
+-        uint fl = ocw >> 12, afl = aocw >> 12;
+-        bool mux_cd;
+-
+-        R[1] = u.f0[(flags & 0x010u) != 0u ? s : 0];
+-        R[2] = u.f1[(flags & 0x100u) != 0u ? s : 0];
+-        mux_cd = (flags & 1u) != 0u ? R[12].a >= 0.5
+-                                    : (int(R[12].a * 255.0) & 1) != 0;
+-
+-        vec3 A = read_rgb(icw >> 24), B = read_rgb(icw >> 16);
+-        vec3 C = read_rgb(icw >> 8), D = read_rgb(icw);
+-        float aA = read_alpha(aicw >> 24), aB = read_alpha(aicw >> 16);
+-        float aC = read_alpha(aicw >> 8), aD = read_alpha(aicw);
+-
+-        vec3 pab = (fl & 2u) != 0u ? vec3(dot(A, B)) : A * B;
+-        vec3 pcd = (fl & 1u) != 0u ? vec3(dot(C, D)) : C * D;
+-        vec3 sum = (fl & 4u) != 0u ? (mux_cd ? pcd : pab) : pab + pcd;
+-        vec3 ab = map_out3(pab, fl & 0x38u);
+-        vec3 cd = map_out3(pcd, fl & 0x38u);
+-        vec3 ms = map_out3(sum, fl & 0x38u);
+-
+-        float qab = aA * aB, qcd = aC * aD;
+-        float qs = (afl & 4u) != 0u ? (mux_cd ? qcd : qab) : qab + qcd;
+-        float aab = clamp(map_out(qab, afl & 0x38u), -1.0, 1.0);
+-        float acd = clamp(map_out(qcd, afl & 0x38u), -1.0, 1.0);
+-        float ams = clamp(map_out(qs, afl & 0x38u), -1.0, 1.0);
+-
+-        uint d;
+-        if ((d = (ocw >> 4) & 0xFu) != 0u) {
+-            R[d].rgb = ab;
+-            if ((fl & 0x80u) != 0u) R[d].a = ab.b;   /* blue to alpha */
+-        }
+-        if ((d = ocw & 0xFu) != 0u) {
+-            R[d].rgb = cd;
+-            if ((fl & 0x40u) != 0u) R[d].a = cd.b;
+-        }
+-        if ((d = (ocw >> 8) & 0xFu) != 0u)
+-            R[d].rgb = ms;
+-        if ((d = (aocw >> 4) & 0xFu) != 0u) R[d].a = aab;
+-        if ((d = aocw & 0xFu) != 0u)        R[d].a = acd;
+-        if ((d = (aocw >> 8) & 0xFu) != 0u) R[d].a = ams;
+-        R[0] = vec4(0.0);
+-    }
++    R12.a = (K_STAGEPROG & 0x1Fu) != 0u ? t[0].a : 1.0;
++
++    if (n > 0u) cstage(0, K_CICW0, K_COCW0, K_AICW0, K_AOCW0, flags);
++    if (n > 1u) cstage(1, K_CICW1, K_COCW1, K_AICW1, K_AOCW1, flags);
++    if (n > 2u) cstage(2, K_CICW2, K_COCW2, K_AICW2, K_AOCW2, flags);
++    if (n > 3u) cstage(3, K_CICW3, K_COCW3, K_AICW3, K_AOCW3, flags);
++    if (n > 4u) cstage(4, K_CICW4, K_COCW4, K_AICW4, K_AOCW4, flags);
++    if (n > 5u) cstage(5, K_CICW5, K_COCW5, K_AICW5, K_AOCW5, flags);
++    if (n > 6u) cstage(6, K_CICW6, K_COCW6, K_AICW6, K_AOCW6, flags);
++    if (n > 7u) cstage(7, K_CICW7, K_COCW7, K_AICW7, K_AOCW7, flags);
+ 
+-    if (u.fin.x != 0u || u.fin.y != 0u) {
+-        uint f0 = u.fin.x, f1 = u.fin.y, ff = f1 & 0xFFu;
+-        R[1] = u.fc0;
+-        R[2] = u.fc1;
+-        vec3 a = (ff & 0x40u) != 0u ? 1.0 - R[5].rgb : R[5].rgb;
+-        vec3 b = (ff & 0x20u) != 0u ? 1.0 - R[12].rgb : R[12].rgb;
+-        R[14] = vec4((ff & 0x80u) != 0u ? clamp(a + b, 0.0, 1.0) : a + b, 0.0);
++    if (K_FIN0 != 0u || K_FIN1 != 0u) {
++        uint f0 = K_FIN0, f1 = K_FIN1, ff = f1 & 0xFFu;
++        R1 = u.fc0;
++        R2 = u.fc1;
++        vec3 a = (ff & 0x40u) != 0u ? 1.0 - R5.rgb : R5.rgb;
++        vec3 b = (ff & 0x20u) != 0u ? 1.0 - R12.rgb : R12.rgb;
++        R14 = vec4((ff & 0x80u) != 0u ? clamp(a + b, 0.0, 1.0) : a + b, 0.0);
+         vec3 E = read_rgb(f1 >> 24), F = read_rgb(f1 >> 16);
+-        R[15] = vec4(E * F, 0.0);
++        R15 = vec4(E * F, 0.0);
+         vec3 A = read_rgb(f0 >> 24), B = read_rgb(f0 >> 16);
+         vec3 C = read_rgb(f0 >> 8), D = read_rgb(f0);
+         o = vec4(D + C * (1.0 - A) + B * A, read_alpha(f1 >> 8));
+     } else {
+-        o = R[12];
++        o = R12;
+     }
+     return clamp(o, 0.0, 1.0);
+ }
+@@ -239,7 +356,7 @@ vec4 combine(vec4 v0, vec4 v1, vec4 fog, vec4 t[4])
+ bool alpha_pass(float a)
+ {
+     int v = int(a * 255.0 + 0.5), r = int(u.mode.w & 0xFFu);
+-    switch (u.mode.z) {
++    switch (K_AFUNC) {
+     case 0x200u: return false;
+     case 0x201u: return v <  r;
+     case 0x202u: return v == r;
+@@ -255,22 +372,26 @@ void main()
+ {
+     vec4 col;
+ 
+-    if (u.mode.x != 0u) {
++    if (K_RC != 0u) {
+         vec4 tc[4] = vec4[4](v_t0, v_t1, v_t2, v_t3);
+         vec4 t[4] = vec4[4](vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0));
+-        for (int st = 0; st < 4; st++) {
+-            vec4 r;
+-            if (!stage_fetch(st, tc[st], t, r))
+-                discard;
+-            t[st] = r;
+-        }
++        /* Unrolled, as the combiner stages are (cstage). */
++        vec4 r;
++        if (!stage_fetch(0, tc[0], t, r)) discard;
++        t[0] = r;
++        if (!stage_fetch(1, tc[1], t, r)) discard;
++        t[1] = r;
++        if (!stage_fetch(2, tc[2], t, r)) discard;
++        t[2] = r;
++        if (!stage_fetch(3, tc[3], t, r)) discard;
++        t[3] = r;
+         col = combine(v_d0, v_d1, vec4(u.fogc.rgb, v_fog), t);
+     } else {
+         /* Stage 0 nearest times diffuse (a stage that samples nothing has a
+          * white texture bound), as the executor's pre-transformed path. */
+         col = clamp(v_d0, 0.0, 1.0) * texel2d(0, v_t0.xy);
+     }
+-    if (u.mode.y != 0u && !alpha_pass(col.a))
++    if (K_ATEST != 0u && !alpha_pass(col.a))
+         discard;
+     o_color = col;
+ }

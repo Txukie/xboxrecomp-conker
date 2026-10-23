@@ -1,0 +1,102 @@
+diff --git a/src/apu/apu_state.h b/src/apu/apu_state.h
+index 7318675..22c0cca 100644
+--- a/src/apu/apu_state.h
++++ b/src/apu/apu_state.h
+@@ -374,6 +374,7 @@ typedef struct MCPXAPUVPSSLData {
+     uint8_t count[MCPX_HW_SSLS_PER_VOICE];
+     int ssl_index;
+     int ssl_seg;
++    int empty_frames;   /* frames the current segment's entry read empty */
+ } MCPXAPUVPSSLData;
+ 
+ typedef struct MCPXAPUVoiceFilter {
+diff --git a/src/apu/apu_vp.c b/src/apu/apu_vp.c
+index 3ec56ca..918c656 100644
+--- a/src/apu/apu_vp.c
++++ b/src/apu/apu_vp.c
+@@ -242,6 +242,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
+                        NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
+         d->vp.ssl[selected_handle].ssl_seg = 0;
+         d->vp.ssl[selected_handle].ssl_index = 0;
++        d->vp.ssl[selected_handle].empty_frames = 0;
+ 
+         unsigned int ea_start = GET_MASK(argument, NV1BA0_PIO_VOICE_ON_ENVA);
+         voice_set_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_STATE,
+@@ -1075,6 +1076,23 @@ static void vp_ring_report(unsigned secs)
+  * Sample fetching from voice buffers
+  * ============================================================ */
+ 
++/* VP frames a stream voice waits on an empty SSL entry before stepping over
++ * it: 150 frames of 32 samples, 100 ms. */
++#define SSL_EMPTY_FRAMES_MAX 150
++
++/* A stream voice finished segment ssl_seg of SSL ssl_index: on to the next
++ * segment, or to the other SSL, reporting this one done. */
++static void ssl_next_segment(MCPXAPUState *d, uint32_t v, int ssl_index)
++{
++    d->vp.ssl[v].ssl_seg += 1;
++    if (d->vp.ssl[v].ssl_seg < d->vp.ssl[v].count[ssl_index])
++        return;
++    d->vp.ssl[v].ssl_index = (ssl_index + 1) % 2;
++    d->vp.ssl[v].ssl_seg = 0;
++    set_notify_status(d, v, MCPX_HW_NOTIFIER_SSLA_DONE + ssl_index,
++                      NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
++}
++
+ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
+                        int num_samples_requested)
+ {
+@@ -1158,8 +1176,24 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
+         hwaddr addr = d->regs[NV_PAPU_VPSSLADDR] + page * 8;
+         segment_offset = ldl_le_phys(address_space_memory, addr);
+         segment_length = ldl_le_phys(address_space_memory, addr + 4);
+-        assert(segment_offset != 0);
+-        assert(segment_length != 0);
++        /* A segment the SSL counts but whose entry is still empty: DirectSound
++         * can raise the count before the entry's offset and length land (on
++         * hardware the window is a few FE methods; here the title's thread
++         * can stop between them while the VP runs). Read as is, a zero
++         * length made ebo 0xFFFFFFFF, and the voice played on from physical
++         * 0 through all of RAM -- minutes of full-scale noise until the
++         * title restarted the stream. Wait for the entry instead, and step
++         * over it if it stays empty, so a stream is never held forever. */
++        if (segment_offset == 0 || (segment_length & 0xffff) == 0) {
++            if (++d->vp.ssl[v].empty_frames < SSL_EMPTY_FRAMES_MAX)
++                return -1;
++            d->vp.ssl[v].empty_frames = 0;
++            ssl_next_segment(d, v, ssl_index);
++            voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_OFFSET,
++                           NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
++            return -1;
++        }
++        d->vp.ssl[v].empty_frames = 0;
+         seg_len = (segment_length >> 0) & 0xffff;
+         seg_cs = (segment_length >> 16) & 3;
+         seg_spb = (segment_length >> 18) & 0x1f;
+@@ -1168,7 +1202,6 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
+         if (seg_cs == NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_ADPCM) {
+             sample_size = NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S24;
+         }
+-        assert(seg_len > 0);
+         ebo = seg_len - 1;
+     }
+ 
+@@ -1288,17 +1321,8 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
+ 
+     if (cbo >= ebo) {
+         if (stream) {
+-            d->vp.ssl[v].ssl_seg += 1;
++            ssl_next_segment(d, v, ssl_index);
+             cbo = 0;
+-            if (d->vp.ssl[v].ssl_seg < d->vp.ssl[v].count[ssl_index]) {
+-                /* Move to next segment */
+-            } else {
+-                int next_index = (ssl_index + 1) % 2;
+-                d->vp.ssl[v].ssl_index = next_index;
+-                d->vp.ssl[v].ssl_seg = 0;
+-                set_notify_status(d, v, MCPX_HW_NOTIFIER_SSLA_DONE + ssl_index,
+-                                  NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
+-            }
+         } else {
+             if (loop) {
+                 cbo = lbo;
