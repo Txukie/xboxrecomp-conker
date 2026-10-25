@@ -26143,6 +26143,8 @@ loc_0003D1F6: ;
  */
 void sub_0003D200(void)
 {
+    extern void sub_0003D200_enter(void);
+    sub_0003D200_enter();
     int _flags = 0; /* fallback flag var */
     uint32_t _fa = 0, _fb = 0;
     int32_t _fas = 0, _fbs = 0;

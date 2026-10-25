@@ -249,6 +249,41 @@ void sub_004C7FFF_enter(void)
         MEM32(alive) = CONKER_DSP_ALIVE_SIGNATURE;
 }
 
+/* sub_0003D200 pushes a camera mode on the player camera's stack (edx the
+ * camera, ecx the slot; on the guest stack the mode mask and two more
+ * words), and does nothing when the slot is taken. The weapon's
+ * over-the-shoulder camera is pushed into slot 1, the only push there,
+ * from 0x0003D143 with mask 0x100 (Aim), every frame the weapon is out; the
+ * aim camera pops it when the weapon goes away.
+ *
+ * While the Swing Button has the weapon out (conker_swing.c), slot 1 is
+ * marked taken -- holding a copy of the mode in use, in case anything pops
+ * it -- so the push does nothing and the camera is not touched. The mark
+ * goes at the next push the button does not want kept. */
+#define CAM_SLOT1_USED    0x27Au
+#define CAM_SLOT1_MARK    0xC35Bu
+void sub_0003D200_enter(void)
+{
+    extern int conker_swing_keep_camera(void);
+    const uint32_t cam = g_edx;
+
+    if (g_ecx != 1)
+        return;
+    if (MEM32(g_esp) == 0x0003D148u && MEM32(g_esp + 4) == 0x100u
+            && conker_swing_keep_camera()) {
+        if (MEM16(cam + CAM_SLOT1_USED) == 0) {
+            MEM16(cam + 0x98) = MEM16(cam + 0x94);
+            MEM32(cam + 0xC8) = MEM32(cam + 0xC0);
+            MEM32(cam + 0x120) = MEM32(cam + 0x118);
+            MEM32(cam + 0x178) = MEM32(cam + 0x170);
+            MEM32(cam + 0x1D0) = MEM32(cam + 0x1C8);
+            MEM16(cam + CAM_SLOT1_USED) = CAM_SLOT1_MARK;
+        }
+    } else if (MEM16(cam + CAM_SLOT1_USED) == CAM_SLOT1_MARK) {
+        MEM16(cam + CAM_SLOT1_USED) = 0;
+    }
+}
+
 void conker_debug_string(uint32_t xbox_va)
 {
     const char *message = (const char *)((uintptr_t)xbox_va + g_xbox_mem_offset);

@@ -21,7 +21,7 @@
 | Partida nueva (Game 1) | ✅ Llega a las escenas iniciales; el juego en sí está poco probado |
 | Renderizado Vulkan | ✅ Píxeles y vertex programs en la GPU; 30 fps como en la consola, o hasta 60/90/120; resolución interna de 1X a 10X |
 | Primer arranque | ✅ Una ventana pide la ISO (también Redump, o el .7z/.zip) o la carpeta extraída y la instala |
-| Recomp Options | ✅ En Options del menú principal: modo de ventana, proporción, resolución, resolución de render, VSync, límite de fps, Allow Skip Cutscenes y Uncensor; se guardan en `settings.cfg` |
+| Recomp Options | ✅ En Options del menú principal: modo de ventana, proporción, resolución, resolución de render, VSync, límite de fps, Allow Skip Cutscenes, Swing Button y Uncensor; se guardan en `settings.cfg` |
 | Mods | ✅ Carpetas en `~/.local/share/conker-recomp/mods` que sustituyen archivos del juego sin tocarlo; se activan y desactivan sin borrarlas |
 | Pantalla panorámica | ✅ Recomp Options o `CONKER_ASPECT=16:9` (Hor+); los vídeos conservan su 4:3 con barras negras; los elementos 2D del menú se estiran |
 | Vídeos (FMV) | ✅ Decodificación y colores comprobados contra ffmpeg con Vulkan |
@@ -47,7 +47,7 @@ más lento.
 
 ```sh
 cmake --build work/conker/project/build --target appimage
-./appimage/Conker-Recomp-0.2.0-x86_64.AppImage
+./appimage/Conker-Recomp-0.2.1-x86_64.AppImage
 ```
 
 El objetivo deja la AppImage en `appimage/`, en la raíz del repositorio
@@ -90,6 +90,11 @@ la versión 1.9.0 y se comprueba su SHA-256.
   LT pulsado un segundo salta cualquier escena, aunque no se haya visto antes
   (normalmente solo se pueden saltar las ya vistas). Las escenas que el juego
   nunca deja saltar, como las de la introducción, siguen igual.
+- **Swing Button** (en Recomp Options, Off por defecto): con X, el botón X
+  golpea con el arma de una sola pulsación, como en la N64, sin cambiar la
+  cámara: saca el arma, golpea (varias pulsaciones encadenan el combo) y la
+  guarda al poco. B y luego RT siguen funcionando como siempre, con la cámara
+  sobre el hombro.
 - **Uncensor** (en Recomp Options): activa el
   [parche de descensura](https://gamebanana.com/mods/697391) (textos y audio).
   Con izquierda/derecha se elige Enable, Disable o Update y con A se aplica.

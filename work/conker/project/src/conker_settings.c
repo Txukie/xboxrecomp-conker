@@ -49,11 +49,12 @@ static volatile int s_scale = 1;
 static volatile int s_vsync = 1;
 static volatile int s_fps = 30;
 static volatile int s_skip_cutscenes;    /* LT skips every cutscene, seen or not */
+static volatile int s_swing_button;      /* X swings the weapon (conker_swing.c) */
 static volatile float s_hor_plus;
 
 static const char *const k_labels[CONKER_OPT_COUNT] = {
     "Display Mode", "Aspect Ratio", "Resolution",
-    "Render Resolution", "VSync", "FPS Limit", "Allow Skip Cutscenes", "Uncensor",
+    "Render Resolution", "VSync", "FPS Limit", "Allow Skip Cutscenes", "Swing Button", "Uncensor",
 };
 /* Uncensor: left and right pick, A carries it out (conker_mods.c). */
 static const char *const k_uncensor[CONKER_UNCENSOR_CHOICES] = { "Disable", "Enable", "Update" };
@@ -94,6 +95,7 @@ static void save(void)
     fprintf(f, "vsync=%s\n", s_vsync ? "on" : "off");
     fprintf(f, "fps_limit=%d\n", s_fps);
     fprintf(f, "skip_cutscenes=%s\n", s_skip_cutscenes ? "yes" : "no");
+    fprintf(f, "swing_button=%s\n", s_swing_button ? "x" : "off");
     fclose(f);
 }
 
@@ -130,6 +132,8 @@ static void parse_line(char *line)
             s_scale = i;
     } else if (!strcmp(key, "vsync")) {
         s_vsync = strcmp(val, "off") != 0;
+    } else if (!strcmp(key, "swing_button")) {
+        s_swing_button = !strcmp(val, "x");
     } else if (!strcmp(key, "skip_cutscenes")) {
         s_skip_cutscenes = !strcmp(val, "yes");
     } else if (!strcmp(key, "fps_limit")) {
@@ -220,6 +224,11 @@ void conker_settings_load(void)
         apply_fps();
 }
 
+int conker_swing_enabled(void)
+{
+    return s_swing_button;
+}
+
 float conker_settings_hor_plus(void)
 {
     return s_hor_plus;
@@ -288,6 +297,9 @@ void conker_options_value(int row, char *buf, size_t size)
     case CONKER_OPT_SKIP_CUTSCENES:
         snprintf(buf, size, "%s", s_skip_cutscenes ? "Yes" : "No");
         break;
+    case CONKER_OPT_SWING_BUTTON:
+        snprintf(buf, size, "%s", s_swing_button ? "X" : "Off");
+        break;
     case CONKER_OPT_UNCENSOR: {
         char status[96];
         int c = s_uncensor < 0 ? conker_mods_uncensor_choice() : s_uncensor;
@@ -355,6 +367,9 @@ static void change(int row, int dir)
         break;
     case CONKER_OPT_SKIP_CUTSCENES:
         s_skip_cutscenes = !s_skip_cutscenes;
+        break;
+    case CONKER_OPT_SWING_BUTTON:
+        s_swing_button = !s_swing_button;
         break;
     case CONKER_OPT_UNCENSOR:
         if (s_uncensor < 0)
@@ -470,6 +485,7 @@ static void swallow_all(void)
 #define LT_PRESSED        30           /* analog threshold, of 255 */
 
 extern ptrdiff_t g_xbox_mem_offset;
+void conker_swing_filter(XBOX_INPUT_STATE *st, uint64_t now);   /* conker_swing.c */
 static unsigned s_lt_held;             /* ports with LT down */
 static int s_all_seen_set;
 
@@ -506,6 +522,8 @@ static void input_filter(DWORD port, XBOX_INPUT_STATE *st, int connected)
         skip_cutscenes_filter(port, st, connected);
     if (!connected || port >= PORTS)
         return;
+    if (!s_open)
+        conker_swing_filter(st, now);
     bits = pad_bits(st);
     pressed = bits & ~s_prev[port];
     s_prev[port] = bits;

@@ -20,6 +20,7 @@ enum {
     CONKER_OPT_VSYNC,
     CONKER_OPT_FPS,
     CONKER_OPT_SKIP_CUTSCENES,
+    CONKER_OPT_SWING_BUTTON,
     CONKER_OPT_UNCENSOR,
     CONKER_OPT_COUNT
 };
@@ -32,6 +33,9 @@ void conker_settings_load(void);
 
 /* Hand the pad to the submenu while it is open (xbox_InputSetFilter). */
 void conker_settings_install_input(void);
+
+/* Swing Button (conker_swing.c): X swings the weapon in one press. */
+int conker_swing_enabled(void);
 
 /* Hor+: how much wider the horizontal view is than 4:3's, or 0 at 4:3. */
 float conker_settings_hor_plus(void);
