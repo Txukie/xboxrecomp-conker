@@ -126,3 +126,90 @@ applies to the submodule. Each should go upstream:
 3. **Write the `Nv2aBackend` → `xbox_gfx` adapter** and register it from
    `main.c`.
 4. **Compile on Windows and macOS.**
+
+## Performance
+
+Goal: a steady frame rate on the Steam Deck at 1X render and the Deck's own
+1280x800 (16:10), where 0.2.1 averaged low and its frame times jumped
+around.
+
+What profiling found on a desktop (Ryzen 7 5800X, RX 9070 XT), uncapped in
+the first garden, and what 0.2.2 changed (patch 0027):
+
+- The game's main thread spends most of the frame in D3D's wait for the GPU
+  to go idle (`sub_0053C450`, spinning on the FIFO put/get and PGRAPH
+  status). The frame is bound by the push-buffer executor's thread and,
+  through it, by every point where that thread waits for the GPU.
+- Conker's glow samples the 640x480 Z24S8 depth buffer as a LIN_R8G8B8A8
+  texture every frame, from the front end on. Each frame read depth back
+  (a full GPU wait), converted it on the CPU, hashed it and decoded it a
+  texel at a time (`sample_tex`, a quarter of the executor thread). It is
+  now made on the GPU from the depth image (`shaders/zeta_pack.frag`).
+  `RECOMP_VK_ZETA_READBACK=1` brings back the old path.
+- Four render targets a frame (two 128x128 and one 64x64 16-bit, one
+  256x256 32-bit) are drawn as linear surfaces and then as swizzled ones at
+  the same address. Each switch went through guest memory with a full GPU
+  wait: about 8 ms of waiting per frame on the desktop. The new view is
+  redrawn from the old one on the GPU (`shaders/surf_alias.frag`, the same
+  byte permutation, checked texel for texel against the CPU's swizzle).
+  `RECOMP_VK_ALIAS_READBACK=1` brings back the old path.
+- Result on the desktop, standing in the garden uncapped: about 49 fps
+  before, 62 after. Full flushes went from about 5 a frame to 2.
+
+Next steps, in the order they would be taken (none investigated yet):
+
+1. **Measure on the Deck.** `perf record` on the game (perf_event_paranoid
+   permitting call graphs there), MangoHud's frame-time graph and
+   `RECOMP_VK_VERBOSE=1`: which thread bounds the frame there, how long
+   the remaining flushes wait, and whether the GPU itself is busy.
+2. **Hashing.** Every surface and texture in use is hashed once a frame to
+   notice CPU writes: about 20 MB a frame, now the largest cost on the
+   executor thread. Split it into textures and surfaces first; then a SIMD
+   hash, or skipping memory known not to have been written (page write
+   tracking, e.g. soft-dirty bits or a write-protect fault) instead of
+   rereading it.
+3. **Presentation without a wait.** Every flip reads back each drawn surface
+   and the frame to show, and waits for the GPU (`vk_resolve`). Submitting
+   that without waiting and presenting it at the next flip would let the
+   CPU and GPU overlap, at a frame of latency. Mind the front end's
+   256x256 luminance downsample, which the CPU reads to set the exposure.
+4. **Visibility tests without a wait.** Draining the occlusion reports at a
+   semaphore release flushes when a result is not in yet (about once a
+   frame). Writing a report only once its fence has signalled, leaving it
+   incomplete until then as D3D expects, would remove that wait, if Conker
+   does not spin on the result.
+5. **The guest's idle spin.** D3D's GPU-idle wait spins a core at 100%. On
+   the Deck the CPU and GPU share one power budget, so a sleeping wait
+   (a hook on `sub_0053C450` that blocks until the executor is idle) could
+   leave more of it to the GPU.
+6. **The executor's own cost.** `nv2a_pb_exec_method`, `note` and
+   `pb_walk_segment` are about a sixth of its thread: profile which
+   methods are hot.
+7. **Hitches from pipeline creation.** The `VkPipelineCache` is not saved,
+   so every run compiles its pipelines again as new combiner programs show
+   up. Save and load it (the driver's own shader cache helps only partly).
+8. **Texture decode fast paths** for the formats that still go texel by
+   texel through `sample_tex` (seen: 0x00, 0x13, 0x1A, 0x24, 0x28), which
+   matter on level loads.
+
+## Parked
+
+- **Weapon: Original (frying pan instead of the bat).** Parked 2026-10-27,
+  to come back to. Findings so far:
+  - The remake has no Conker animations for the pan: the training section
+    ("Pan Handled") uses the bat's 23 body animations
+    (`characters\conker\Weapons\BaseballBat\*`), which every level loads.
+  - Held objects are named by the table at 0x006A6108, indexed by object id
+    (0x280 `BaseballBat`, 0x281 `FryingPanBound`). The name builds the path
+    `aid\bfdmodel\attach\<name>\default.rbm`.
+  - The pan's model (`FryingPanBound`) and its six hand animations
+    (`anim\attach\FryingPan\*`) exist only inside the training level's
+    package, `zpackage\Level\TrainingLevel\default.rbm`.
+  - The cutscene prop `fryingpan` (object 0x18), loaded everywhere, does not
+    work as a drop-in: naming the bat object after it hangs the game when
+    the weapon comes out.
+  - Plan: an extractor for the packages (Rare's CAFF; header 0x180, section
+    entries with a compression type at +0xC, 0 = none, 2 = a custom
+    compression that is not deflate; the parser is around 0x00405C00-0x00407700).
+    The pan's files would then be shipped as uncompressed loose files
+    through the mods overlay.

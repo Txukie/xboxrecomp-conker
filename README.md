@@ -26,7 +26,7 @@
 | Pantalla panorámica | ✅ Recomp Options o `CONKER_ASPECT=16:9` (Hor+); los vídeos conservan su 4:3 con barras negras; los elementos 2D del menú se estiran |
 | Vídeos (FMV) | ✅ Decodificación y colores comprobados contra ffmpeg con Vulkan |
 | Backend Metal | 🔴 Todavía no |
-| Problemas conocidos | Con el rasterizador de CPU los vídeos salen lavados; la emulación USB a veces deja de leer el mando |
+| Problemas conocidos | Con el rasterizador de CPU los vídeos salen lavados |
 
 ## Prueba rápida
 
@@ -47,7 +47,7 @@ más lento.
 
 ```sh
 cmake --build work/conker/project/build --target appimage
-./appimage/Conker-Recomp-0.2.1-x86_64.AppImage
+./appimage/Conker-Recomp-0.2.2-x86_64.AppImage
 ```
 
 El objetivo deja la AppImage en `appimage/`, en la raíz del repositorio

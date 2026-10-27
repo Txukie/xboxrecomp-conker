@@ -1,0 +1,738 @@
+diff --git a/src/vulkan/CMakeLists.txt b/src/vulkan/CMakeLists.txt
+index 1768501..4d5bfbc 100644
+--- a/src/vulkan/CMakeLists.txt
++++ b/src/vulkan/CMakeLists.txt
+@@ -11,7 +11,7 @@ endif()
+ 
+ set(_vk_gen "${CMAKE_CURRENT_BINARY_DIR}/shaders")
+ set(_vk_spv)
+-foreach(_shader nv2a.vert nv2a.frag nv2a_vsh.vert)
++foreach(_shader nv2a.vert nv2a.frag nv2a_vsh.vert zeta_pack.vert zeta_pack.frag surf_alias.frag)
+     add_custom_command(
+         OUTPUT "${_vk_gen}/${_shader}.inc"
+         COMMAND "${CMAKE_COMMAND}" -E make_directory "${_vk_gen}"
+diff --git a/src/vulkan/nv2a_vk.c b/src/vulkan/nv2a_vk.c
+index ce5345c..e2eeda5 100644
+--- a/src/vulkan/nv2a_vk.c
++++ b/src/vulkan/nv2a_vk.c
+@@ -52,6 +52,15 @@ static const uint32_t k_frag_spv[] =
+ static const uint32_t k_vsh_spv[] =
+ #include "nv2a_vsh.vert.inc"
+ ;
++static const uint32_t k_zpack_vert_spv[] =
++#include "zeta_pack.vert.inc"
++;
++static const uint32_t k_zpack_frag_spv[] =
++#include "zeta_pack.frag.inc"
++;
++static const uint32_t k_salias_frag_spv[] =
++#include "surf_alias.frag.inc"
++;
+ 
+ #define VK_RING_VERTS   (64u << 20)
+ #define VK_RING_UNIFORM (32u << 20)
+@@ -75,6 +84,9 @@ static unsigned s_scale = 1;
+ static volatile unsigned s_scale_req;
+ static uint32_t s_max_dim = VK_MAX_TEX_DIM;
+ static int s_blit_bgra, s_blit_565, s_blit_1555, s_zblit;
++/* The depth format can be sampled and has stencil: zeta surfaces read as
++ * textures come from the GPU (tex_from_zeta). */
++static int s_zsample;
+ 
+ #define VK_CHECK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { \
+     fprintf(stderr, "[VK] %s failed: %d (%s:%d)\n", #x, (int)r_, __FILE__, __LINE__); \
+@@ -353,6 +365,18 @@ static void img_retire(Img *im)
+     memset(im, 0, sizeof *im);
+ }
+ 
++/* An image view alone, retired the same way. */
++static void view_retire(VkImageView *v)
++{
++    if (!*v)
++        return;
++    if (s_ndead == (int)(sizeof s_dead / sizeof s_dead[0]))
++        flush();
++    memset(&s_dead[s_ndead], 0, sizeof s_dead[s_ndead]);
++    s_dead[s_ndead++].view = *v;
++    *v = VK_NULL_HANDLE;
++}
++
+ /* ---- Guest memory --------------------------------------------------- */
+ 
+ static uint8_t *guest(uint32_t va)
+@@ -417,10 +441,20 @@ typedef struct {
+      * or stencil since guest memory last had them (zeta_queue_readback). */
+     uint32_t pitch, zfmt, rows;
+     int gpu_dirty;
++    uint32_t version;        /* new at every write, as Surf.version */
++    /* Depth and stencil alone, for sampling the image as a texture
++     * (tex_from_zeta); made when first needed. */
++    VkImageView dview, sview;
+ } Zeta;
+ 
+ static Surf s_surfs[VK_MAX_SURFACES];
+ static Zeta s_zetas[VK_MAX_ZETAS];
++
++static void zeta_views_retire(Zeta *z)
++{
++    view_retire(&z->dview);
++    view_retire(&z->sview);
++}
+ static Surf *s_rt;               /* what the open render pass draws into */
+ static Zeta *s_rt_z;
+ static uint32_t s_frame = 1, s_use;
+@@ -665,6 +699,9 @@ static VkFormat surf_format(uint32_t bpp, uint32_t cfmt)
+ 
+ /* The image for the surface being drawn into, `need_h` rows tall at least,
+  * holding what guest memory holds unless the GPU drew it since. */
++static int surf_alias_gpu(Surf *dst, Surf *src);
++static uint32_t s_alias_gpu;
++
+ static Surf *surf_get(const Nv2aSurface *ns, uint32_t need_h)
+ {
+     Surf *s = NULL, *lru = NULL;
+@@ -751,8 +788,38 @@ static Surf *surf_get(const Nv2aSurface *ns, uint32_t need_h)
+      * and draws into it as the other; kept apart, the drawn image was never
+      * cleared, and a frame's worth of text piled onto every frame before. */
+     {
+-        int i, any = 0;
++        int i, any = 0, newer = 0, done = 0;
++        Surf *last = NULL;
++        /* One newer view: redrawn from it on the GPU (surf_alias_gpu). Conker
++         * draws four targets a frame as linear and then as swizzled, and the
++         * trip through guest memory waited for the GPU four times a frame. */
+         for (i = 0; i < VK_MAX_SURFACES; i++) {
++            Surf *o = &s_surfs[i];
++            if (o != s && o->color.image && o->gpu_dirty && o->version > s->version
++                && o->va < s->va + surf_span(s) && s->va < o->va + surf_span(o)) {
++                newer++;
++                last = o;
++            }
++        }
++        if (newer == 1 && surf_alias_gpu(s, last)) {
++            for (i = 0; i < VK_MAX_SURFACES; i++) {
++                Surf *o = &s_surfs[i];
++                if (o == s || !o->color.image || !o->gpu_dirty
++                    || o->va >= s->va + surf_span(s) || s->va >= o->va + surf_span(o))
++                    continue;
++                o->gpu_dirty = 0;      /* this one holds the bytes now */
++                if (o != last)
++                    o->force_upload = 1;
++            }
++            s->version = ++s_writes;
++            s->gpu_dirty = 1;
++            s->force_upload = 0;
++            s->guest_hash = surf_hash_guest(s);
++            s->checked_frame = s_frame;
++            s_alias_gpu++;
++            done = 1;
++        }
++        for (i = 0; i < VK_MAX_SURFACES && !done; i++) {
+             Surf *o = &s_surfs[i];
+             if (o == s || !o->color.image || !o->gpu_dirty
+                 || o->va >= s->va + surf_span(s) || s->va >= o->va + surf_span(o))
+@@ -806,6 +873,7 @@ static Zeta *zeta_get(uint32_t va, uint32_t w, uint32_t h, uint32_t sc)
+             w = w > z->depth.w / sc ? w : z->depth.w / sc;
+             h = h > z->depth.h / sc ? h : z->depth.h / sc;
+         }
++        zeta_views_retire(z);
+         img_retire(&z->depth);
+         img_retire(&z->lo);
+         lru = z;
+@@ -817,6 +885,7 @@ static Zeta *zeta_get(uint32_t va, uint32_t w, uint32_t h, uint32_t sc)
+         z = lru;
+         if (z->depth.image) {
+             if (s_rt_z == z) { end_rendering(); s_rt_z = NULL; }
++            zeta_views_retire(z);
+             img_retire(&z->depth);
+             img_retire(&z->lo);
+         }
+@@ -828,7 +897,8 @@ static Zeta *zeta_get(uint32_t va, uint32_t w, uint32_t h, uint32_t sc)
+         if (!img_create(&z->depth, w * sc, h * sc, 1, s_depth_fmt,
+                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
+                         | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+-                        | VK_IMAGE_USAGE_TRANSFER_DST_BIT, 0)) {
++                        | VK_IMAGE_USAGE_TRANSFER_DST_BIT
++                        | (s_zsample ? VK_IMAGE_USAGE_SAMPLED_BIT : 0), 0)) {
+             memset(z, 0, sizeof *z);
+             return NULL;
+         }
+@@ -890,6 +960,7 @@ typedef struct {
+     Img img;
+     const Surf *src;         /* drawn: the surface, and its version copied */
+     uint32_t src_version;
++    const Zeta *zsrc;        /* drawn == 2: the zeta, its version in src_version */
+ } Tex;
+ 
+ static Tex s_tex[VK_MAX_TEXTURES];
+@@ -897,7 +968,7 @@ static int s_ntex;
+ static Img s_white2d, s_whitecube;
+ static uint32_t *s_decode;
+ static size_t s_decode_cap;
+-static uint32_t s_tex_uploads, s_tex_hits, s_tex_new, s_tex_rt, s_tex_copies;
++static uint32_t s_tex_uploads, s_tex_hits, s_tex_new, s_tex_rt, s_tex_copies, s_tex_zeta;
+ 
+ /* Surfaces drawn over [va, va+bytes) go back to guest memory first: the
+  * stage is about to read what a render pass left there. */
+@@ -1225,12 +1296,353 @@ static Img *tex_from_surface(Tex *t, const Nv2aStage *st, Surf *s)
+     return &t->img;
+ }
+ 
++/* ---- Zeta surfaces as textures ------------------------------------- */
++
++/* A title that samples its depth buffer reads the zeta surface's memory as
++ * a colour texture: Conker's glow, every frame from the front end on, reads
++ * the 640x480 Z24S8 surface as LIN_R8G8B8A8. Read back for that, each frame
++ * waited for the GPU to finish the scene so far, converted 300 000 depths
++ * on the CPU, hashed them, decoded them again a texel at a time and uploaded
++ * the result -- most of the frame on a slower CPU, and a stall of whatever
++ * the GPU still had to do. The texture is made on the GPU from the depth
++ * image instead (shaders/zeta_pack.frag), which leaves guest memory as it
++ * was; a stage that reads it any other way still has it read back. */
++static VkPipelineCache s_pcache;
++static VkDescriptorSetLayout s_zp_dsl;
++static VkPipelineLayout s_zp_layout;
++static VkPipeline s_zp_pipe;
++static int s_zp_failed;
++
++static VkSampler sampler_get(int mag, int min, int mip, uint32_t au, uint32_t av);
++
++/* A full-screen pass: zeta_pack.vert's triangle, a fragment shader, one
++ * colour target of format cf, viewport and scissor dynamic. */
++static VkPipeline pass_pipeline(const uint32_t *fspv, size_t fsize, VkFormat cf,
++                                VkPipelineLayout layout)
++{
++    VkShaderModuleCreateInfo sm = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
++    VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
++    VkPipelineShaderStageCreateInfo stages[2];
++    VkPipelineVertexInputStateCreateInfo vin = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
++    VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
++    VkPipelineViewportStateCreateInfo vp = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
++    VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
++    VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
++    VkPipelineColorBlendAttachmentState cba;
++    VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
++    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
++    VkPipelineDynamicStateCreateInfo ds = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
++    VkPipelineRenderingCreateInfo ri = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
++    VkGraphicsPipelineCreateInfo gi = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
++    VkPipeline pipe = VK_NULL_HANDLE;
++
++    sm.codeSize = sizeof k_zpack_vert_spv;
++    sm.pCode = k_zpack_vert_spv;
++    if (vkCreateShaderModule(s_dev, &sm, NULL, &vs) != VK_SUCCESS)
++        return VK_NULL_HANDLE;
++    sm.codeSize = fsize;
++    sm.pCode = fspv;
++    if (vkCreateShaderModule(s_dev, &sm, NULL, &fs) != VK_SUCCESS) {
++        vkDestroyShaderModule(s_dev, vs, NULL);
++        return VK_NULL_HANDLE;
++    }
++    memset(stages, 0, sizeof stages);
++    stages[0].sType = stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
++    stages[0].module = vs;
++    stages[0].pName = "main";
++    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++    stages[1].module = fs;
++    stages[1].pName = "main";
++    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++    vp.viewportCount = vp.scissorCount = 1;
++    rs.polygonMode = VK_POLYGON_MODE_FILL;
++    rs.cullMode = VK_CULL_MODE_NONE;
++    rs.lineWidth = 1.0f;
++    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++    memset(&cba, 0, sizeof cba);
++    cba.colorWriteMask = 0xF;
++    cb.attachmentCount = 1;
++    cb.pAttachments = &cba;
++    ds.dynamicStateCount = 2;
++    ds.pDynamicStates = dyn;
++    ri.colorAttachmentCount = 1;
++    ri.pColorAttachmentFormats = &cf;
++    gi.pNext = &ri;
++    gi.stageCount = 2;
++    gi.pStages = stages;
++    gi.pVertexInputState = &vin;
++    gi.pInputAssemblyState = &ia;
++    gi.pViewportState = &vp;
++    gi.pRasterizationState = &rs;
++    gi.pMultisampleState = &ms;
++    gi.pColorBlendState = &cb;
++    gi.pDynamicState = &ds;
++    gi.layout = layout;
++    if (vkCreateGraphicsPipelines(s_dev, s_pcache, 1, &gi, NULL, &pipe) != VK_SUCCESS)
++        pipe = VK_NULL_HANDLE;
++    vkDestroyShaderModule(s_dev, vs, NULL);
++    vkDestroyShaderModule(s_dev, fs, NULL);
++    return pipe;
++}
++
++/* A pass's layout: nimg combined image samplers at bindings 0.., pushed,
++ * and pc bytes of fragment push constants. */
++static VkPipelineLayout pass_layout(uint32_t nimg, uint32_t pc, VkDescriptorSetLayout *dsl)
++{
++    VkDescriptorSetLayoutBinding bind[2];
++    VkDescriptorSetLayoutCreateInfo dl = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
++    VkPushConstantRange pcr = { VK_SHADER_STAGE_FRAGMENT_BIT, 0, pc };
++    VkPipelineLayoutCreateInfo pl = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
++    VkPipelineLayout layout;
++    uint32_t i;
++
++    memset(bind, 0, sizeof bind);
++    for (i = 0; i < nimg && i < 2; i++) {
++        bind[i].binding = i;
++        bind[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
++        bind[i].descriptorCount = 1;
++        bind[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
++    }
++    dl.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
++    dl.bindingCount = i;
++    dl.pBindings = bind;
++    if (vkCreateDescriptorSetLayout(s_dev, &dl, NULL, dsl) != VK_SUCCESS)
++        return VK_NULL_HANDLE;
++    pl.setLayoutCount = 1;
++    pl.pSetLayouts = dsl;
++    pl.pushConstantRangeCount = 1;
++    pl.pPushConstantRanges = &pcr;
++    if (vkCreatePipelineLayout(s_dev, &pl, NULL, &layout) != VK_SUCCESS)
++        return VK_NULL_HANDLE;
++    return layout;
++}
++
++/* Draw a full-screen pass into target (w x h): what it had stays where the
++ * shader discards. The caller has bound nothing; this binds everything. */
++static void pass_draw(VkImageView target, uint32_t w, uint32_t h, VkPipeline pipe,
++                      VkPipelineLayout layout, const VkDescriptorImageInfo *img,
++                      uint32_t nimg, const void *pc, uint32_t pcsize)
++{
++    VkRenderingInfo ri = { VK_STRUCTURE_TYPE_RENDERING_INFO };
++    VkRenderingAttachmentInfo ca = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
++    VkWriteDescriptorSet wr[2];
++    VkViewport vp;
++    VkRect2D sc;
++    VkCommandBuffer c;
++    uint32_t k;
++
++    end_rendering();
++    s_rt = NULL;
++    s_rt_z = NULL;
++    barrier_all();
++    ca.imageView = target;
++    ca.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
++    ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
++    ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++    ri.renderArea.extent.width = w;
++    ri.renderArea.extent.height = h;
++    ri.layerCount = 1;
++    ri.colorAttachmentCount = 1;
++    ri.pColorAttachments = &ca;
++    c = cmd();
++    vkCmdBeginRendering(c, &ri);
++    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
++    memset(&vp, 0, sizeof vp);
++    vp.width = (float)w;
++    vp.height = (float)h;
++    vp.maxDepth = 1.0f;
++    vkCmdSetViewport(c, 0, 1, &vp);
++    memset(&sc, 0, sizeof sc);
++    sc.extent.width = w;
++    sc.extent.height = h;
++    vkCmdSetScissor(c, 0, 1, &sc);
++    memset(wr, 0, sizeof wr);
++    for (k = 0; k < nimg && k < 2; k++) {
++        wr[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++        wr[k].dstBinding = k;
++        wr[k].descriptorCount = 1;
++        wr[k].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
++        wr[k].pImageInfo = &img[k];
++    }
++    s_push_desc(c, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, k, wr);
++    vkCmdPushConstants(c, layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, pcsize, pc);
++    vkCmdDraw(c, 3, 1, 0, 0);
++    vkCmdEndRendering(c);
++    barrier_all();
++}
++
++static int zpack_pipeline(void)
++{
++    if (s_zp_pipe)
++        return 1;
++    if (s_zp_failed)
++        return 0;
++    s_zp_failed = 1;
++    s_zp_layout = pass_layout(2, 4, &s_zp_dsl);
++    if (s_zp_layout)
++        s_zp_pipe = pass_pipeline(k_zpack_frag_spv, sizeof k_zpack_frag_spv,
++                                  VK_FORMAT_B8G8R8A8_UNORM, s_zp_layout);
++    if (!s_zp_pipe) {
++        fprintf(stderr, "[VK] no depth-to-texture pipeline; sampled zeta surfaces are read back\n");
++        return 0;
++    }
++    s_zp_failed = 0;
++    return 1;
++}
++
++/* ---- One view of a surface's memory redrawn as another ------------- */
++
++static VkDescriptorSetLayout s_sa_dsl;
++static VkPipelineLayout s_sa_layout;
++static struct { VkFormat f; VkPipeline p; } s_sa_pipes[4];
++static int s_sa_npipes, s_sa_off = -1;
++
++typedef struct {
++    uint32_t dst_pitch, dst_mx, dst_my, dst_swz;
++    uint32_t src_pitch, src_mx, src_my, src_swz;
++    uint32_t src_w, src_h, bpp, sc;
++} SurfAliasPc;
++
++static VkPipeline surf_alias_pipeline(VkFormat f)
++{
++    VkPipeline p;
++    int i;
++    for (i = 0; i < s_sa_npipes; i++)
++        if (s_sa_pipes[i].f == f)
++            return s_sa_pipes[i].p;
++    if (s_sa_npipes == (int)(sizeof s_sa_pipes / sizeof s_sa_pipes[0]))
++        return VK_NULL_HANDLE;
++    if (!s_sa_layout)
++        s_sa_layout = pass_layout(1, sizeof(SurfAliasPc), &s_sa_dsl);
++    if (!s_sa_layout)
++        return VK_NULL_HANDLE;
++    p = pass_pipeline(k_salias_frag_spv, sizeof k_salias_frag_spv, f, s_sa_layout);
++    s_sa_pipes[s_sa_npipes].f = f;           /* a failure is remembered too */
++    s_sa_pipes[s_sa_npipes].p = p;
++    s_sa_npipes++;
++    if (!p)
++        fprintf(stderr, "[VK] no surface alias pipeline for format %d; aliased"
++                        " surfaces go through guest memory\n", (int)f);
++    return p;
++}
++
++/* dst takes what src drew, as dst's layout sees src's bytes: both start at
++ * the same address, have the same texel size and image format and the same
++ * render scale, and src covers all of dst. 0: not done, use guest memory. */
++static int surf_alias_gpu(Surf *dst, Surf *src)
++{
++    SurfAliasPc pc;
++    VkDescriptorImageInfo ii;
++    VkPipeline p;
++
++    if (s_sa_off < 0)
++        s_sa_off = getenv("RECOMP_VK_ALIAS_READBACK") != NULL;
++    if (s_sa_off || dst->va != src->va || dst->bpp != src->bpp || dst->sc != src->sc
++        || dst->color.fmt != src->color.fmt || surf_span(src) < surf_span(dst)
++        || (dst->swz_w && (dst->w & (dst->w - 1) || dst->h & (dst->h - 1)))
++        || (src->swz_w && (src->w & (src->w - 1) || src->h & (src->h - 1))))
++        return 0;
++    p = surf_alias_pipeline(dst->color.fmt);
++    if (!p)
++        return 0;
++    memset(&pc, 0, sizeof pc);
++    pc.dst_pitch = dst->pitch;
++    pc.dst_swz = dst->swz_w != 0;
++    if (pc.dst_swz)
++        xbox_swizzle_masks(dst->w, dst->h, &pc.dst_mx, &pc.dst_my);
++    pc.src_pitch = src->pitch;
++    pc.src_swz = src->swz_w != 0;
++    if (pc.src_swz)
++        xbox_swizzle_masks(src->w, src->h, &pc.src_mx, &pc.src_my);
++    if ((!pc.dst_swz && !pc.dst_pitch) || (!pc.src_swz && !pc.src_pitch))
++        return 0;
++    pc.src_w = src->w;
++    pc.src_h = src->h;
++    pc.bpp = dst->bpp;
++    pc.sc = dst->sc;
++    ii.sampler = sampler_get(0, 0, 0, 0, 0);
++    ii.imageView = src->color.view;
++    ii.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
++    pass_draw(dst->color.view, dst->color.w, dst->color.h, p, s_sa_layout, &ii, 1,
++              &pc, sizeof pc);
++    return 1;
++}
++
++static VkImageView zeta_view(const Zeta *z, VkImageAspectFlags aspect)
++{
++    VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
++    VkImageView v;
++    vi.image = z->depth.image;
++    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
++    vi.format = s_depth_fmt;
++    vi.subresourceRange.aspectMask = aspect;
++    vi.subresourceRange.levelCount = 1;
++    vi.subresourceRange.layerCount = 1;
++    return vkCreateImageView(s_dev, &vi, NULL, &v) == VK_SUCCESS ? v : VK_NULL_HANDLE;
++}
++
++/* The zeta surface a stage reads, if it reads one in a way the pass makes:
++ * the surface's own memory, pitch and dword layout. */
++static Zeta *zeta_source(const Nv2aStage *st)
++{
++    int i;
++    if (!s_zsample || st->normalized || st->cube || st->levels > 1
++        || (st->color != 0x41 && st->color != 0x12))
++        return NULL;
++    for (i = 0; i < VK_MAX_ZETAS; i++) {
++        Zeta *z = &s_zetas[i];
++        if (z->depth.image && z->va == st->offset && z->zfmt == 2
++            && z->pitch == st->pitch && st->width * 4 <= z->pitch
++            && st->width * z->sc <= z->depth.w && st->height * z->sc <= z->depth.h)
++            return z;
++    }
++    return NULL;
++}
++
++static Img *tex_from_zeta(Tex *t, const Nv2aStage *st, Zeta *z)
++{
++    uint32_t w = st->width * z->sc, h = st->height * z->sc;
++    int mode = st->color == 0x41 ? 0 : 1;
++    VkDescriptorImageInfo ii[2];
++    int k;
++
++    if (t->img.image && (t->img.w != w || t->img.h != h))
++        img_retire(&t->img);
++    if (!t->img.image) {
++        if (!img_create(&t->img, w, h, 1, VK_FORMAT_B8G8R8A8_UNORM,
++                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
++                        | VK_IMAGE_USAGE_TRANSFER_DST_BIT, 0))
++            return NULL;
++        t->zsrc = NULL;
++    }
++    if (t->zsrc == z && t->src_version == z->version)
++        return &t->img;
++    if (!z->dview)
++        z->dview = zeta_view(z, VK_IMAGE_ASPECT_DEPTH_BIT);
++    if (!z->sview)
++        z->sview = zeta_view(z, VK_IMAGE_ASPECT_STENCIL_BIT);
++    if (!z->dview || !z->sview)
++        return NULL;
++    for (k = 0; k < 2; k++) {
++        ii[k].sampler = sampler_get(0, 0, 0, 0, 0);
++        ii[k].imageView = k ? z->sview : z->dview;
++        ii[k].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
++    }
++    pass_draw(t->img.view, w, h, s_zp_pipe, s_zp_layout, ii, 2, &mode, 4);
++    t->zsrc = z;
++    t->src_version = z->version;
++    s_tex_zeta++;
++    return &t->img;
++}
++
+ /* The view a stage samples: decoded once, and again whenever its bytes (or
+  * its palette's) change. NULL: sample white. */
+ static Img *tex_get(const Nv2aStage *st)
+ {
+     Tex *t = NULL, *lru = NULL;
+     Surf *src;
++    Zeta *zsrc;
+     uint32_t bytes, drawn;
+     uint64_t h;
+     int i;
+@@ -1242,7 +1654,10 @@ static Img *tex_get(const Nv2aStage *st)
+     if (!bytes || !nv2a_backend_guest_span_ok(st->offset, bytes))
+         return NULL;
+     src = drawn_source(st);
+-    drawn = src != NULL;
++    zsrc = src ? NULL : zeta_source(st);
++    if (zsrc && !zpack_pipeline())
++        zsrc = NULL;
++    drawn = zsrc ? 2u : src != NULL;
+     for (i = 0; i < s_ntex; i++) {
+         Tex *c = &s_tex[i];
+         if (c->offset == st->offset && c->width == st->width
+@@ -1275,6 +1690,11 @@ static Img *tex_get(const Nv2aStage *st)
+         t->drawn = drawn;
+     }
+     t->last_use = s_frame;
++    if (zsrc) {
++        Img *im = tex_from_zeta(t, st, zsrc);
++        if (im)
++            return im;
++    }
+     if (src)
+         return src->va == s_draw_target_va ? tex_from_surface(t, st, src)
+                                            : surf_sample(src, st);
+@@ -1369,7 +1789,6 @@ typedef struct {
+ #define VK_PIPE_SLOTS 4096
+ static struct { PipeKey k; VkPipeline p; int used; } s_pipes[VK_PIPE_SLOTS];
+ static int s_npipes;
+-static VkPipelineCache s_pcache;
+ 
+ static uint32_t pipe_hash(const PipeKey *k)
+ {
+@@ -1839,6 +2258,7 @@ static void vk_clear(const Nv2aSurface *ns, const Nv2aRenderState *rs,
+     }
+     if ((flags & 3) && z) {
+         z->gpu_dirty = 1;
++        z->version = ++s_writes;
+         memset(&at[n], 0, sizeof at[n]);
+         if (flags & 1)
+             at[n].aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
+@@ -2119,8 +2539,10 @@ static void vk_draw_full(const Nv2aSurface *ns, const Nv2aFullBatch *b)
+     if (use_q)
+         vkCmdEndQuery(c, s_qpool, s_q_used++);
+     end_draw(c, s, &pk, use_q);
+-    if (z && writes_zeta(rs))
++    if (z && writes_zeta(rs)) {
+         z->gpu_dirty = 1;
++        z->version = ++s_writes;
++    }
+     s_tris += b->count / 3;
+ }
+ 
+@@ -2312,8 +2734,10 @@ static void vk_draw_program(const Nv2aSurface *ns, const Nv2aProgramBatch *b)
+     if (use_q)
+         vkCmdEndQuery(c, s_qpool, s_q_used++);
+     end_draw(c, s, &pk, use_q);
+-    if (z && writes_zeta(rs))
++    if (z && writes_zeta(rs)) {
+         z->gpu_dirty = 1;
++        z->version = ++s_writes;
++    }
+     s_tris += b->count / 3;
+     s_prog_draws++;
+ }
+@@ -2442,6 +2866,7 @@ static void scale_change(unsigned to)
+         memset(&s_surfs[i], 0, sizeof s_surfs[i]);
+     }
+     for (i = 0; i < VK_MAX_ZETAS; i++) {
++        zeta_views_retire(&s_zetas[i]);
+         img_retire(&s_zetas[i].depth);
+         img_retire(&s_zetas[i].lo);
+         memset(&s_zetas[i], 0, sizeof s_zetas[i]);
+@@ -2471,9 +2896,9 @@ static void vk_flip(void)
+         }
+     if (s_verbose && s_frame % 300 == 0)
+         fprintf(stderr, "[VK] flip %u: %u draws, %u tris, %u flushes (+%u soft), %d textures"
+-                        " (%u uploads, %u new, %u read back, %u copied, %u hits), %u program draws, %u alias syncs\n", s_frame,
++                        " (%u uploads, %u new, %u read back, %u copied, %u from depth, %u hits), %u program draws, %u alias syncs (+%u on the GPU)\n", s_frame,
+                 s_draws, s_tris, s_flushes, s_soft_flushes, s_ntex, s_tex_uploads, s_tex_new, s_tex_rt,
+-                s_tex_copies, s_tex_hits, s_prog_draws, s_alias_syncs);
++                s_tex_copies, s_tex_zeta, s_tex_hits, s_prog_draws, s_alias_syncs, s_alias_gpu);
+ }
+ 
+ /* The executor's own draw() is never used: draw_full is set. */
+@@ -2656,6 +3081,10 @@ static void pick_colour_formats(void)
+     s_blit_565 = fmt_blits(VK_FORMAT_R5G6B5_UNORM_PACK16, 1);
+     s_blit_1555 = fmt_blits(VK_FORMAT_A1R5G5B5_UNORM_PACK16, 1);
+     s_zblit = fmt_blits(s_depth_fmt, 0);
++    vkGetPhysicalDeviceFormatProperties(s_phys, s_depth_fmt, &fp);
++    s_zsample = s_depth_fmt != VK_FORMAT_D32_SFLOAT
++             && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
++             && !getenv("RECOMP_VK_ZETA_READBACK");
+     vkGetPhysicalDeviceProperties(s_phys, &p);
+     s_max_dim = p.limits.maxImageDimension2D;
+     if (s_verbose)
+diff --git a/src/vulkan/shaders/surf_alias.frag b/src/vulkan/shaders/surf_alias.frag
+new file mode 100644
+index 0000000..d111ea1
+--- /dev/null
++++ b/src/vulkan/shaders/surf_alias.frag
+@@ -0,0 +1,59 @@
++#version 450
++/* One render target's image redrawn as another view of the same memory
++ * would see it (nv2a_vk.c, surf_alias_gpu): the same bytes in the other
++ * layout, linear (pitch) or swizzled (the NV2A's Morton order, from the
++ * masks xbox_swizzle_masks makes). Each target texel finds its byte offset
++ * in its own layout and takes the source texel stored at that offset.
++ * Pixels the source does not cover keep what the target had. A render
++ * scale above 1 maps whole guest pixels and keeps the position inside one. */
++
++layout(set = 0, binding = 0) uniform sampler2D u_src;
++layout(push_constant) uniform Pc {
++    uint dst_pitch, dst_mx, dst_my, dst_swz;   /* pitch in bytes; masks */
++    uint src_pitch, src_mx, src_my, src_swz;
++    uint src_w, src_h, bpp, sc;
++} pc;
++
++layout(location = 0) out vec4 o_color;
++
++uint deposit(uint v, uint mask)
++{
++    uint r = 0u, bit = 1u;
++    for (int i = 0; i < 32 && mask != 0u; i++) {
++        uint low = mask & (~mask + 1u);
++        if ((v & bit) != 0u) r |= low;
++        mask &= mask - 1u;
++        bit <<= 1;
++    }
++    return r;
++}
++
++uint extract(uint v, uint mask)
++{
++    uint r = 0u, bit = 1u;
++    for (int i = 0; i < 32 && mask != 0u; i++) {
++        uint low = mask & (~mask + 1u);
++        if ((v & low) != 0u) r |= bit;
++        mask &= mask - 1u;
++        bit <<= 1;
++    }
++    return r;
++}
++
++void main()
++{
++    uvec2 p = uvec2(gl_FragCoord.xy);
++    uvec2 g = p / pc.sc, sub = p % pc.sc;
++    uint off = pc.dst_swz != 0u ? (deposit(g.x, pc.dst_mx) | deposit(g.y, pc.dst_my)) * pc.bpp
++                                : g.y * pc.dst_pitch + g.x * pc.bpp;
++    uvec2 s;
++    if (pc.src_swz != 0u) {
++        uint m = off / pc.bpp;
++        s = uvec2(extract(m, pc.src_mx), extract(m, pc.src_my));
++    } else {
++        s = uvec2((off % pc.src_pitch) / pc.bpp, off / pc.src_pitch);
++    }
++    if (s.x >= pc.src_w || s.y >= pc.src_h)
++        discard;
++    o_color = texelFetch(u_src, ivec2(s * pc.sc + sub), 0);
++}
+diff --git a/src/vulkan/shaders/zeta_pack.frag b/src/vulkan/shaders/zeta_pack.frag
+new file mode 100644
+index 0000000..f876fe5
+--- /dev/null
++++ b/src/vulkan/shaders/zeta_pack.frag
+@@ -0,0 +1,28 @@
++#version 450
++/* A depth/stencil image as the colour texture a title reads when it samples
++ * its zeta surface's memory (nv2a_vk.c, tex_from_zeta). The NV2A stores
++ * Z24S8 as one dword per pixel, depth << 8 | stencil; the texture format
++ * decides which byte lands in which channel, as the executor's decoder does:
++ *
++ *   mode 0, LIN_R8G8B8A8: A = stencil, R G B = depth from the top byte down
++ *   mode 1, LIN_A8R8G8B8: A R G = depth from the top byte down, B = stencil
++ *
++ * The target is B8G8R8A8_UNORM, so each byte is written as itself / 255. */
++
++layout(set = 0, binding = 0) uniform sampler2D u_depth;
++layout(set = 0, binding = 1) uniform usampler2D u_stencil;
++layout(push_constant) uniform Pc { int mode; } pc;
++
++layout(location = 0) out vec4 o_color;
++
++void main()
++{
++    ivec2 p = ivec2(gl_FragCoord.xy);
++    float d = clamp(texelFetch(u_depth, p, 0).r, 0.0, 1.0);
++    uint d24 = uint(d * 16777215.0 + 0.5);
++    uint s = texelFetch(u_stencil, p, 0).r & 0xFFu;
++    vec4 b = vec4(float(d24 >> 16), float((d24 >> 8) & 0xFFu), float(d24 & 0xFFu),
++                  float(s)) / 255.0;
++    o_color = pc.mode == 0 ? vec4(b.x, b.y, b.z, b.w)     /* R G B A */
++                           : vec4(b.y, b.z, b.w, b.x);    /* R G B A */
++}
+diff --git a/src/vulkan/shaders/zeta_pack.vert b/src/vulkan/shaders/zeta_pack.vert
+new file mode 100644
+index 0000000..99f962c
+--- /dev/null
++++ b/src/vulkan/shaders/zeta_pack.vert
+@@ -0,0 +1,8 @@
++#version 450
++/* One triangle over the whole target (zeta_pack.frag). */
++
++void main()
++{
++    vec2 p = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);
++    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
++}

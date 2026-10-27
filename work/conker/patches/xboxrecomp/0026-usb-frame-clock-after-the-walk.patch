@@ -1,0 +1,218 @@
+diff --git a/src/usb/ohci.c b/src/usb/ohci.c
+index c2c40e0..b9dc242 100644
+--- a/src/usb/ohci.c
++++ b/src/usb/ohci.c
+@@ -193,6 +193,17 @@ static uint32_t *reg_of(OhciController *hc, uint32_t off)
+     return (off < OHCI_REG_MAX) ? &hc->reg[off / 4] : NULL;
+ }
+ 
++/* Raise interrupt status bits.
++ *
++ * Atomically, because the driver clears them from another thread: a plain
++ * |= that reads the register before an acknowledgement and writes it back
++ * after puts the acknowledged bit back, and the driver is handed the same
++ * WritebackDoneHead twice. */
++static void status_set(OhciController *hc, uint32_t bits)
++{
++    InterlockedOr((volatile LONG *)&hc->reg[HcInterruptStatus / 4], (LONG)bits);
++}
++
+ /* ---- register semantics ------------------------------------------------ */
+ 
+ static uint64_t ohci_read(void *dev, uint32_t off, int size)
+@@ -283,7 +294,7 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
+                 wr32(hcca + HCCA_DONE_HEAD, 0);
+             hc->reg[HcDoneHead / 4] = 0;
+         }
+-        *r &= ~v;                       /* write 1 to clear                 */
++        InterlockedAnd((volatile LONG *)r, (LONG)~v);   /* write 1 to clear */
+         hc->ack_seq++;
+         return;
+ 
+@@ -354,7 +365,7 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
+             if (*ps & PORT_CCS)
+                 *ps |= PORT_PES;
+             *ps |= PORT_PRSC;
+-            hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
++            status_set(hc, INTR_RHSC);
+         }
+         return;
+     }
+@@ -535,6 +546,17 @@ static void wr32(uint32_t va, uint32_t v)
+         return;
+     *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va) = v;
+ }
++/* Replace a guest dword only if it still holds what was read; whether it
++ * did. */
++static int cas32(uint32_t va, uint32_t expect, uint32_t v)
++{
++    va = bus_resolve(va);
++    if (!guest_ok(va, 4))
++        return 0;
++    return (uint32_t)InterlockedCompareExchange(
++               (volatile LONG *)((uint8_t *)xbox_GetMemoryOffset() + va),
++               (LONG)v, (LONG)expect) == expect;
++}
+ static uint8_t *guest_ptr(uint32_t va, uint32_t bytes)
+ {
+     va = bus_resolve(va);
+@@ -733,11 +755,34 @@ static int ohci_walk_eds(OhciController *hc, uint32_t ed, uint32_t *done_head)
+         if (ed0 & ED_SKIP) { ed = rd32(ed + 12) & ED_PTR_MASK; continue; }
+         if (head & ED_HEAD_HALT) { ed = rd32(ed + 12) & ED_PTR_MASK; continue; }
+ 
++        /* The driver edits the list while this walks it, from its DPC on
++         * another thread: to cancel a transfer it sets sKip, waits for the
++         * frame number to move on (so no walk can still be using the
++         * endpoint) and then takes the descriptors back and reuses them. So
++         * the endpoint is looked at again before every descriptor, and the
++         * head pointer is moved on only if it is still the one this walk
++         * read. Writing back a head read earlier put a reclaimed descriptor
++         * back on the endpoint, and putting it on the done queue as well
++         * handed the driver a completion for a transfer it had already
++         * requeued: it took the "not accessed" code for an error, walked the
++         * endpoint for the end of a transfer that was no longer there, and
++         * never left its DPC -- the pad went dead minutes into play. */
+         while ((head & ED_PTR_MASK) != tail
+             && guest_ok(head & ED_PTR_MASK, 16) && ++tguard < 64) {
+             uint32_t td = head & ED_PTR_MASK;
+             uint32_t next = rd32(td + 8) & ED_PTR_MASK;
+-            uint32_t cc = ohci_do_td(hc, ed0, td);
++            uint32_t new_head, cc;
++
++            if ((rd32(ed) & ED_SKIP) || rd32(ed + 8) != head)
++                break;                      /* the driver has it now */
++            cc = ohci_do_td(hc, ed0, td);
++
++            new_head = next | (head & ED_HEAD_TOGGLE);
++            if (cc != TD_CC_NOERROR)
++                new_head |= ED_HEAD_HALT;   /* a stall halts the endpoint */
++            if ((rd32(ed) & ED_SKIP) || !cas32(ed + 8, head, new_head))
++                break;                      /* taken back mid-transfer */
++            head = new_head;
+ 
+             /* Report the outcome where the driver reads it, then put the
+              * descriptor on the done queue, newest first. */
+@@ -746,13 +791,9 @@ static int ohci_walk_eds(OhciController *hc, uint32_t ed, uint32_t *done_head)
+             *done_head = td;
+             completed++;
+ 
+-            head = next | (head & ED_HEAD_TOGGLE);
+-            if (cc != TD_CC_NOERROR) {
+-                head |= ED_HEAD_HALT;       /* a stall halts the endpoint */
++            if (cc != TD_CC_NOERROR)
+                 break;
+-            }
+         }
+-        wr32(ed + 8, head);
+         ed = rd32(ed + 12) & ED_PTR_MASK;
+     }
+ 
+@@ -767,7 +808,7 @@ static void ohci_publish_done(OhciController *hc, uint32_t done_head)
+     if (hcca)
+         wr32(hcca + HCCA_DONE_HEAD, done_head);
+     hc->reg[HcDoneHead / 4] = done_head;
+-    hc->reg[HcInterruptStatus / 4] |= INTR_WDH;
++    status_set(hc, INTR_WDH);
+ }
+ 
+ /* Both runners add to the caller's done queue rather than publishing their
+@@ -967,7 +1008,7 @@ static void ohci_raise(OhciController *hc, uint32_t source)
+     uint32_t enable = hc->reg[HcInterruptEnable / 4];
+     int claimed;
+ 
+-    hc->reg[HcInterruptStatus / 4] |= source;
++    status_set(hc, source);
+ 
+     if (!(enable & INTR_MIE) || !(enable & source))
+         return;
+@@ -1115,7 +1156,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
+             unsigned port = pspec ? (unsigned)atoi(pspec) : (s_ndp >= 4 ? 2u : 0u);
+             if (port >= s_ndp) port = s_ndp - 1u;
+             hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
+-            hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
++            status_set(hc, INTR_RHSC);
+             plugged = 1;
+             s_plugged_pads = 1;
+             first_port = port;
+@@ -1133,7 +1174,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
+             if (++settle > 50) {                 /* ~1 s after the last */
+                 unsigned port = (first_port + (unsigned)s_plugged_pads) % s_ndp;
+                 hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
+-                hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
++                status_set(hc, INTR_RHSC);
+                 fprintf(stderr, "  [OHCI0] pad %d arriving on port %u%c",
+                         s_plugged_pads + 1, port + 1, 10);
+                 fflush(stderr);
+@@ -1142,32 +1183,6 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
+             }
+         }
+ 
+-        /* The frame clock.
+-         *
+-         * INTR_SF was defined and never raised, and HcFmNumber only moved when
+-         * something read it. That is enough for a driver that polls, and not
+-         * enough for one that waits: USB enumeration is full of delays counted
+-         * in frames -- the recovery time after SET_ADDRESS is the first -- and
+-         * the Xbox stack enables StartOfFrame precisely to count them. Without
+-         * a frame ever starting, enumeration stops one transfer past
+-         * SET_ADDRESS with the driver waiting for time to pass.
+-         *
+-         * Twenty frames a tick because a frame is 1 ms and this loop sleeps
+-         * 20. The count is what drivers compare; the rate is what they feel,
+-         * and both are closer to right this way than a counter that never
+-         * moves. */
+-        {
+-            uint32_t hcca = hc->reg[HcHCCA / 4];
+-
+-            hc->reg[HcFmNumber / 4] =
+-                (hc->reg[HcFmNumber / 4] + OHCI_TICK_MS) & 0xFFFFu;
+-            /* HccaFrameNumber is 16 bits at +0x80 with a pad above it that the
+-             * controller zeroes, so a dword write is what hardware does. */
+-            if (hcca)
+-                wr32(hcca + 0x80, hc->reg[HcFmNumber / 4]);
+-            hc->reg[HcInterruptStatus / 4] |= INTR_SF;
+-        }
+-
+         /* Be the bus master. ControlListEnable in HcControl says the driver
+          * wants the list walked; ControlListFilled says it has put something
+          * on it. Walking on the tick rather than only when CLF is written
+@@ -1235,6 +1250,39 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
+          * this stops on its own -- and if it ever does not, the cap below says
+          * so rather than spinning the ISR forever. */
+     deliver:
++        /* The frame clock.
++         *
++         * INTR_SF was defined and never raised, and HcFmNumber only moved when
++         * something read it. That is enough for a driver that polls, and not
++         * enough for one that waits: USB enumeration is full of delays counted
++         * in frames -- the recovery time after SET_ADDRESS is the first -- and
++         * the Xbox stack enables StartOfFrame precisely to count them. Without
++         * a frame ever starting, enumeration stops one transfer past
++         * SET_ADDRESS with the driver waiting for time to pass.
++         *
++         * Twenty frames a tick because a frame is 1 ms and this loop sleeps
++         * 20. The count is what drivers compare; the rate is what they feel,
++         * and both are closer to right this way than a counter that never
++         * moves.
++         *
++         * After the walk, not before it. The driver cancels a transfer by
++         * setting sKip on its endpoint and taking the descriptors back once
++         * the frame number has moved on, which on hardware means the
++         * controller has finished with the endpoint. Moving the number at
++         * the top of a pass told it that while the walk that had already
++         * read the endpoint was still to come. */
++        {
++            uint32_t hcca = hc->reg[HcHCCA / 4];
++
++            hc->reg[HcFmNumber / 4] =
++                (hc->reg[HcFmNumber / 4] + OHCI_TICK_MS) & 0xFFFFu;
++            /* HccaFrameNumber is 16 bits at +0x80 with a pad above it that the
++             * controller zeroes, so a dword write is what hardware does. */
++            if (hcca)
++                wr32(hcca + 0x80, hc->reg[HcFmNumber / 4]);
++            status_set(hc, INTR_SF);
++        }
++
+         status = hc->reg[HcInterruptStatus / 4] & enable & 0x7Fu;
+         if (!status)
+             continue;
