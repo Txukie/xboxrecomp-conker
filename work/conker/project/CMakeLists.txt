@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 # The release version: the AppImage is named after it, and the executable
 # prints it.
-project(conker_recomp VERSION 0.2.2 LANGUAGES C)
+project(conker_recomp VERSION 0.3.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)

@@ -242,7 +242,12 @@ int main(int argc, char **argv)
      *                        the OHCI model is what lets it find a pad
      *   RECOMP_KEYBOARD      the keyboard is pad 0 (Enter = START, Z = A),
      *                        through the framebuffer window (RECOMP_FB_WINDOW),
-     *                        which also reads SDL game controllers */
+     *                        which also reads SDL game controllers
+     *   RECOMP_DISPATCH_GATE the USB model's interrupt runs on the guest
+     *                        thread at a safe point, never beside the USB
+     *                        driver's DPC: running both at once corrupted
+     *                        the driver's memory, and the pad stopped (or
+     *                        the game froze in the menu) after a while */
     conker_host_setenv_default("RECOMP_PB_EXEC", "1");
     conker_host_setenv_default("RECOMP_TITLE_KEVENTS", "1");
     conker_host_setenv_default("RECOMP_VBLANK", "paced");
@@ -250,6 +255,7 @@ int main(int argc, char **argv)
     conker_host_setenv_default("RECOMP_AC97_READY", "1");
     conker_host_setenv_default("RECOMP_USB", "1");
     conker_host_setenv_default("RECOMP_KEYBOARD", "1");
+    conker_host_setenv_default("RECOMP_DISPATCH_GATE", "1");
     /* Recomp Options (the front end's Options page): the cfg file sets the
      * window, aspect (Hor+, recomp_manual.c), render scale and frame limit
      * before anything opens; the submenu takes the pad while it shows. */
@@ -272,6 +278,13 @@ int main(int argc, char **argv)
         s_save_path = default_save;
     /* Mods in <data>/mods, laid over the game's files (conker_mods.c). */
     conker_mods_init(data_dir, s_save_path);
+    /* The Vulkan renderer's list of the pipelines the game has used, built
+     * again at every start so that nothing compiles while it plays. */
+    {
+        static char list[4200];
+        snprintf(list, sizeof list, "%s/pipelines.bin", data_dir);
+        conker_host_setenv_default("RECOMP_VK_PIPELINE_LIST", list);
+    }
 
 #if defined(_WIN32)
     return conker_boot();

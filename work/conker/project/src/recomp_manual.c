@@ -284,6 +284,23 @@ void sub_0003D200_enter(void)
     }
 }
 
+/* ── Swing Button: running with the weapon out (sub_002DEF80) ──────────────
+ *
+ * sub_002DEF80 (ecx the character, eax a heading) moves a character along
+ * the heading the player update (sub_002D6570) has worked out: the stick's
+ * angle from the camera's heading, or with a weapon out from the heading
+ * Conker had when it came out. For a weapon the Swing Button brought out,
+ * conker_swing_heading (conker_swing.c) gives the camera's again and turns
+ * Conker to face it, so he runs with the weapon as he does without it. */
+void sub_002DEF80_enter(void)
+{
+    extern int conker_swing_heading(uint32_t character, uint32_t *heading);
+    uint32_t heading;
+
+    if (conker_swing_heading(g_ecx, &heading))
+        g_eax = heading;
+}
+
 void conker_debug_string(uint32_t xbox_va)
 {
     const char *message = (const char *)((uintptr_t)xbox_va + g_xbox_mem_offset);
@@ -339,4 +356,148 @@ void sub_000645C0_enter(void)
     float s = conker_settings_hor_plus();
     if (s > 0.0f)
         g_xmm1.f[0] *= s;
+}
+
+/* ── D3D's wait for the GPU to go idle (sub_0053C450, sub_0053C630) ───────
+ *
+ * The generated functions, with a pause on each pass of their waits: it polls
+ * the FIFO's put and get (+0x3240, +0x3244) and PGRAPH's status (+0x400700)
+ * until the executor has caught up, and spun a core at 100% doing it -- most
+ * of the frame, since the frame waits on the executor. On the Steam Deck,
+ * with the 30 fps cap, the game drew 13 W spinning and 5 W pausing, which is
+ * battery life. The first polls stay a spin, so a short wait costs nothing more;
+ * after them it sleeps 50 us a pass. Both are excluded from the generated
+ * code (regenerate.sh --exclude-manual). */
+#include "platform/host_time.h"   /* xbox_HostSleepNs */
+
+static void gpu_wait_pause(unsigned *polls)
+{
+    if (++*polls > 64)
+        xbox_HostSleepNs(50000);
+}
+
+/* The flush it starts with (sub_0053C630): sets PFB's flush bit and waits
+ * for the GPU to clear it. The executor clears it once the flip it is
+ * holding for its vblank is let go, so with flip pacing this is where the
+ * frame spends its spare time, and it gets the same pause. */
+void sub_0053C630(void)
+{
+    unsigned polls = 0;
+    int _flags = 0; /* fallback flag var */
+    uint32_t _fa = 0, _fb = 0;
+    int32_t _fas = 0, _fbs = 0;
+    (void)_fa; (void)_fb; (void)_fas; (void)_fbs;
+
+loc_0053C630: ;
+    eax = MEM32(0x5499E8);
+    eax = MEM32(eax + 0x1C28);
+    (void)0; /* sfence: cache/ordering hint, nothing to model */
+    ecx = MEM32(eax + 0x100410);
+    ecx = ecx | 0x10000;
+    _fa = (uint32_t)(ecx) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* or result */
+    MEM32(eax + 0x100410) = ecx;
+
+loc_0053C650: ;
+    _fa = (uint32_t)(MEM32(eax + 0x100410)) & 0xFFFFFFFFu; _fb = (uint32_t)(0x10000) & 0xFFFFFFFFu;
+    _fas = (int32_t)(int32_t)(_fa); _fbs = (int32_t)(int32_t)(_fb); /* test MEM32(eax + 0x100410), 0x10000 (32-bit) */
+    if (TEST_NZ(_fa, _fb)) { gpu_wait_pause(&polls); goto loc_0053C650; } /* jne */
+
+loc_0053C65C: ;
+    esp += 4; return; /* ret */
+
+}
+
+
+void sub_0053C450(void)
+{
+    unsigned polls = 0;
+    int _flags = 0; /* fallback flag var */
+    uint32_t _fa = 0, _fb = 0;
+    int32_t _fas = 0, _fbs = 0;
+    (void)_fa; (void)_fb; (void)_fas; (void)_fbs;
+
+loc_0053C450: ;
+    eax = MEM32(edx + 8);
+    _fa = (uint32_t)(LO8(eax)) & 0xFFu; _fb = (uint32_t)(4) & 0xFFu;
+    _fas = (int32_t)(int8_t)(_fa); _fbs = (int32_t)(int8_t)(_fb); /* test LO8(eax), 4 (8-bit) */
+    PUSH32(esp, esi);
+    if (TEST_Z(_fa, _fb)) goto loc_0053C460; /* je: equal / zero */
+
+loc_0053C458: ;
+    esi = MEM32(edx + 0x770);
+    goto loc_0053C462;
+
+loc_0053C460: ;
+    esi = MEM32(edx);
+
+loc_0053C462: ;
+    _fa = (uint32_t)(HI8(eax)) & 0xFFu; _fb = (uint32_t)(0x20) & 0xFFu;
+    _fas = (int32_t)(int8_t)(_fa); _fbs = (int32_t)(int8_t)(_fb); /* test HI8(eax), 0x20 (8-bit) */
+    if (TEST_NZ(_fa, _fb)) goto loc_0053C4B8; /* jne: not equal / not zero */
+
+loc_0053C467: ;
+    PUSH32(esp, 0x0053C46Cu); RECOMP_ABI_CALL(0x0053C630u, sub_0053C630); /* call 0x0053C630 */
+
+loc_0053C46C: ;
+    eax = MEM32(edx + 0x1C20);
+    esi = esi & 0xFFFFFFF;
+    _fa = (uint32_t)(esi) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* and result */
+    MEM32(eax + 0x40) = esi;
+    eax = MEM32(0x547530);
+    _fa = (uint32_t)(eax) & 0xFFFFFFFFu; _fb = (uint32_t)(0) & 0xFFFFFFFFu;
+    _fas = (int32_t)(int32_t)(_fa); _fbs = (int32_t)(int32_t)(_fb); /* cmp eax, 0 (32-bit) */
+    if (CMP_EQ(_fa, _fb)) goto loc_0053C4F0; /* je: equal / zero */
+
+loc_0053C484: ;
+    ecx = MEM32(0x5499E8);
+    eax = MEM32(ecx + 0x934);
+
+loc_0053C490: ;
+    ecx = MEM32(eax + 0x3240);
+    _fa = (uint32_t)(ecx) & 0xFFFFFFFFu; _fb = (uint32_t)(MEM32(eax + 0x3244)) & 0xFFFFFFFFu;
+    _fas = (int32_t)(int32_t)(_fa); _fbs = (int32_t)(int32_t)(_fb); /* cmp ecx, MEM32(eax + 0x3244) (32-bit) */
+    if (CMP_NE(_fa, _fb)) { gpu_wait_pause(&polls); goto loc_0053C490; } /* jne */
+
+loc_0053C49E: ;
+    esi = MEM32(eax + 0x400700);
+    ecx = 0; /* xor self */
+    _fa = (uint32_t)(ecx) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* xor result */
+    _fa = (uint32_t)(esi) & 0xFFFFFFFFu; _fb = (uint32_t)(0) & 0xFFFFFFFFu;
+    _fas = (int32_t)(int32_t)(_fa); _fbs = (int32_t)(int32_t)(_fb); /* cmp esi, 0 (32-bit) */
+    SET_LO8(ecx, (CMP_NE(_fa, _fb)) ? 1 : 0); /* setne */
+    _fa = (uint32_t)(ecx) & 0xFFFFFFFFu; _fb = (uint32_t)(0) & 0xFFFFFFFFu;
+    _fas = (int32_t)(int32_t)(_fa); _fbs = (int32_t)(int32_t)(_fb); /* cmp ecx, 0 (32-bit) */
+    if (CMP_NE(_fa, _fb)) { gpu_wait_pause(&polls); goto loc_0053C490; } /* jne */
+
+loc_0053C4AF: ;
+    MEM32(edx + 8) = MEM32(edx + 8) | 0x2000;
+    _fa = (uint32_t)(MEM32(edx + 8)) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* or result */
+    POP32(esp, esi);
+    esp += 4; return; /* ret */
+
+loc_0053C4B8: ;
+    eax = MEM32(edx);
+    eax = eax & 0xFFFFFFF;
+    _fa = (uint32_t)(eax) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* and result */
+    ecx = 0x5499E0;
+    _fb = (uint32_t)(0x40) & 0xFFFFFFFFu; _fbs = (int32_t)(int32_t)(_fb); /* sub source, before the write */
+    ecx = ecx - 0x40;
+    _fa = (uint32_t)(ecx) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* sub result */
+    MEM32(edx + 0x1C20) = ecx;
+    MEM32(ecx + 0x40) = eax;
+    ecx = MEM32(edx + 0x1C20);
+    MEM32(ecx + 0x44) = eax;
+    eax = MEM32(edx + 0x2C);
+    ecx = MEM32(edx + 0x30);
+    _fb = (uint32_t)(2) & 0xFFFFFFFFu; _fbs = (int32_t)(int32_t)(_fb); /* sub source, before the write */
+    eax = eax - 2;
+    _fa = (uint32_t)(eax) & 0xFFFFFFFFu; _fas = (int32_t)(int32_t)(_fa); /* sub result */
+    MEM32(ecx) = eax;
+    eax = MEM32(edx + 0x2478);
+    MEM32(edx + 0x1DE4) = eax;
+
+loc_0053C4F0: ;
+    POP32(esp, esi);
+    esp += 4; return; /* ret */
+
 }

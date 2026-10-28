@@ -156,12 +156,62 @@ the first garden, and what 0.2.2 changed (patch 0027):
 - Result on the desktop, standing in the garden uncapped: about 49 fps
   before, 62 after. Full flushes went from about 5 a frame to 2.
 
+On the Steam Deck (1280x800, 1X, 30 fps cap, first garden), 0.2.2 ran at
+about 24 fps. The GPU was not short of power (13 W of 15) nor of speed:
+with its clock fixed at 1600 MHz the game held 30 fps at 42% GPU load. Its
+clock was the problem. The renderer recorded a whole frame and submitted it
+at the flip, so the GPU idled while the CPU recorded; the Deck's governor
+took that for low load and kept the clock at 1040 MHz, often at 200. 0.3.0
+(patch 0028):
+
+- Submits every 64 draws (`RECOMP_VK_SUBMIT_DRAWS`, 0 for once a frame),
+  so the GPU works while the CPU records. The Deck then holds 30 fps with
+  the clock on automatic, at about 80% GPU load.
+- D3D's GPU-idle wait (`sub_0053C450`) and its flush wait (`sub_0053C630`)
+  sleep after their first 64 polls instead of spinning, and the executor's
+  ack thread sleeps when nothing has been submitted for 1 ms: about 5 W
+  instead of 13 at the same frame rate. Pausing those waits exposed that
+  the kick latch (PGRAPH 0x400B10, which `sub_0053C120` waits on) was only
+  written by the DMA walk; it is now written in both modes.
+
+The slingshot section then ran at 24 fps on the Deck, at 1X as at 2X, so
+not bound by pixels. With the vertex programs on the CPU
+(`RECOMP_VK_CPU_VSH=1`) the GPU's load fell from 78% to 9%: the GPU's
+frame was the vertex-program interpreter (`shaders/nv2a_vsh.vert`), which
+indexes its registers with values read from the program and so took all
+192 VGPRs and 56 KB of code per pipeline. 0.3.0 (also patch 0028):
+
+- Each program is translated to GLSL (`src/vulkan/nv2a_vk_vprog.c`, from
+  `nv2a_vsh.vert`'s own text with the program in place of the loop) and
+  compiled with glslang on a compile thread; the interpreter runs it until
+  then. 24 to 48 VGPRs and 4 to 16 KB each. The slingshot section: 30 fps
+  at about 20% GPU load. glslang is linked statically (its archive, with
+  local `cosh`/`sinh` so the binary keeps needing glibc 2.43, which SteamOS
+  has); SPIRV-Tools and libstdc++ go in the AppImage.
+- Pipelines are built from `VK_EXT_graphics_pipeline_library` parts (vertex
+  input, vertex shader, combiner, output) and linked on first use; a
+  compile thread builds the optimised pipeline and swaps it in.
+  `RECOMP_VK_GPL=0` compiles them whole.
+- Every pipeline the game asks for is listed in
+  `<data>/pipelines.bin` (`RECOMP_VK_PIPELINE_LIST`) and built again at
+  each start: on the Deck, 190 pipelines in 2.9 s, and a menu that took a
+  minute of compiling on the first run of a build ran smoothly on the next.
+  A new build changes the shaders, so its first run still compiles.
+
+Also in 0.3.0: the barn level's light shafts flashed orange over the scene
+every few seconds on the Deck, and on the desktop only with the vertex
+programs on the CPU. They are drawn from an INLINE_ARRAY whose vertex
+carries a 16-bit pair, and the executor sized 16-bit attributes as floats
+when laying out inline vertices: every vertex after the first was read
+from misaligned dwords, positions up to 1e34. The layout now uses
+attr_elem_bytes. Found by skipping draws by texture at run time, then
+logging the shaft draws' attributes.
+
 Next steps, in the order they would be taken (none investigated yet):
 
-1. **Measure on the Deck.** `perf record` on the game (perf_event_paranoid
-   permitting call graphs there), MangoHud's frame-time graph and
-   `RECOMP_VK_VERBOSE=1`: which thread bounds the frame there, how long
-   the remaining flushes wait, and whether the GPU itself is busy.
+1. **Uncapped on the Deck.** At 20% GPU load at 30 fps, 60 fps should be
+   in reach; the executor thread (about 70% of a core at 30) is then the
+   likely limit.
 2. **Hashing.** Every surface and texture in use is hashed once a frame to
    notice CPU writes: about 20 MB a frame, now the largest cost on the
    executor thread. Split it into textures and surfaces first; then a SIMD
@@ -178,17 +228,10 @@ Next steps, in the order they would be taken (none investigated yet):
    frame). Writing a report only once its fence has signalled, leaving it
    incomplete until then as D3D expects, would remove that wait, if Conker
    does not spin on the result.
-5. **The guest's idle spin.** D3D's GPU-idle wait spins a core at 100%. On
-   the Deck the CPU and GPU share one power budget, so a sleeping wait
-   (a hook on `sub_0053C450` that blocks until the executor is idle) could
-   leave more of it to the GPU.
-6. **The executor's own cost.** `nv2a_pb_exec_method`, `note` and
+5. **The executor's own cost.** `nv2a_pb_exec_method`, `note` and
    `pb_walk_segment` are about a sixth of its thread: profile which
    methods are hot.
-7. **Hitches from pipeline creation.** The `VkPipelineCache` is not saved,
-   so every run compiles its pipelines again as new combiner programs show
-   up. Save and load it (the driver's own shader cache helps only partly).
-8. **Texture decode fast paths** for the formats that still go texel by
+6. **Texture decode fast paths** for the formats that still go texel by
    texel through `sample_tex` (seen: 0x00, 0x13, 0x1A, 0x24, 0x28), which
    matter on level loads.
 

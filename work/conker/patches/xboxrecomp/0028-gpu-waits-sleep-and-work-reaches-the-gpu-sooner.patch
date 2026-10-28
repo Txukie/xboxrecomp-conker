@@ -1,0 +1,1778 @@
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index 7673520..64893da 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -4024,18 +4024,17 @@ static void draw_inline_array(void)
+ 
+     memcpy(saved, s_gpu.attr, sizeof saved);
+ 
++    /* Each attribute takes its own size, rounded up to a dword: a 16-bit
++     * pair is one dword, not two. Counting 16-bit attributes as floats put
++     * every attribute after them, and every vertex after the first, in the
++     * wrong place: Conker's light shafts (a short2 at v3) drew from
++     * misaligned dwords, beams out to 1e30 that now and then crossed the
++     * screen as a flash of light. */
+     for (a = 0; a < NV_VERTEX_ATTRS; a++) {
+-        uint32_t bytes;
+         if (!s_gpu.attr[a].size)
+             continue;
+-        switch (s_gpu.attr[a].type) {
+-        case 0:  bytes = 4;                        break;  /* D3DCOLOR   */
+-        case 2:  bytes = 4 * s_gpu.attr[a].size;   break;  /* float      */
+-        case 4:  bytes = s_gpu.attr[a].size;       break;  /* ubyte norm */
+-        default: bytes = 4 * s_gpu.attr[a].size;   break;
+-        }
+         s_gpu.attr[a].offset = off;
+-        off += (bytes + 3u) & ~3u;
++        off += (attr_elem_bytes(&s_gpu.attr[a]) + 3u) & ~3u;
+     }
+     vsize = off;
+     if (!vsize)
+@@ -4493,7 +4492,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+      *
+      * The GPU latches it into PGRAPH 0x400B10, and D3D waits there for the
+      * kick's fence bits. Unmodelled, 0x400B10 read 0 and the wait ended only
+-     * when the semaphore happened to be a multiple of 32. (DMA_GET, which D3D
++     * when the semaphore happened to be a multiple of 32. It is latched
++     * whichever way the ring is read: when only the DMA walk latched it, a
++     * title whose waits pause instead of spinning stopped in that wait for
++     * good at boot. (DMA_GET, which D3D
+      * reads next, is published by the walk itself; see nv2a_pb_scan.c. The
+      * marker's own address is behind the executor's read position, so it is
+      * not used for that.)
+@@ -4509,7 +4511,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+      * enter it. So for a mirrored fence the latch carries the mirror's fence
+      * bits and the marker's address, which is what a GPU that had consumed
+      * everything would report. */
+-    if (method == 0x0310 && subch == 5 && nv2a_pb_dma_walk()) {
++    if (method == 0x0310 && subch == 5) {
+         volatile uint32_t *r = xbox_Nv2aRegPtr(0x400B10);
+ 
+         if (!r)
+diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
+index c919972..911ef89 100644
+--- a/src/kernel/xbox_memory_layout.c
++++ b/src/kernel/xbox_memory_layout.c
+@@ -20,6 +20,7 @@
+ #include "guest_vmem.h"
+ #include "kernel_missing.h"
+ #include "nv2a_flip_hold.h"
++#include "platform/host_time.h"   /* xbox_HostSleepNs */
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -1445,9 +1446,17 @@ volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset)
+     return (volatile uint32_t *)((char *)g_nv2a_memory + offset);
+ }
+ 
++/* How the ack thread waits between passes: yielding for NV2A_ACK_BUSY_NS
++ * after the title last submitted work, then sleeping NV2A_ACK_IDLE_NS a pass.
++ * Yielding alone kept a core busy at all times, whether or not anything was
++ * submitted, which on a handheld is battery. */
++#define NV2A_ACK_BUSY_NS 1000000ull
++#define NV2A_ACK_IDLE_NS 100000ull
++
+ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+ {
+     volatile uint32_t *regs = (volatile uint32_t *)param;
++    uint64_t last_work_ns = 0;
+     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+         /* A flip held for its vblank (nv2a_flip_hold.h): this pass walks
+          * nothing, leaves DMA_GET where it is and acknowledges no PFB flush,
+@@ -1623,6 +1632,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+                     *get = put;
+                     get_written = put;
+                 }
++                if (put != last_put)
++                    last_work_ns = xbox_HostNowNs();
+                 last_put = put; last_put_ms = now_ms;
+                 /* GET as well as PUT. A title that stops submitting has either
+                  * finished or is spinning on the GPU catching up, and only GET
+@@ -1670,7 +1681,10 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
+                                + g_memory_offset) = GetTickCount();
+ 
+-        Sleep(0);  /* yield; the waiter is spinning on another core */
++        if (xbox_HostNowNs() - last_work_ns < NV2A_ACK_BUSY_NS)
++            Sleep(0);  /* yield; the waiter is spinning on another core */
++        else
++            xbox_HostSleepNs(NV2A_ACK_IDLE_NS);
+     }
+     return 0;
+ }
+diff --git a/src/vulkan/CMakeLists.txt b/src/vulkan/CMakeLists.txt
+index 4d5bfbc..d45440c 100644
+--- a/src/vulkan/CMakeLists.txt
++++ b/src/vulkan/CMakeLists.txt
+@@ -24,7 +24,38 @@ foreach(_shader nv2a.vert nv2a.frag nv2a_vsh.vert zeta_pack.vert zeta_pack.frag
+     list(APPEND _vk_spv "${_vk_gen}/${_shader}.inc")
+ endforeach()
+ 
+-add_library(xbox_nv2a_vk STATIC nv2a_vk.c ${_vk_spv})
++# Vertex programs are translated to GLSL from nv2a_vsh.vert's own text and
++# compiled at run time with glslang (nv2a_vk_vprog.c), linked statically
++# when its archives are found. SPIRV-Tools, which glslang uses, stays a
++# shared library.
++add_custom_command(
++    OUTPUT "${_vk_gen}/nv2a_vsh.vert.txt.inc"
++    COMMAND "${CMAKE_COMMAND}" -E make_directory "${_vk_gen}"
++    COMMAND "${CMAKE_COMMAND}" -DIN=${CMAKE_CURRENT_SOURCE_DIR}/shaders/nv2a_vsh.vert
++            -DOUT=${_vk_gen}/nv2a_vsh.vert.txt.inc -DNAME=s_vsh_template
++            -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_text.cmake"
++    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nv2a_vsh.vert"
++            "${CMAKE_CURRENT_SOURCE_DIR}/embed_text.cmake"
++    COMMENT "embed nv2a_vsh.vert"
++    VERBATIM)
++list(APPEND _vk_spv "${_vk_gen}/nv2a_vsh.vert.txt.inc")
++find_path(XBOXRECOMP_GLSLANG_INCLUDE glslang/Include/glslang_c_interface.h)
++find_library(XBOXRECOMP_GLSLANG_LIB libglslang.a)
++find_library(XBOXRECOMP_GLSLANG_RES_LIB libglslang-default-resource-limits.a)
++find_library(XBOXRECOMP_SPIRV_OPT_LIB SPIRV-Tools-opt)
++find_library(XBOXRECOMP_SPIRV_LIB SPIRV-Tools)
++
++add_library(xbox_nv2a_vk STATIC nv2a_vk.c nv2a_vk_vprog.c ${_vk_spv})
++if(XBOXRECOMP_GLSLANG_INCLUDE AND XBOXRECOMP_GLSLANG_LIB AND XBOXRECOMP_GLSLANG_RES_LIB
++   AND XBOXRECOMP_SPIRV_OPT_LIB AND XBOXRECOMP_SPIRV_LIB AND NOT WIN32)
++    target_include_directories(xbox_nv2a_vk PRIVATE ${XBOXRECOMP_GLSLANG_INCLUDE})
++    target_compile_definitions(xbox_nv2a_vk PRIVATE XBOXRECOMP_VK_GLSLANG=1)
++    target_link_libraries(xbox_nv2a_vk PUBLIC
++        ${XBOXRECOMP_GLSLANG_RES_LIB} ${XBOXRECOMP_GLSLANG_LIB}
++        ${XBOXRECOMP_SPIRV_OPT_LIB} ${XBOXRECOMP_SPIRV_LIB} stdc++ m)
++else()
++    message(STATUS "xboxrecomp: no glslang (static) and SPIRV-Tools; vertex programs run in the interpreter")
++endif()
+ target_include_directories(xbox_nv2a_vk
+     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}
+     PRIVATE ${_vk_gen})
+diff --git a/src/vulkan/embed_text.cmake b/src/vulkan/embed_text.cmake
+new file mode 100644
+index 0000000..a4e77dd
+--- /dev/null
++++ b/src/vulkan/embed_text.cmake
+@@ -0,0 +1,5 @@
++# cmake -DIN=<file> -DOUT=<file> -DNAME=<identifier> -P embed_text.cmake:
++# the file's text as a C string (nv2a_vk_vprog.c reads nv2a_vsh.vert so).
++file(READ "${IN}" _hex HEX)
++string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," _hex "${_hex}")
++file(WRITE "${OUT}" "static const char ${NAME}[] = {${_hex}0};\n")
+diff --git a/src/vulkan/nv2a_vk.c b/src/vulkan/nv2a_vk.c
+index e2eeda5..1dbb88c 100644
+--- a/src/vulkan/nv2a_vk.c
++++ b/src/vulkan/nv2a_vk.c
+@@ -29,11 +29,15 @@
+  * only asks).
+  */
+ #include "nv2a_vk.h"
++#include "nv2a_vk_vprog.h"
+ 
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <stdatomic.h>
++#include <threads.h>
++#include <time.h>
+ 
+ #include <vulkan/vulkan.h>
+ 
+@@ -149,6 +153,27 @@ static VkDeviceSize s_kc_off = UINT64_MAX, s_kp_off = UINT64_MAX;
+ static float s_kc_last[192][4];
+ static uint32_t s_kp_last[NV2A_VSH_SLOTS_VK][8], s_kp_n;
+ 
++/* Where a slow frame's time went, since the last flip (RECOMP_VK_VERBOSE
++ * reports frames over 50 ms): on the recording thread, compiling pipelines
++ * and their parts, uploading textures and surfaces, waiting for the GPU. */
++static uint64_t s_fr_pipe_us, s_fr_lib_us, s_fr_up_us, s_fr_wait_us, s_fr_t0;
++static uint32_t s_fr_pipes, s_fr_libs[4], s_fr_ups;
++static _Thread_local int s_compile_thread;   /* set on the compile threads */
++
++static uint64_t now_us(void)
++{
++    struct timespec t;
++    timespec_get(&t, TIME_UTC);
++    return (uint64_t)t.tv_sec * 1000000u + (uint64_t)t.tv_nsec / 1000u;
++}
++
++static void wait_fence(VkFence *f)
++{
++    uint64_t t0 = now_us();
++    vkWaitForFences(s_dev, 1, f, VK_TRUE, UINT64_MAX);
++    s_fr_wait_us += now_us() - t0;
++}
++
+ typedef struct {
+     VkImage image;
+     VkDeviceMemory mem;
+@@ -560,7 +585,7 @@ static int lo_get(Img *lo, uint32_t w, uint32_t h, VkFormat fmt)
+ }
+ 
+ /* Guest memory into the image. */
+-static void surf_upload(Surf *s)
++static void surf_upload_now(Surf *s)
+ {
+     size_t bytes = (size_t)s->w * s->h * s->bpp;
+     VkDeviceSize off = ring_take(&s_rup, bytes, 16);
+@@ -597,6 +622,14 @@ static void surf_upload(Surf *s)
+     s->version = ++s_writes;
+ }
+ 
++static void surf_upload(Surf *s)
++{
++    uint64_t t0 = now_us();
++    surf_upload_now(s);
++    s_fr_up_us += now_us() - t0;
++    s_fr_ups++;
++}
++
+ /* The image into guest memory, at the next flush. */
+ static void surf_queue_readback(Surf *s)
+ {
+@@ -1115,7 +1148,7 @@ static uint32_t stage_mips(const Nv2aStage *st)
+     return st->levels < n ? st->levels : n;
+ }
+ 
+-static int tex_upload(Tex *t, const Nv2aStage *st)
++static int tex_upload_now(Tex *t, const Nv2aStage *st)
+ {
+     uint32_t faces = st->cube ? 6u : 1u, mips = stage_mips(st), f, lv;
+     size_t total = 0, at;
+@@ -1179,6 +1212,15 @@ static int tex_upload(Tex *t, const Nv2aStage *st)
+     return 1;
+ }
+ 
++static int tex_upload(Tex *t, const Nv2aStage *st)
++{
++    uint64_t t0 = now_us();
++    int ok = tex_upload_now(t, st);
++    s_fr_up_us += now_us() - t0;
++    s_fr_ups++;
++    return ok;
++}
++
+ /* Render to texture: a stage that reads exactly what a surface holds -- same
+  * address, size, layout and texel format -- samples a copy of the surface's
+  * image, and nothing goes through guest memory. Conker's front end does this
+@@ -1780,15 +1822,37 @@ enum {
+ 
+ typedef struct {
+     uint32_t fmt, depth, blend, src, dst, eq, mask;
+-    uint32_t vsh;            /* the vertex program runs here (nv2a_vsh.vert) */
++    uint32_t vsh;            /* the vertex stage: 0 nv2a.vert (transformed on
++                              * the CPU), 1 the interpreter (nv2a_vsh.vert),
++                              * 2 + n the program in s_vprogs[n] */
+     uint32_t spec[VK_SPEC_COUNT];
+ } PipeKey;
+ 
+ /* Pipelines by key, open addressing: a frame looks one up per draw, and a
+- * title has hundreds of combiner programs. */
++ * title has hundreds of combiner programs. The compile threads (below) add
++ * to it too, so it is under s_pipe_mtx, as are the vertex programs and the
++ * pipeline libraries. */
+ #define VK_PIPE_SLOTS 4096
+ static struct { PipeKey k; VkPipeline p; int used; } s_pipes[VK_PIPE_SLOTS];
+ static int s_npipes;
++static mtx_t s_pipe_mtx;
++/* Pipelines an optimised one replaced. A command buffer may still hold
++ * them, so they go at the next full flush. */
++static VkPipeline s_pipe_dead[VK_PIPE_SLOTS];
++static int s_npipe_dead;
++
++/* VK_EXT_graphics_pipeline_library. A pipeline is compiled whole on first
++ * use, on the thread that records the frame, and the frame waits: on the
++ * Steam Deck a new combination stalled the game for tens of milliseconds,
++ * and the first visit to a screen was a run of such stalls. With the
++ * extension the four parts are compiled apart and kept (the vertex
++ * program's part with the program, the combiner's with the combiner), a
++ * new combination is linked from them in a fraction of a millisecond, and
++ * a compile thread builds the optimised whole and swaps it in.
++ * RECOMP_VK_GPL=0 compiles whole pipelines as before. */
++static int s_gpl;
++enum { LIB_VI, LIB_PRE, LIB_FS, LIB_FO, LIB_COUNT };   /* its parts */
++static VkPipeline lib_get(const PipeKey *k, int type);
+ 
+ static uint32_t pipe_hash(const PipeKey *k)
+ {
+@@ -1800,6 +1864,96 @@ static uint32_t pipe_hash(const PipeKey *k)
+     return h;
+ }
+ 
++/* ---- Vertex programs ------------------------------------------------ */
++
++/* Vertex programs compiled to shaders of their own (nv2a_vk_vprog.c), by
++ * content, open addressing. Compiling one takes about 10 ms, so a compile
++ * thread does it: until its shader is ready a program runs in the
++ * interpreter, as does one that does not compile. RECOMP_VK_VPROG=0 keeps
++ * them all there. */
++#define VK_MAX_VPROGS 2048
++enum { VPROG_QUEUED, VPROG_COMPILING, VPROG_READY, VPROG_FAILED };
++static struct {
++    uint32_t hash, n;
++    uint32_t (*words)[8];
++    VkShaderModule mod;
++    atomic_int state;
++} s_vprogs[VK_MAX_VPROGS];
++static uint32_t s_nvprogs;
++static atomic_uint s_vprog_done, s_vprog_failed, s_vprog_us;
++static atomic_int s_vprog_on = 1;
++
++/* A program's slot, added if new (*added); -1 when the table is full.
++ * Under s_pipe_mtx. */
++static int vprog_slot_locked(const uint32_t (*prog)[8], uint32_t n, int *added)
++{
++    const uint32_t *w = (const uint32_t *)prog;
++    uint32_t h = 2166136261u, i, slot;
++
++    *added = 0;
++    for (i = 0; i < n * 8; i++)
++        h = (h ^ w[i]) * 16777619u;
++    for (slot = h % VK_MAX_VPROGS; s_vprogs[slot].words; slot = (slot + 1) % VK_MAX_VPROGS)
++        if (s_vprogs[slot].hash == h && s_vprogs[slot].n == n
++            && !memcmp(s_vprogs[slot].words, prog, (size_t)n * 32))
++            return (int)slot;
++    if (s_nvprogs >= VK_MAX_VPROGS / 2 || !(s_vprogs[slot].words = malloc((size_t)n * 32)))
++        return -1;
++    memcpy(s_vprogs[slot].words, prog, (size_t)n * 32);
++    s_vprogs[slot].hash = h;
++    s_vprogs[slot].n = n;
++    atomic_store(&s_vprogs[slot].state, VPROG_QUEUED);
++    s_nvprogs++;
++    *added = 1;
++    return (int)slot;
++}
++
++/* Compile a slot's program, unless another thread already took it. */
++static void vprog_compile(uint32_t slot)
++{
++    VkShaderModuleCreateInfo sm = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
++    struct timespec t0, t1;
++    int want = VPROG_QUEUED;
++    uint32_t *spv;
++    size_t words = 0;
++
++    if (!atomic_compare_exchange_strong(&s_vprogs[slot].state, &want, VPROG_COMPILING))
++        return;
++    timespec_get(&t0, TIME_UTC);
++    spv = nv2a_vk_vprog_compile((const uint32_t (*)[8])s_vprogs[slot].words,
++                                (int)s_vprogs[slot].n, &words);
++    if (spv) {
++        sm.codeSize = words * 4;
++        sm.pCode = spv;
++        if (vkCreateShaderModule(s_dev, &sm, NULL, &s_vprogs[slot].mod) != VK_SUCCESS)
++            s_vprogs[slot].mod = VK_NULL_HANDLE;
++        free(spv);
++    }
++    timespec_get(&t1, TIME_UTC);
++    atomic_fetch_add(&s_vprog_us, (unsigned)((t1.tv_sec - t0.tv_sec) * 1000000
++                                             + (t1.tv_nsec - t0.tv_nsec) / 1000));
++    if (s_vprogs[slot].mod) {
++        /* Its part of every pipeline too, so the first draw that runs it
++         * only links. */
++        if (s_gpl) {
++            PipeKey k;
++            memset(&k, 0, sizeof k);
++            k.vsh = 2 + slot;
++            lib_get(&k, LIB_PRE);
++        }
++        atomic_fetch_add(&s_vprog_done, 1);
++        atomic_store(&s_vprogs[slot].state, VPROG_READY);
++    } else {
++        /* Without a compiler every program fails the same way: stop
++         * asking. */
++        if (atomic_fetch_add(&s_vprog_failed, 1) == 7 && !atomic_load(&s_vprog_done))
++            atomic_store(&s_vprog_on, 0);
++        atomic_store(&s_vprogs[slot].state, VPROG_FAILED);
++    }
++}
++
++/* ---- Pipeline states ------------------------------------------------ */
++
+ static VkBlendFactor blend_factor(uint32_t f)
+ {
+     switch (f) {
+@@ -1833,133 +1987,722 @@ static VkBlendOp blend_op(uint32_t e)
+     }
+ }
+ 
+-static VkPipeline pipe_get(const PipeKey *k)
+-{
+-    static const VkDynamicState dyn[] = {
+-        VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+-        VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+-        VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
+-        VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
+-        VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+-        VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+-        VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE,
+-    };
+-    VkVertexInputBindingDescription vb = { 0, sizeof(Nv2aFullVertex), VK_VERTEX_INPUT_RATE_VERTEX };
++/* Dynamic state, by the part of a pipeline it belongs to. */
++static const VkDynamicState k_dyn_pre[] = {
++    VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
++    VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE,
++};
++static const VkDynamicState k_dyn_fs[] = {
++    VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
++    VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
++    VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
++    VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
++};
++static const VkDynamicState k_dyn_fo[] = { VK_DYNAMIC_STATE_BLEND_CONSTANTS };
++
++/* Every state a key's pipeline is made of, for a whole pipeline or for
++ * any of its library parts. Points into itself: fill it where it stays. */
++typedef struct {
++    VkVertexInputBindingDescription vb;
+     VkVertexInputAttributeDescription va[8];
+-    VkPipelineVertexInputStateCreateInfo vi = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+-    VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+-    VkPipelineViewportStateCreateInfo vp = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+-    VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+-    VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+-    VkPipelineDepthStencilStateCreateInfo ds = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
++    VkPipelineVertexInputStateCreateInfo vi;
++    VkPipelineInputAssemblyStateCreateInfo ia;
++    VkPipelineViewportStateCreateInfo vp;
++    VkPipelineRasterizationStateCreateInfo rs;
++    VkPipelineMultisampleStateCreateInfo ms;
++    VkPipelineDepthStencilStateCreateInfo ds;
+     VkPipelineColorBlendAttachmentState cba;
+-    VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+-    VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
++    VkPipelineColorBlendStateCreateInfo cb;
+     VkPipelineShaderStageCreateInfo st[2];
+-    VkPipelineRenderingCreateInfo pr = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
+-    VkGraphicsPipelineCreateInfo gi = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+-    VkFormat cfmt = (VkFormat)k->fmt;
+-    VkPipeline p;
+-    int i;
+-
+     VkSpecializationMapEntry me[VK_SPEC_COUNT];
+     VkSpecializationInfo spi;
+-    uint32_t slot = pipe_hash(k) % VK_PIPE_SLOTS;
++    VkFormat cfmt;
++    VkPipelineRenderingCreateInfo pr;
++} PipeStates;
+ 
+-    while (s_pipes[slot].used) {
+-        if (!memcmp(&s_pipes[slot].k, k, sizeof *k))
+-            return s_pipes[slot].p;
+-        slot = (slot + 1) % VK_PIPE_SLOTS;
+-    }
+-    if (s_npipes >= VK_PIPE_SLOTS - 1)
+-        return VK_NULL_HANDLE;
++static void pipe_states(const PipeKey *k, PipeStates *ps)
++{
++    int i;
++
++    memset(ps, 0, sizeof *ps);
+     for (i = 0; i < VK_SPEC_COUNT; i++) {
+-        me[i].constantID = (uint32_t)i;
+-        me[i].offset = (uint32_t)(4 * i);
+-        me[i].size = 4;
++        ps->me[i].constantID = (uint32_t)i;
++        ps->me[i].offset = (uint32_t)(4 * i);
++        ps->me[i].size = 4;
+     }
+-    spi.mapEntryCount = VK_SPEC_COUNT;
+-    spi.pMapEntries = me;
+-    spi.dataSize = sizeof k->spec;
+-    spi.pData = k->spec;
++    ps->spi.mapEntryCount = VK_SPEC_COUNT;
++    ps->spi.pMapEntries = ps->me;
++    ps->spi.dataSize = sizeof k->spec;
++    ps->spi.pData = k->spec;
+ 
++    ps->vb.stride = sizeof(Nv2aFullVertex);
++    ps->vb.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+     for (i = 0; i < 8; i++) {
+-        va[i].location = (uint32_t)i;
+-        va[i].binding = 0;
+-        va[i].format = VK_FORMAT_R32G32B32A32_SFLOAT;
+-    }
+-    va[0].offset = offsetof(Nv2aFullVertex, pos);
+-    va[1].offset = offsetof(Nv2aFullVertex, d0);
+-    va[2].offset = offsetof(Nv2aFullVertex, d1);
+-    va[3].offset = offsetof(Nv2aFullVertex, fog);
++        ps->va[i].location = (uint32_t)i;
++        ps->va[i].format = VK_FORMAT_R32G32B32A32_SFLOAT;
++    }
++    ps->va[0].offset = offsetof(Nv2aFullVertex, pos);
++    ps->va[1].offset = offsetof(Nv2aFullVertex, d0);
++    ps->va[2].offset = offsetof(Nv2aFullVertex, d1);
++    ps->va[3].offset = offsetof(Nv2aFullVertex, fog);
+     for (i = 0; i < 4; i++)
+-        va[4 + i].offset = (uint32_t)(offsetof(Nv2aFullVertex, tex) + 16 * i);
++        ps->va[4 + i].offset = (uint32_t)(offsetof(Nv2aFullVertex, tex) + 16 * i);
++    ps->vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+     if (!k->vsh) {           /* a program batch pulls its own vertices */
+-        vi.vertexBindingDescriptionCount = 1;
+-        vi.pVertexBindingDescriptions = &vb;
+-        vi.vertexAttributeDescriptionCount = 8;
+-        vi.pVertexAttributeDescriptions = va;
+-    }
+-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+-    vp.viewportCount = 1;
+-    vp.scissorCount = 1;
++        ps->vi.vertexBindingDescriptionCount = 1;
++        ps->vi.pVertexBindingDescriptions = &ps->vb;
++        ps->vi.vertexAttributeDescriptionCount = 8;
++        ps->vi.pVertexAttributeDescriptions = ps->va;
++    }
++    ps->ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
++    ps->ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++    ps->vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
++    ps->vp.viewportCount = 1;
++    ps->vp.scissorCount = 1;
+     /* No depth clipping: the CPU rasteriser compares z as it is, past the
+      * far value included. */
+-    rs.depthClampEnable = s_depth_clamp ? VK_TRUE : VK_FALSE;
+-    rs.polygonMode = VK_POLYGON_MODE_FILL;
+-    rs.cullMode = VK_CULL_MODE_NONE;
+-    rs.lineWidth = 1.0f;
+-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+-    ds.depthBoundsTestEnable = VK_FALSE;
+-    memset(&cba, 0, sizeof cba);
+-    cba.blendEnable = k->blend ? VK_TRUE : VK_FALSE;
+-    cba.srcColorBlendFactor = cba.srcAlphaBlendFactor = blend_factor(k->src);
+-    cba.dstColorBlendFactor = cba.dstAlphaBlendFactor = blend_factor(k->dst);
++    ps->rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
++    ps->rs.depthClampEnable = s_depth_clamp ? VK_TRUE : VK_FALSE;
++    ps->rs.polygonMode = VK_POLYGON_MODE_FILL;
++    ps->rs.cullMode = VK_CULL_MODE_NONE;
++    ps->rs.lineWidth = 1.0f;
++    ps->ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
++    ps->ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++    ps->ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
++    ps->ds.depthBoundsTestEnable = VK_FALSE;
++    ps->cba.blendEnable = k->blend ? VK_TRUE : VK_FALSE;
++    ps->cba.srcColorBlendFactor = ps->cba.srcAlphaBlendFactor = blend_factor(k->src);
++    ps->cba.dstColorBlendFactor = ps->cba.dstAlphaBlendFactor = blend_factor(k->dst);
+     if (k->src == 0x0308)          /* SRC_ALPHA_SATURATE's alpha is 1 */
+-        cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+-    cba.colorBlendOp = cba.alphaBlendOp = blend_op(k->eq);
+-    cba.colorWriteMask = k->mask;
+-    cb.attachmentCount = 1;
+-    cb.pAttachments = &cba;
+-    dy.dynamicStateCount = (uint32_t)(sizeof dyn / sizeof dyn[0]);
+-    dy.pDynamicStates = dyn;
+-    memset(st, 0, sizeof st);
+-    st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+-    st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+-    st[0].module = k->vsh ? s_vsh : s_vs;
+-    st[0].pName = "main";
+-    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+-    st[1].module = s_fs;
+-    st[1].pName = "main";
+-    st[1].pSpecializationInfo = &spi;
+-    pr.colorAttachmentCount = 1;
+-    pr.pColorAttachmentFormats = &cfmt;
++        ps->cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
++    ps->cba.colorBlendOp = ps->cba.alphaBlendOp = blend_op(k->eq);
++    ps->cba.colorWriteMask = k->mask;
++    ps->cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
++    ps->cb.attachmentCount = 1;
++    ps->cb.pAttachments = &ps->cba;
++    ps->st[0].sType = ps->st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++    ps->st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
++    ps->st[0].module = k->vsh >= 2 ? s_vprogs[k->vsh - 2].mod : k->vsh ? s_vsh : s_vs;
++    ps->st[0].pName = "main";
++    ps->st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++    ps->st[1].module = s_fs;
++    ps->st[1].pName = "main";
++    ps->st[1].pSpecializationInfo = &ps->spi;
++    ps->cfmt = (VkFormat)k->fmt;
++    ps->pr.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
++    ps->pr.colorAttachmentCount = 1;
++    ps->pr.pColorAttachmentFormats = &ps->cfmt;
+     if (k->depth) {
+-        pr.depthAttachmentFormat = s_depth_fmt;
++        ps->pr.depthAttachmentFormat = s_depth_fmt;
+         if (s_depth_fmt != VK_FORMAT_D32_SFLOAT)
+-            pr.stencilAttachmentFormat = s_depth_fmt;
++            ps->pr.stencilAttachmentFormat = s_depth_fmt;
+     }
+-    gi.pNext = &pr;
++}
++
++/* The whole pipeline in one go: without the extension, or with it off. */
++static VkPipeline pipe_create_whole(const PipeKey *k)
++{
++    VkDynamicState dyn[16];
++    VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
++    VkGraphicsPipelineCreateInfo gi = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
++    PipeStates ps;
++    VkPipeline p;
++    uint32_t n = 0, i;
++
++    pipe_states(k, &ps);
++    for (i = 0; i < sizeof k_dyn_pre / sizeof k_dyn_pre[0]; i++) dyn[n++] = k_dyn_pre[i];
++    for (i = 0; i < sizeof k_dyn_fs / sizeof k_dyn_fs[0]; i++) dyn[n++] = k_dyn_fs[i];
++    for (i = 0; i < sizeof k_dyn_fo / sizeof k_dyn_fo[0]; i++) dyn[n++] = k_dyn_fo[i];
++    dy.dynamicStateCount = n;
++    dy.pDynamicStates = dyn;
++    gi.pNext = &ps.pr;
+     gi.stageCount = 2;
+-    gi.pStages = st;
+-    gi.pVertexInputState = &vi;
+-    gi.pInputAssemblyState = &ia;
+-    gi.pViewportState = &vp;
+-    gi.pRasterizationState = &rs;
+-    gi.pMultisampleState = &ms;
+-    gi.pDepthStencilState = &ds;
+-    gi.pColorBlendState = &cb;
++    gi.pStages = ps.st;
++    gi.pVertexInputState = &ps.vi;
++    gi.pInputAssemblyState = &ps.ia;
++    gi.pViewportState = &ps.vp;
++    gi.pRasterizationState = &ps.rs;
++    gi.pMultisampleState = &ps.ms;
++    gi.pDepthStencilState = &ps.ds;
++    gi.pColorBlendState = &ps.cb;
+     gi.pDynamicState = &dy;
+     gi.layout = s_layout;
+     if (vkCreateGraphicsPipelines(s_dev, s_pcache, 1, &gi, NULL, &p) != VK_SUCCESS)
+         return VK_NULL_HANDLE;
+-    s_pipes[slot].k = *k;
+-    s_pipes[slot].p = p;
+-    s_pipes[slot].used = 1;
+-    s_npipes++;
+     return p;
+ }
+ 
++/* ---- Pipeline libraries --------------------------------------------- */
++
++/* The four parts (LIB_*), each kept by the part of the key it depends on. */
++#define VK_LIB_SLOTS 8192
++static struct { PipeKey k; uint32_t type; VkPipeline p; int used; } s_libs[VK_LIB_SLOTS];
++static int s_nlibs;
++
++static void lib_key(PipeKey *m, const PipeKey *k, int type)
++{
++    memset(m, 0, sizeof *m);
++    switch (type) {
++    case LIB_VI:
++        m->vsh = k->vsh != 0;
++        break;
++    case LIB_PRE:
++        m->vsh = k->vsh;
++        break;
++    case LIB_FS:
++        memcpy(m->spec, k->spec, sizeof m->spec);
++        m->depth = k->depth;
++        break;
++    default:
++        m->fmt = k->fmt;
++        m->depth = k->depth;
++        m->blend = k->blend;
++        m->src = k->src;
++        m->dst = k->dst;
++        m->eq = k->eq;
++        m->mask = k->mask;
++        break;
++    }
++}
++
++static VkPipeline lib_create(const PipeKey *k, int type)
++{
++    static const VkGraphicsPipelineLibraryFlagsEXT part[LIB_COUNT] = {
++        VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT,
++        VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT,
++        VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT,
++        VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT,
++    };
++    VkGraphicsPipelineLibraryCreateInfoEXT li = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT };
++    VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
++    VkGraphicsPipelineCreateInfo gi = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
++    PipeStates ps;
++    VkPipeline p;
++
++    pipe_states(k, &ps);
++    li.pNext = &ps.pr;
++    li.flags = part[type];
++    gi.pNext = &li;
++    gi.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR
++             | VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT;
++    gi.layout = s_layout;
++    switch (type) {
++    case LIB_VI:
++        gi.pVertexInputState = &ps.vi;
++        gi.pInputAssemblyState = &ps.ia;
++        break;
++    case LIB_PRE:
++        gi.stageCount = 1;
++        gi.pStages = &ps.st[0];
++        gi.pViewportState = &ps.vp;
++        gi.pRasterizationState = &ps.rs;
++        dy.dynamicStateCount = sizeof k_dyn_pre / sizeof k_dyn_pre[0];
++        dy.pDynamicStates = k_dyn_pre;
++        gi.pDynamicState = &dy;
++        break;
++    case LIB_FS:
++        gi.stageCount = 1;
++        gi.pStages = &ps.st[1];
++        gi.pDepthStencilState = &ps.ds;
++        gi.pMultisampleState = &ps.ms;
++        dy.dynamicStateCount = sizeof k_dyn_fs / sizeof k_dyn_fs[0];
++        dy.pDynamicStates = k_dyn_fs;
++        gi.pDynamicState = &dy;
++        break;
++    default:
++        gi.pColorBlendState = &ps.cb;
++        gi.pMultisampleState = &ps.ms;
++        dy.dynamicStateCount = sizeof k_dyn_fo / sizeof k_dyn_fo[0];
++        dy.pDynamicStates = k_dyn_fo;
++        gi.pDynamicState = &dy;
++        break;
++    }
++    if (vkCreateGraphicsPipelines(s_dev, s_pcache, 1, &gi, NULL, &p) != VK_SUCCESS)
++        return VK_NULL_HANDLE;
++    return p;
++}
++
++/* Under s_pipe_mtx. */
++static int lib_find_locked(const PipeKey *m, int type, uint32_t *slot)
++{
++    for (*slot = (pipe_hash(m) ^ (uint32_t)type * 0x9E3779B9u) % VK_LIB_SLOTS;
++         s_libs[*slot].used; *slot = (*slot + 1) % VK_LIB_SLOTS)
++        if (s_libs[*slot].type == (uint32_t)type && !memcmp(&s_libs[*slot].k, m, sizeof *m))
++            return 1;
++    return 0;
++}
++
++static VkPipeline lib_get(const PipeKey *k, int type)
++{
++    PipeKey m;
++    VkPipeline p;
++    uint32_t slot;
++
++    lib_key(&m, k, type);
++    mtx_lock(&s_pipe_mtx);
++    if (lib_find_locked(&m, type, &slot)) {
++        p = s_libs[slot].p;
++        mtx_unlock(&s_pipe_mtx);
++        return p;
++    }
++    mtx_unlock(&s_pipe_mtx);
++    {
++        uint64_t t0 = now_us();
++        p = lib_create(k, type);
++        if (!s_compile_thread) {
++            s_fr_lib_us += now_us() - t0;
++            s_fr_libs[type]++;
++        }
++    }
++    if (!p)
++        return VK_NULL_HANDLE;
++    mtx_lock(&s_pipe_mtx);
++    if (lib_find_locked(&m, type, &slot)) {          /* made meanwhile */
++        vkDestroyPipeline(s_dev, p, NULL);
++        p = s_libs[slot].p;
++    } else if (s_nlibs < VK_LIB_SLOTS - 1) {
++        s_libs[slot].k = m;
++        s_libs[slot].type = (uint32_t)type;
++        s_libs[slot].p = p;
++        s_libs[slot].used = 1;
++        s_nlibs++;
++    }
++    mtx_unlock(&s_pipe_mtx);
++    return p;
++}
++
++/* A key's pipeline: linked from its parts, optimised across them (`lto`)
++ * or not; whole without the extension. */
++static VkPipeline pipe_build(const PipeKey *k, int lto)
++{
++    VkPipelineLibraryCreateInfoKHR lci = { VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR };
++    VkGraphicsPipelineCreateInfo gi = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
++    VkPipeline libs[LIB_COUNT], p;
++    int t;
++
++    if (!s_gpl)
++        return pipe_create_whole(k);
++    for (t = 0; t < LIB_COUNT; t++)
++        if (!(libs[t] = lib_get(k, t)))
++            return VK_NULL_HANDLE;
++    lci.libraryCount = LIB_COUNT;
++    lci.pLibraries = libs;
++    gi.pNext = &lci;
++    gi.flags = lto ? VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT : 0;
++    gi.layout = s_layout;
++    if (vkCreateGraphicsPipelines(s_dev, s_pcache, 1, &gi, NULL, &p) != VK_SUCCESS)
++        return VK_NULL_HANDLE;
++    return p;
++}
++
++/* Under s_pipe_mtx: the key's entry, or where it would go (-1: full). */
++static int pipe_find_locked(const PipeKey *k, int *found)
++{
++    uint32_t slot = pipe_hash(k) % VK_PIPE_SLOTS;
++
++    *found = 0;
++    while (s_pipes[slot].used) {
++        if (!memcmp(&s_pipes[slot].k, k, sizeof *k)) {
++            *found = 1;
++            return (int)slot;
++        }
++        slot = (slot + 1) % VK_PIPE_SLOTS;
++    }
++    return s_npipes >= VK_PIPE_SLOTS - 1 ? -1 : (int)slot;
++}
++
++/* Adds p for k unless one is there already, which is returned instead (p
++ * is then destroyed); *added says which. */
++static VkPipeline pipe_add(const PipeKey *k, VkPipeline p, int *added)
++{
++    int found, slot;
++
++    *added = 0;
++    mtx_lock(&s_pipe_mtx);
++    slot = pipe_find_locked(k, &found);
++    if (found) {
++        VkPipeline have = s_pipes[slot].p;
++        mtx_unlock(&s_pipe_mtx);
++        vkDestroyPipeline(s_dev, p, NULL);
++        return have;
++    }
++    if (slot >= 0) {
++        s_pipes[slot].k = *k;
++        s_pipes[slot].p = p;
++        s_pipes[slot].used = 1;
++        s_npipes++;
++        *added = 1;
++    }
++    mtx_unlock(&s_pipe_mtx);
++    return p;
++}
++
++/* ---- Compile threads ------------------------------------------------ */
++
++/* Two threads, taking in order: vertex programs (a draw is waiting in the
++ * interpreter), optimised pipelines (a draw runs a merely linked one), then
++ * the pipeline list (pipelines a draw may want later). */
++#define VK_JOB_RING 4096
++#define VK_COMPILE_THREADS 2
++static mtx_t s_job_mtx;
++static cnd_t s_job_cnd;
++static int s_jobs_up;            /* 1 running, -1 could not start */
++static uint32_t s_jv[VK_JOB_RING], s_jv_head, s_jv_tail;
++static PipeKey s_jl[VK_JOB_RING];
++static uint32_t s_jl_head, s_jl_tail;
++
++/* The pipeline list: every pipeline the title has asked for, kept across
++ * runs (RECOMP_VK_PIPELINE_LIST names the file) and built again at start,
++ * so a screen seen before does not compile anything when it comes back.
++ * A vertex program's pipeline is listed with the program itself, since
++ * its slot here differs from run to run. */
++typedef struct { PipeKey k; uint32_t n; uint32_t (*words)[8]; } PipeRec;
++static PipeRec *s_pre;
++static uint32_t s_pre_n, s_pre_next;
++static atomic_uint s_pre_done;
++static struct timespec s_pre_t0;
++
++static void pipe_optimise(const PipeKey *k)
++{
++    VkPipeline p = pipe_build(k, 1), old;
++    int found, slot;
++
++    if (!p)
++        return;
++    mtx_lock(&s_pipe_mtx);
++    slot = pipe_find_locked(k, &found);
++    if (found && s_npipe_dead < VK_PIPE_SLOTS) {
++        old = s_pipes[slot].p;
++        s_pipes[slot].p = p;
++        s_pipe_dead[s_npipe_dead++] = old;
++        p = VK_NULL_HANDLE;
++    }
++    mtx_unlock(&s_pipe_mtx);
++    if (p)
++        vkDestroyPipeline(s_dev, p, NULL);
++}
++
++static void precompile(const PipeRec *r)
++{
++    PipeKey k = r->k;
++    int found, added, slot;
++    VkPipeline p;
++    struct timespec t1;
++
++    if (r->n) {
++        k.vsh = 1;
++        if (atomic_load(&s_vprog_on)) {
++            mtx_lock(&s_pipe_mtx);
++            slot = vprog_slot_locked((const uint32_t (*)[8])r->words, r->n, &added);
++            mtx_unlock(&s_pipe_mtx);
++            if (slot >= 0) {
++                struct timespec ms = { 0, 1000000 };
++                vprog_compile((uint32_t)slot);
++                while (atomic_load(&s_vprogs[slot].state) == VPROG_COMPILING)
++                    thrd_sleep(&ms, NULL);
++                if (atomic_load(&s_vprogs[slot].state) == VPROG_READY)
++                    k.vsh = 2 + (uint32_t)slot;
++            }
++        }
++    }
++    mtx_lock(&s_pipe_mtx);
++    pipe_find_locked(&k, &found);
++    mtx_unlock(&s_pipe_mtx);
++    if (!found && (p = pipe_build(&k, 1)))
++        pipe_add(&k, p, &added);
++    if (atomic_fetch_add(&s_pre_done, 1) + 1 == s_pre_n) {
++        timespec_get(&t1, TIME_UTC);
++        fprintf(stderr, "[VK] pipeline list: %u pipelines ready in %.1f s\n", s_pre_n,
++                (double)(t1.tv_sec - s_pre_t0.tv_sec)
++                + (double)(t1.tv_nsec - s_pre_t0.tv_nsec) / 1e9);
++    }
++}
++
++static int compile_thread(void *arg)
++{
++    (void)arg;
++    s_compile_thread = 1;
++    for (;;) {
++        int kind;
++        uint32_t slot = 0;
++        PipeKey k;
++        const PipeRec *r = NULL;
++
++        mtx_lock(&s_job_mtx);
++        for (;;) {
++            if (s_jv_head != s_jv_tail) {
++                kind = 0;
++                slot = s_jv[s_jv_head++ % VK_JOB_RING];
++                break;
++            }
++            if (s_jl_head != s_jl_tail) {
++                kind = 1;
++                k = s_jl[s_jl_head++ % VK_JOB_RING];
++                break;
++            }
++            if (s_pre_next < s_pre_n) {
++                kind = 2;
++                r = &s_pre[s_pre_next++];
++                break;
++            }
++            cnd_wait(&s_job_cnd, &s_job_mtx);
++        }
++        mtx_unlock(&s_job_mtx);
++        if (kind == 0)
++            vprog_compile(slot);
++        else if (kind == 1)
++            pipe_optimise(&k);
++        else
++            precompile(r);
++    }
++    return 0;
++}
++
++static void jobs_start(void)
++{
++    thrd_t t;
++    int i;
++
++    s_jobs_up = -1;
++    if (mtx_init(&s_job_mtx, mtx_plain) != thrd_success
++        || cnd_init(&s_job_cnd) != thrd_success)
++        return;
++    for (i = 0; i < VK_COMPILE_THREADS; i++) {
++        if (thrd_create(&t, compile_thread, NULL) != thrd_success)
++            break;
++        thrd_detach(t);
++        s_jobs_up = 1;
++    }
++}
++
++static void job_push_vprog(uint32_t slot)
++{
++    mtx_lock(&s_job_mtx);
++    s_jv[s_jv_tail++ % VK_JOB_RING] = slot;
++    cnd_signal(&s_job_cnd);
++    mtx_unlock(&s_job_mtx);
++}
++
++static void job_push_optimise(const PipeKey *k)
++{
++    mtx_lock(&s_job_mtx);
++    if (s_jl_tail - s_jl_head < VK_JOB_RING) {   /* else it stays merely linked */
++        s_jl[s_jl_tail++ % VK_JOB_RING] = *k;
++        cnd_signal(&s_job_cnd);
++    }
++    mtx_unlock(&s_job_mtx);
++}
++
++/* The PipeKey vsh for a program batch's program. */
++static uint32_t vprog_for(const uint32_t (*prog)[8], uint32_t n)
++{
++    int added, slot;
++
++    if (!atomic_load(&s_vprog_on) || s_jobs_up < 0)
++        return 1;
++    mtx_lock(&s_pipe_mtx);
++    slot = vprog_slot_locked(prog, n, &added);
++    mtx_unlock(&s_pipe_mtx);
++    if (slot < 0)
++        return 1;
++    if (added)
++        job_push_vprog((uint32_t)slot);
++    return atomic_load(&s_vprogs[slot].state) == VPROG_READY ? 2 + (uint32_t)slot : 1;
++}
++
++/* ---- Pipeline list file --------------------------------------------- */
++
++/* Header, then records: n (program instructions, 0 for none), the key (vsh
++ * 0, or 2 with a program), the program, and a check word of all that. A
++ * record cut short by a crash fails its check and ends the list. */
++static const char k_pl_magic[8] = "NV2APL1";
++#define VK_PL_SEEN 65536
++static uint64_t s_pl_seen[VK_PL_SEEN];
++static uint32_t s_pl_nseen;
++static FILE *s_pl_file;
++
++static uint64_t pl_hash(const PipeKey *k, uint32_t n, const uint32_t (*w)[8])
++{
++    const uint8_t *b = (const uint8_t *)k;
++    uint64_t h = 14695981039346656037ull;
++    size_t i;
++
++    for (i = 0; i < sizeof *k; i++)
++        h = (h ^ b[i]) * 1099511628211ull;
++    h = (h ^ n) * 1099511628211ull;
++    b = (const uint8_t *)w;
++    for (i = 0; i < (size_t)n * 32; i++)
++        h = (h ^ b[i]) * 1099511628211ull;
++    return h | 1;    /* 0 marks a free slot */
++}
++
++/* Whether h is new, noting it. Only the recording thread calls this once
++ * the list is loaded. */
++static int pl_note(uint64_t h)
++{
++    uint32_t slot = (uint32_t)(h % VK_PL_SEEN);
++
++    while (s_pl_seen[slot]) {
++        if (s_pl_seen[slot] == h)
++            return 0;
++        slot = (slot + 1) % VK_PL_SEEN;
++    }
++    if (s_pl_nseen >= VK_PL_SEEN / 2)
++        return 0;
++    s_pl_seen[slot] = h;
++    s_pl_nseen++;
++    return 1;
++}
++
++static void pl_write(FILE *f, const PipeKey *k, uint32_t n, const uint32_t (*w)[8])
++{
++    uint32_t check = (uint32_t)pl_hash(k, n, w);
++
++    fwrite(&n, 4, 1, f);
++    fwrite(k, sizeof *k, 1, f);
++    if (n)
++        fwrite(w, 32, n, f);
++    fwrite(&check, 4, 1, f);
++}
++
++/* A pipeline the title asked for, onto the list if it is not there. */
++static void pl_record(const PipeKey *key)
++{
++    PipeKey k = *key;
++    const uint32_t (*w)[8] = NULL;
++    uint32_t n = 0;
++
++    if (!s_pl_file || k.vsh == 1)      /* the interpreter stands in: skip */
++        return;
++    if (k.vsh >= 2) {
++        n = s_vprogs[k.vsh - 2].n;
++        w = (const uint32_t (*)[8])s_vprogs[k.vsh - 2].words;
++        k.vsh = 2;
++    }
++    if (!pl_note(pl_hash(&k, n, w)))
++        return;
++    pl_write(s_pl_file, &k, n, w);
++    fflush(s_pl_file);
++}
++
++/* Read the list (keeping what checks out, written back compacted), queue
++ * it for the compile threads, and keep the file open to add to. */
++static void pl_load(const char *path)
++{
++    FILE *f = fopen(path, "rb");
++    uint8_t *buf = NULL;
++    long size = 0;
++    size_t at;
++    uint32_t cap = 0, ks;
++    char tmp[4096];
++
++    if (f) {
++        if (!fseek(f, 0, SEEK_END) && (size = ftell(f)) > 0 && !fseek(f, 0, SEEK_SET)
++            && (buf = malloc((size_t)size)) && fread(buf, 1, (size_t)size, f) != (size_t)size)
++            size = 0;
++        fclose(f);
++    }
++    if (buf && size >= 12 && !memcmp(buf, k_pl_magic, 8)
++        && (memcpy(&ks, buf + 8, 4), ks == sizeof(PipeKey))) {
++        for (at = 12; at + 8 + sizeof(PipeKey) <= (size_t)size;) {
++            uint32_t n, check;
++            PipeKey k;
++            const uint32_t (*w)[8];
++            size_t len;
++
++            memcpy(&n, buf + at, 4);
++            if (n > NV2A_VSH_SLOTS_VK)
++                break;
++            len = 4 + sizeof k + (size_t)n * 32 + 4;
++            if (at + len > (size_t)size)
++                break;
++            memcpy(&k, buf + at + 4, sizeof k);
++            w = (const uint32_t (*)[8])(buf + at + 4 + sizeof k);
++            memcpy(&check, buf + at + len - 4, 4);
++            if (check != (uint32_t)pl_hash(&k, n, n ? w : NULL) || (n ? k.vsh != 2 : k.vsh != 0))
++                break;
++            at += len;
++            if (!pl_note(pl_hash(&k, n, n ? w : NULL)))
++                continue;
++            if (s_pre_n == cap) {
++                PipeRec *g = realloc(s_pre, (cap = cap ? cap * 2 : 256) * sizeof *g);
++                if (!g)
++                    break;
++                s_pre = g;
++            }
++            s_pre[s_pre_n].k = k;
++            s_pre[s_pre_n].n = n;
++            s_pre[s_pre_n].words = NULL;
++            if (n && !(s_pre[s_pre_n].words = malloc((size_t)n * 32)))
++                continue;
++            if (n)
++                memcpy(s_pre[s_pre_n].words, w, (size_t)n * 32);
++            s_pre_n++;
++        }
++    }
++    free(buf);
++
++    snprintf(tmp, sizeof tmp, "%s.tmp", path);
++    if ((f = fopen(tmp, "wb"))) {
++        uint32_t i;
++        ks = sizeof(PipeKey);
++        fwrite(k_pl_magic, 8, 1, f);
++        fwrite(&ks, 4, 1, f);
++        for (i = 0; i < s_pre_n; i++)
++            pl_write(f, &s_pre[i].k, s_pre[i].n, (const uint32_t (*)[8])s_pre[i].words);
++        if (fclose(f) == 0) {
++            remove(path);   /* Windows' rename does not replace */
++            rename(tmp, path);
++        }
++    }
++    s_pl_file = fopen(path, "ab");
++    timespec_get(&s_pre_t0, TIME_UTC);
++    fprintf(stderr, "[VK] pipeline list %s: %u pipelines to build\n", path, s_pre_n);
++}
++
++/* ---- Pipelines ------------------------------------------------------ */
++
++static VkPipeline pipe_get(const PipeKey *k)
++{
++    VkPipeline p;
++    int found, slot, added;
++
++    mtx_lock(&s_pipe_mtx);
++    slot = pipe_find_locked(k, &found);
++    p = found ? s_pipes[slot].p : VK_NULL_HANDLE;
++    mtx_unlock(&s_pipe_mtx);
++    if (found)
++        return p;
++    {
++        uint64_t t0 = now_us();
++        p = pipe_build(k, 0);
++        s_fr_pipe_us += now_us() - t0;
++        s_fr_pipes++;
++    }
++    if (!p)
++        return VK_NULL_HANDLE;
++    p = pipe_add(k, p, &added);
++    if (added) {
++        if (s_gpl && s_jobs_up > 0)
++            job_push_optimise(k);
++        pl_record(k);
++    }
++    return p;
++}
++
++/* Pipelines that optimised ones replaced, once nothing can be using them
++ * (flush). */
++static void pipe_reap(void)
++{
++    int i;
++
++    mtx_lock(&s_pipe_mtx);
++    for (i = 0; i < s_npipe_dead; i++)
++        vkDestroyPipeline(s_dev, s_pipe_dead[i], NULL);
++    s_npipe_dead = 0;
++    mtx_unlock(&s_pipe_mtx);
++}
++
+ /* ---- Visibility tests ----------------------------------------------- */
+ 
+ /* Occlusion queries, one per draw that counts (zpass_enable), in the order
+@@ -1979,6 +2722,7 @@ static uint32_t s_nopen;
+ /* ---- Flush ---------------------------------------------------------- */
+ 
+ static uint32_t s_flushes, s_soft_flushes, s_draws, s_tris, s_prog_draws;
++static uint32_t s_submit_draws = 64, s_since_submit;  /* see submit_if_due */
+ 
+ static void slot_save(void)
+ {
+@@ -2018,7 +2762,7 @@ static void soft_flush(void)
+     s_cur ^= 1;
+     n = &s_slot[s_cur];
+     if (n->busy) {
+-        vkWaitForFences(s_dev, 1, &n->fence, VK_TRUE, UINT64_MAX);
++        wait_fence(&n->fence);
+         vkResetFences(s_dev, 1, &n->fence);
+         vkResetCommandPool(s_dev, n->pool, 0);
+         n->busy = 0;
+@@ -2026,6 +2770,7 @@ static void soft_flush(void)
+     n->rv.used = n->ru.used = n->rup.used = 0;
+     slot_load();
+     s_kc_off = s_kp_off = UINT64_MAX;
++    s_since_submit = 0;
+     s_soft_flushes++;
+ }
+ 
+@@ -2045,7 +2790,7 @@ static void flush(void)
+     if (vkQueueSubmit(s_queue, 1, &si, s_fence) != VK_SUCCESS) {
+         fprintf(stderr, "[VK] submit failed\n");
+     } else {
+-        vkWaitForFences(s_dev, 1, &s_fence, VK_TRUE, UINT64_MAX);
++        wait_fence(&s_fence);
+     }
+     vkResetFences(s_dev, 1, &s_fence);
+     vkResetCommandPool(s_dev, s_pool, 0);
+@@ -2055,7 +2800,7 @@ static void flush(void)
+     {   /* the other slot's submission, if any, is done too */
+         Slot *o = &s_slot[s_cur ^ 1];
+         if (o->busy) {
+-            vkWaitForFences(s_dev, 1, &o->fence, VK_TRUE, UINT64_MAX);
++            wait_fence(&o->fence);
+             vkResetFences(s_dev, 1, &o->fence);
+             vkResetCommandPool(s_dev, o->pool, 0);
+             o->rv.used = o->ru.used = o->rup.used = 0;
+@@ -2104,8 +2849,10 @@ static void flush(void)
+     for (i = 0; i < s_ndead; i++)
+         img_destroy_now(&s_dead[i]);
+     s_ndead = 0;
++    pipe_reap();
+     s_rv.used = s_ru.used = s_rup.used = s_rrd.used = 0;
+     s_kc_off = s_kp_off = UINT64_MAX;
++    s_since_submit = 0;
+ }
+ 
+ /* ---- The back end --------------------------------------------------- */
+@@ -2457,6 +3204,18 @@ static VkCommandBuffer bind_draw(const Nv2aSurface *ns, const Nv2aRenderState *r
+     return c;
+ }
+ 
++/* Hand the GPU what has been recorded every so many draws, instead of the
++ * whole frame at its flip. Recording a frame takes a good part of it, and
++ * with one submission a frame the GPU idles all that time: a GPU that
++ * scales its clock by load (the Steam Deck's) then runs at a fraction of
++ * its clock, and the frame takes longer still. RECOMP_VK_SUBMIT_DRAWS sets
++ * how many (0: once a frame). */
++static void submit_if_due(void)
++{
++    if (s_submit_draws && s_since_submit >= s_submit_draws)
++        soft_flush();
++}
++
+ static void end_draw(VkCommandBuffer c, Surf *s, const PipeKey *pk, int use_q)
+ {
+     (void)c;
+@@ -2466,6 +3225,7 @@ static void end_draw(VkCommandBuffer c, Surf *s, const PipeKey *pk, int use_q)
+     }
+     (void)use_q;
+     s_draws++;
++    s_since_submit++;
+ }
+ 
+ static void vk_draw_full(const Nv2aSurface *ns, const Nv2aFullBatch *b)
+@@ -2486,6 +3246,7 @@ static void vk_draw_full(const Nv2aSurface *ns, const Nv2aFullBatch *b)
+ 
+     if (!b->count || vbytes > s_rv.size)
+         return;
++    submit_if_due();
+     s_draw_target_va = ns->color_va;
+     stage_descriptors(b, img2d, imgcube);
+     s = surf_get(ns, ns->clip_y + ns->height);
+@@ -2575,6 +3336,7 @@ static void vk_draw_program(const Nv2aSurface *ns, const Nv2aProgramBatch *b)
+ 
+     if (!b->count || !b->ninst || b->ninst > NV2A_VSH_SLOTS_VK)
+         return;
++    submit_if_due();
+     s_draw_target_va = ns->color_va;
+     stage_descriptors(pix, img2d, imgcube);
+     s = surf_get(ns, ns->clip_y + ns->height);
+@@ -2703,7 +3465,8 @@ static void vk_draw_program(const Nv2aSurface *ns, const Nv2aProgramBatch *b)
+     for (k = 0; k < b->count; k++)
+         ix[k] = b->indices[k] - b->min_index;
+ 
+-    pipe_key(&pk, s, z, rs, 1, pix, (const VkDraw *)(s_ru.map + uoff));
++    pipe_key(&pk, s, z, rs, (int)vprog_for(b->program, b->ninst),
++             pix, (const VkDraw *)(s_ru.map + uoff));
+     pipe = pipe_get(&pk);
+     if (!pipe)
+         return;
+@@ -2887,6 +3650,19 @@ static void vk_flip(void)
+     if (req && req != s_scale)
+         scale_change(req);
+     s_frame++;
++    {
++        uint64_t t = now_us();
++        if (s_verbose && s_fr_t0 && t - s_fr_t0 > 50000)
++            fprintf(stderr, "[VK] slow frame %u: %.0f ms; %u pipelines %.0f ms (parts compiled:"
++                    " input %u, vertex %u, pixel %u, output %u, %.0f ms), %u uploads %.0f ms,"
++                    " GPU waits %.0f ms\n", s_frame, (t - s_fr_t0) / 1000.0, s_fr_pipes,
++                    s_fr_pipe_us / 1000.0, s_fr_libs[0], s_fr_libs[1], s_fr_libs[2], s_fr_libs[3],
++                    s_fr_lib_us / 1000.0, s_fr_ups, s_fr_up_us / 1000.0, s_fr_wait_us / 1000.0);
++        s_fr_t0 = t;
++        s_fr_pipe_us = s_fr_lib_us = s_fr_up_us = s_fr_wait_us = 0;
++        s_fr_pipes = s_fr_ups = 0;
++        memset(s_fr_libs, 0, sizeof s_fr_libs);
++    }
+     /* Drop textures nothing has drawn with for a while. */
+     for (i = 0; i < s_ntex; i++)
+         if (s_tex[i].img.image && s_frame - s_tex[i].last_use > VK_TEX_IDLE_FLIPS) {
+@@ -2896,9 +3672,12 @@ static void vk_flip(void)
+         }
+     if (s_verbose && s_frame % 300 == 0)
+         fprintf(stderr, "[VK] flip %u: %u draws, %u tris, %u flushes (+%u soft), %d textures"
+-                        " (%u uploads, %u new, %u read back, %u copied, %u from depth, %u hits), %u program draws, %u alias syncs (+%u on the GPU)\n", s_frame,
++                        " (%u uploads, %u new, %u read back, %u copied, %u from depth, %u hits), %u program draws, %u alias syncs (+%u on the GPU),"
++                        " %u vertex programs compiled (%u failed, %.0f ms)\n", s_frame,
+                 s_draws, s_tris, s_flushes, s_soft_flushes, s_ntex, s_tex_uploads, s_tex_new, s_tex_rt,
+-                s_tex_copies, s_tex_zeta, s_tex_hits, s_prog_draws, s_alias_syncs, s_alias_gpu);
++                s_tex_copies, s_tex_zeta, s_tex_hits, s_prog_draws, s_alias_syncs, s_alias_gpu,
++                atomic_load(&s_vprog_done), atomic_load(&s_vprog_failed),
++                atomic_load(&s_vprog_us) / 1000.0);
+ }
+ 
+ /* The executor's own draw() is never used: draw_full is set. */
+@@ -3012,11 +3791,14 @@ static int create_device(void)
+     VkPhysicalDeviceVulkan13Features h13 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
+     VkPhysicalDeviceVulkan12Features h12 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
+     VkDeviceCreateInfo ci = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
++    VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT };
++    VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT hgpl = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT };
+     VkExtensionProperties ext[512];
+     uint32_t n = 512;
+-    const char *exts[2];
++    const char *exts[4], *e = getenv("RECOMP_VK_GPL");
+     uint32_t ne = 0;
+ 
++    h12.pNext = &hgpl;
+     h13.pNext = &h12;
+     have.pNext = &h13;
+     vkGetPhysicalDeviceFeatures2(s_phys, &have);
+@@ -3034,6 +3816,15 @@ static int create_device(void)
+     exts[ne++] = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
+     if (has_ext(ext, n, "VK_KHR_portability_subset"))
+         exts[ne++] = "VK_KHR_portability_subset";
++    s_gpl = hgpl.graphicsPipelineLibrary && !(e && e[0] == '0')
++         && has_ext(ext, n, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME)
++         && has_ext(ext, n, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
++    if (s_gpl) {
++        exts[ne++] = VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME;
++        exts[ne++] = VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME;
++        gpl.graphicsPipelineLibrary = VK_TRUE;
++        f12.pNext = &gpl;
++    }
+ 
+     f13.dynamicRendering = VK_TRUE;
+     /* glslc targets 1.3, where `discard` is OpDemoteToHelperInvocation. */
+@@ -3223,6 +4014,12 @@ int nv2a_vk_install(void)
+ 
+     s_verbose = getenv("RECOMP_VK_VERBOSE") != NULL;
+     s_stencil = !(e && e[0] == '0');
++    if ((e = getenv("RECOMP_VK_VPROG")) && e[0] == '0')
++        s_vprog_on = 0;
++    if ((e = getenv("RECOMP_VK_SUBMIT_DRAWS")))
++        s_submit_draws = (uint32_t)strtoul(e, NULL, 0);
++    if (mtx_init(&s_pipe_mtx, mtx_plain) != thrd_success)
++        return 0;
+     if (!create_instance() || !pick_device() || !create_device()
+         || !pick_depth_format() || !create_objects()) {
+         fprintf(stderr, "[VK] no usable Vulkan device; the CPU rasteriser draws\n");
+@@ -3245,9 +4042,14 @@ int nv2a_vk_install(void)
+         nv2a_vk_set_render_scale((unsigned)atoi(e));
+     if (s_scale_req)
+         s_scale = s_scale_req;
++    e = getenv("RECOMP_VK_PIPELINE_LIST");
++    if (e && *e)
++        pl_load(e);
++    jobs_start();
+     nv2a_backend_register(&s_backend);
+     fprintf(stderr, "[VK] rendering on the GPU (depth format %d, vertex programs on the %s,"
+-            " scale %ux)\n", (int)s_depth_fmt, s_backend.draw_program ? "GPU" : "CPU", s_scale);
++            " pipeline libraries %s, scale %ux)\n", (int)s_depth_fmt,
++            s_backend.draw_program ? "GPU" : "CPU", s_gpl ? "on" : "off", s_scale);
+     return 1;
+ }
+ 
+diff --git a/src/vulkan/nv2a_vk.h b/src/vulkan/nv2a_vk.h
+index 46af1a7..13a58e6 100644
+--- a/src/vulkan/nv2a_vk.h
++++ b/src/vulkan/nv2a_vk.h
+@@ -3,9 +3,11 @@
+  *
+  * Registers itself with the pushbuffer executor (nv2a_backend.h) and draws
+  * on the host GPU what the CPU rasteriser would draw. Vertex-program batches
+- * run their program on the GPU too (draw_program: shaders/nv2a_vsh.vert
+- * interprets it, pulling the attributes from a copy of the title's arrays,
+- * and clip distances stand in for the executor's near-plane clip);
++ * run their program on the GPU too (draw_program: each program translated
++ * to a shader of its own, nv2a_vk_vprog.c, and shaders/nv2a_vsh.vert
++ * interpreting it until then; the attributes are pulled from a copy of the
++ * title's arrays, and clip distances stand in for the executor's near-plane
++ * clip);
+  * fixed-function and pre-transformed batches arrive transformed (draw_full).
+  * The GPU does every pixel -- texture stages, register combiners, alpha
+  * test, blending, depth, stencil and the visibility-test pixel counts.
+@@ -23,6 +25,11 @@
+  *   RECOMP_VK_VERBOSE   device choice, and a line of counts every 300 flips
+  *   RECOMP_VK_STENCIL=0 ignore the stencil test (the CPU rasteriser has none)
+  *   RECOMP_VK_CPU_VSH   run vertex programs on the CPU, as for draw_full
++ *   RECOMP_VK_VPROG=0   keep vertex programs in the interpreter
++ *   RECOMP_VK_GPL=0     compile pipelines whole, without pipeline libraries
++ *   RECOMP_VK_PIPELINE_LIST=<file>  pipelines asked for, kept across runs
++ *                       and built again at start
++ *   RECOMP_VK_SUBMIT_DRAWS=<n>  submit every n draws (0: once a frame)
+  */
+ #ifndef XBOXRECOMP_NV2A_VK_H
+ #define XBOXRECOMP_NV2A_VK_H
+diff --git a/src/vulkan/nv2a_vk_vprog.c b/src/vulkan/nv2a_vk_vprog.c
+new file mode 100644
+index 0000000..d37a133
+--- /dev/null
++++ b/src/vulkan/nv2a_vk_vprog.c
+@@ -0,0 +1,247 @@
++/* NV2A vertex programs translated to GLSL, compiled at run time.
++ *
++ * nv2a_vsh.vert interprets a program: it reads each instruction from a
++ * uniform block and indexes the registers with what it read. A GPU cannot
++ * keep such arrays in registers by index, so every register of the vertex
++ * stays live and the shader takes all the registers there are (192 on
++ * RDNA, with 56 KB of code): few vertices run at a time, and on the Steam
++ * Deck that interpreter was most of the GPU's frame. Translated, each
++ * instruction becomes one line with constant indices.
++ *
++ * The translation is nv2a_vsh.vert itself, with VSH_PROGRAM defined: the
++ * program's lines replace the interpreter loop and call the same mac() and
++ * ilu(), with the opcode a constant, so the two cannot drift apart.
++ *
++ * GLSL to SPIR-V is glslang's, through its C interface, linked statically
++ * where the build finds it; without it (and on Windows, for now) every
++ * program stays in the interpreter. */
++#include "nv2a_vk_vprog.h"
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#if defined(XBOXRECOMP_VK_GLSLANG) && !defined(_WIN32)
++#include <math.h>
++#include <glslang/Include/glslang_c_interface.h>
++#include <glslang/Public/resource_limits_c.h>
++#define VPROG_COMPILER 1
++#endif
++
++#include "nv2a_vsh.vert.txt.inc"   /* s_vsh_template: the shader's source */
++
++/* ---- Translation ---------------------------------------------------- */
++
++typedef struct { char *p; size_t len, cap; } Text;
++
++static void put(Text *t, const char *fmt, ...)
++{
++    va_list ap;
++    int n;
++
++    for (;;) {
++        va_start(ap, fmt);
++        n = vsnprintf(t->p + t->len, t->cap - t->len, fmt, ap);
++        va_end(ap);
++        if (n < 0)
++            return;
++        if ((size_t)n < t->cap - t->len)
++            break;
++        t->cap = t->cap * 2 + (size_t)n;
++        t->p = realloc(t->p, t->cap);
++    }
++    t->len += (size_t)n;
++}
++
++/* A source operand, as src() in the shader reads it. */
++static void put_src(Text *t, uint32_t w)
++{
++    static const char xyzw[] = "xyzw";
++    uint32_t kind = w & 0xFu, idx = (w >> 4) & 0x1Fu, ci = w >> 18, k;
++    char sw[6] = ".";
++
++    if ((w >> 9) & 1u)
++        put(t, "-");
++    if (kind == 0u)
++        put(t, idx < 13u ? "R[%u]" : "vec4(0.0)", idx);
++    else if (kind == 1u)
++        put(t, "R[12]");
++    else if (kind == 2u)
++        put(t, idx < 16u ? "V[%u]" : "vec4(0.0)", idx);
++    else if (kind == 3u)
++        put(t, "kc.c[%u]", ci < 192u ? ci : 0u);
++    else
++        put(t, "kc.c[(%u + a0) < 0 || (%u + a0) >= 192 ? 0 : %u + a0]", ci, ci, ci);
++    for (k = 0; k < 4; k++)
++        sw[1 + k] = xyzw[(w >> (10 + 2 * k)) & 3u];
++    if (strcmp(sw, ".xyzw"))
++        put(t, "%s", sw);
++}
++
++/* A masked write, as put() in the shader does it. */
++static void put_write(Text *t, const char *dst, const char *v, uint32_t m)
++{
++    char mk[5];
++    int n = 0;
++
++    if (m & 8u) mk[n++] = 'x';
++    if (m & 4u) mk[n++] = 'y';
++    if (m & 2u) mk[n++] = 'z';
++    if (m & 1u) mk[n++] = 'w';
++    mk[n] = 0;
++    if (n)
++        put(t, " %s.%s = %s.%s;", dst, mk, v, mk);
++}
++
++char *nv2a_vk_vprog_glsl(const uint32_t (*prog)[8], int n)
++{
++    static const char marker[] = "    VSH_PROGRAM\n";
++    const char *at = strstr(s_vsh_template, marker), *nl = strchr(s_vsh_template, '\n');
++    Text body = { malloc(16384), 0, 16384 }, out;
++    uint32_t inputs = 0;
++    int i, k;
++
++    if (!at || !nl || !body.p)
++        return NULL;
++    body.p[0] = 0;
++    for (i = 0; i < n; i++) {
++        const uint32_t *w = prog[i];
++        uint32_t f = w[0], op = f & 0xFu, iop = (f >> 4) & 0x7u;
++        uint32_t md = (w[1] >> 8) & 0xFFu, id = (w[1] >> 16) & 0xFFu;
++        uint32_t om = (f >> 16) & 0xFu, oa = w[1] & 0xFFu;
++        char dst[16];
++
++        /* Both units read their sources before either writes. */
++        put(&body, "    {");
++        for (k = 0; k < 3; k++) {
++            put(&body, " vec4 %c = ", "abc"[k]);
++            if (f & (1u << (22 + k))) {
++                put_src(&body, w[2 + k]);
++                if ((w[2 + k] & 0xFu) == 2u && ((w[2 + k] >> 4) & 0x1Fu) < 16u)
++                    inputs |= 1u << ((w[2 + k] >> 4) & 0x1Fu);
++            } else {
++                put(&body, "vec4(0.0)");
++            }
++            put(&body, ";");
++        }
++        if (op)
++            put(&body, " vec4 mr = mac(%uu, a, b, c);", op);
++        else
++            put(&body, " vec4 mr = vec4(0.0);");
++        if (iop)
++            put(&body, " vec4 ir = ilu(%uu, c);", iop);
++        else
++            put(&body, " vec4 ir = vec4(0.0);");
++        if (md != 0u && md <= 13u) {
++            snprintf(dst, sizeof dst, "R[%u]", md - 1u);
++            put_write(&body, dst, "mr", (f >> 8) & 0xFu);
++        }
++        if (id != 0u && id <= 13u) {
++            snprintf(dst, sizeof dst, "R[%u]", id - 1u);
++            put_write(&body, dst, "ir", (f >> 12) & 0xFu);
++        }
++        if (om != 0u && ((f >> 21) & 1u) && oa < 13u) {   /* to o[] (c[] stays CPU) */
++            snprintf(dst, sizeof dst, oa ? "O[%u]" : "R[12]", oa);
++            put_write(&body, dst, ((f >> 20) & 1u) ? "ir" : "mr", om);
++        }
++        put(&body, " }\n");
++    }
++
++    out.cap = strlen(s_vsh_template) + body.len + 128;
++    out.p = malloc(out.cap);
++    out.len = 0;
++    if (!out.p) {
++        free(body.p);
++        return NULL;
++    }
++    put(&out, "%.*s", (int)(nl + 1 - s_vsh_template), s_vsh_template);   /* #version */
++    put(&out, "#define VSH_PROGRAM\n#define VSH_INPUTS 0x%Xu\n", inputs);
++    put(&out, "%.*s", (int)(at - (nl + 1)), nl + 1);
++    put(&out, "%s", body.p);
++    put(&out, "%s", at + strlen(marker));
++    free(body.p);
++    return out.p;
++}
++
++/* ---- Compilation ---------------------------------------------------- */
++
++#ifdef VPROG_COMPILER
++#ifdef __GLIBC__
++/* glslang folds constant sinh() and cosh(), and a glibc of 2.44 or later
++ * links them as their 2.44 versions: the binary would then refuse to start
++ * on an older one (SteamOS has 2.43), for two functions no vertex program
++ * uses. These keep the requirement where the rest of the binary has it. */
++double cosh(double x)
++{
++    double e = exp(x);
++    return (e + 1.0 / e) * 0.5;
++}
++
++double sinh(double x)
++{
++    double e = exp(x);
++    return (e - 1.0 / e) * 0.5;
++}
++#endif
++
++uint32_t *nv2a_vk_vprog_compile(const uint32_t (*prog)[8], int n, size_t *words)
++{
++    glslang_input_t in;
++    glslang_shader_t *sh;
++    glslang_program_t *pr = NULL;
++    uint32_t *spv = NULL;
++    char *src;
++    int msgs = GLSLANG_MSG_SPV_RULES_BIT | GLSLANG_MSG_VULKAN_RULES_BIT;
++    static int ready;   /* glslang set up: 0 not yet, 1 yes, -1 failed */
++
++    if (!ready)
++        ready = glslang_initialize_process() ? 1 : -1;
++    if (ready < 0 || !(src = nv2a_vk_vprog_glsl(prog, n)))
++        return NULL;
++    memset(&in, 0, sizeof in);
++    in.language = GLSLANG_SOURCE_GLSL;
++    in.stage = GLSLANG_STAGE_VERTEX;
++    in.client = GLSLANG_CLIENT_VULKAN;
++    in.client_version = GLSLANG_TARGET_VULKAN_1_3;
++    in.target_language = GLSLANG_TARGET_SPV;
++    in.target_language_version = GLSLANG_TARGET_SPV_1_6;
++    in.code = src;
++    in.default_version = 450;
++    in.default_profile = GLSLANG_NO_PROFILE;
++    in.messages = (glslang_messages_t)msgs;
++    in.resource = glslang_default_resource();
++    sh = glslang_shader_create(&in);
++    if (!sh)
++        goto out;
++    if (!glslang_shader_preprocess(sh, &in) || !glslang_shader_parse(sh, &in)) {
++        fprintf(stderr, "[VK] vertex program: %s\n", glslang_shader_get_info_log(sh));
++        goto out;
++    }
++    pr = glslang_program_create();
++    glslang_program_add_shader(pr, sh);
++    if (!glslang_program_link(pr, msgs)) {
++        fprintf(stderr, "[VK] vertex program: %s\n", glslang_program_get_info_log(pr));
++        goto out;
++    }
++    glslang_program_SPIRV_generate(pr, GLSLANG_STAGE_VERTEX);
++    *words = glslang_program_SPIRV_get_size(pr);
++    if (*words && (spv = malloc(*words * 4)))
++        glslang_program_SPIRV_get(pr, spv);
++out:
++    if (pr)
++        glslang_program_delete(pr);
++    if (sh)
++        glslang_shader_delete(sh);
++    free(src);
++    return spv;
++}
++#else
++uint32_t *nv2a_vk_vprog_compile(const uint32_t (*prog)[8], int n, size_t *words)
++{
++    (void)prog;
++    (void)n;
++    (void)words;
++    return NULL;
++}
++#endif
+diff --git a/src/vulkan/nv2a_vk_vprog.h b/src/vulkan/nv2a_vk_vprog.h
+new file mode 100644
+index 0000000..0ce3a38
+--- /dev/null
++++ b/src/vulkan/nv2a_vk_vprog.h
+@@ -0,0 +1,19 @@
++/* NV2A vertex programs translated to GLSL and compiled to SPIR-V, for the
++ * Vulkan back end (nv2a_vk_vprog.c). */
++#ifndef NV2A_VK_VPROG_H
++#define NV2A_VK_VPROG_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++/* The program as nv2a_vsh_export() decodes it (n instructions of eight
++ * words), as the GLSL that runs it: nv2a_vsh.vert with the program in
++ * place of its interpreter loop. Returns a malloc'd string. */
++char *nv2a_vk_vprog_glsl(const uint32_t (*prog)[8], int n);
++
++/* The same, compiled: malloc'd SPIR-V and its length in words, or NULL when
++ * there is no compiler (glslang is loaded at run time and may be missing)
++ * or it failed; the caller then runs the program in the interpreter. */
++uint32_t *nv2a_vk_vprog_compile(const uint32_t (*prog)[8], int n, size_t *words);
++
++#endif
+diff --git a/src/vulkan/shaders/nv2a_vsh.vert b/src/vulkan/shaders/nv2a_vsh.vert
+index b23aeea..7452d8a 100644
+--- a/src/vulkan/shaders/nv2a_vsh.vert
++++ b/src/vulkan/shaders/nv2a_vsh.vert
+@@ -9,7 +9,14 @@
+  * batch's vertex data, copied as the title stored it.
+  *
+  * The CPU path's near-plane clip becomes two clip distances, the same two
+- * planes: w = 1e-3, and screen z at the viewport's z offset. */
++ * planes: w = 1e-3, and screen z at the viewport's z offset.
++ *
++ * The same source is also the template for a program translated to GLSL
++ * (nv2a_vk_vprog.c): there VSH_PROGRAM is the program's straight-line code,
++ * which replaces the loop below, and VSH_INPUTS a mask of the attributes it
++ * reads. The interpreter indexes its registers with values from the
++ * program, which keeps every register of every vertex live at once; the
++ * translation's indices are constants. */
+ 
+ layout(location = 0) out vec4 v_d0;
+ layout(location = 1) out vec4 v_d1;
+@@ -200,8 +207,11 @@ void main()
+ {
+     uint vid = uint(gl_VertexIndex), n = uint(u.vp2.z);
+ 
++#ifndef VSH_INPUTS
++#define VSH_INPUTS 0xFFFF
++#endif
+     for (int i = 0; i < 16; i++)
+-        V[i] = fetch(i, vid);
++        V[i] = ((VSH_INPUTS >> i) & 1) != 0 ? fetch(i, vid) : vec4(0.0);
+     for (int i = 0; i < 13; i++) {
+         R[i] = vec4(0.0);
+         O[i] = vec4(0.0);
+@@ -210,6 +220,9 @@ void main()
+     O[9].w = O[10].w = O[11].w = O[12].w = 1.0;
+     a0 = 0;
+ 
++#ifdef VSH_PROGRAM
++    VSH_PROGRAM
++#else
+     for (uint s = 0u; s < n; s++) {
+         uvec4 w0 = kp.p[2u * s], w1 = kp.p[2u * s + 1u];
+         uint f = w0.x, op = f & 0xFu, iop = (f >> 4) & 0x7u;
+@@ -233,6 +246,7 @@ void main()
+             else if (oa < 13u)  put(O[oa], v, om);
+         }
+     }
++#endif
+ 
+     vec4 pos = R[12];
+     /* w == +0: a program that never divided by w (transform_vertex). */

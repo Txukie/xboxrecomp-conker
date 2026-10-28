@@ -8,14 +8,16 @@
 # first-launch window, conker-setup, when Qt 6 was found).
 #
 # Bundled: the binary, AppRun, the desktop entry and icon, and the libraries
-# a desktop may lack (SDL2, libepoxy, OpenSSL's libcrypto). With SETUP also
+# a desktop may lack (SDL2, libepoxy, OpenSSL's libcrypto, SPIRV-Tools and
+# the C++ runtime for glslang, which is linked in). With SETUP also
 # conker-setup, the Qt it links and Qt's X11/Wayland plugins. Not bundled, on
 # purpose: glibc, the Vulkan loader and GPU drivers, which have to match the
 # host -- so the AppImage runs on distributions with a glibc at least as new
 # as the build machine's.
 #
 # appimagetool comes from APPIMAGETOOL, then PATH, then a pinned release
-# downloaded into WORK_DIR and checked against its SHA-256.
+# downloaded into WORK_DIR and checked against its SHA-256; the runtime it
+# packs from APPIMAGE_RUNTIME, or downloaded once into WORK_DIR.
 set -eu
 
 bin=$1
@@ -31,6 +33,7 @@ mkdir -p "$out" "$dest"
 tool_version=1.9.0
 tool_sha256=46fdd785094c7f6e545b61afcfb0f3d98d8eab243f644b4b17698c01d06083d1
 tool_url="https://github.com/AppImage/appimagetool/releases/download/$tool_version/appimagetool-x86_64.AppImage"
+runtime_url="https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64"
 
 [ -x "$bin" ] || { echo "build-appimage: no executable at $bin" >&2; exit 1; }
 
@@ -48,11 +51,12 @@ cp "$here/conker-recomp.svg" "$appdir/usr/share/icons/hicolor/scalable/apps/"
 # The libraries to carry, as this build resolved them.
 ldd "$bin" | awk '/=> \// { print $1, $3 }' | while read -r name path; do
     case "$name" in
-        libSDL2-2.0.so.*|libepoxy.so.*|libcrypto.so.*)
+        libSDL2-2.0.so.*|libepoxy.so.*|libcrypto.so.*|libSPIRV-Tools*|libstdc++.so.*|libgcc_s.so.*)
             cp -L "$path" "$appdir/usr/lib/$name"
             echo "build-appimage: bundled $name" ;;
     esac
 done
+
 
 # The setup window and what it needs: Qt and the libraries Qt pulls in that
 # a system may lack, and its platform plugins (found through qt.conf). The
@@ -100,9 +104,20 @@ if [ -z "$tool" ]; then
     fi
 fi
 
+# The AppImage runtime, which appimagetool would download itself on every
+# build: its own download failed outright for a while (status code 0) while
+# curl fetched the same file. Fetched once into WORK_DIR, or from
+# APPIMAGE_RUNTIME.
+runtime=${APPIMAGE_RUNTIME:-$out/runtime-x86_64}
+if [ ! -s "$runtime" ]; then
+    echo "build-appimage: downloading the AppImage runtime"
+    curl -sSfL -o "$runtime.part" "$runtime_url"
+    mv "$runtime.part" "$runtime"
+fi
+
 commit=$(git -C "$here" rev-parse --short HEAD 2>/dev/null || echo unknown)
 # --appimage-extract-and-run: appimagetool is itself an AppImage, and this
 # way building needs no FUSE.
 ARCH=x86_64 VERSION="$version" "$tool" --appimage-extract-and-run --no-appstream \
-    "$appdir" "$image"
+    --runtime-file "$runtime" "$appdir" "$image"
 echo "build-appimage: $image ($version, $commit)"
