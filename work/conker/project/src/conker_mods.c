@@ -183,6 +183,15 @@ void conker_mods_init(const char *data_dir, const char *save_dir)
         dirs[i] = paths[i];
         fprintf(stderr, "[MODS] active: %s\n", names[i]);
     }
+    /* Files the recomp makes from the player's game (the frying pan,
+     * conker_weapon.c): laid over it like a mod, but not one, so choosing
+     * them does not empty the cache. */
+    {
+        extern const char *conker_weapon_overlay(void);
+        const char *gen = conker_weapon_overlay();
+        if (gen && n < MAX_MODS)
+            dirs[n++] = gen;
+    }
     xbox_path_set_overlays(dirs, n);
 }
 

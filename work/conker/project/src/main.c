@@ -191,6 +191,23 @@ static int conker_boot(void)
     if (!recomp_dispatch_init())
         fprintf(stderr, "[CONKER] flat dispatch unavailable; "
                         "indirect calls use the binary search\n");
+    /* CONKER_UNPACK_IN/_OUT: unpack one CAFF package with the game's own
+     * decompressor (conker_caff.c) and stop, without starting the game. */
+    {
+        extern int conker_caff_unpack(const char *in, const char *out);
+        const char *in = getenv("CONKER_UNPACK_IN"), *out = getenv("CONKER_UNPACK_OUT");
+        if (in && *in && out && *out) {
+            int rc = conker_caff_unpack(in, out);
+            xbox_kernel_shutdown();
+            xbox_MemoryLayoutShutdown();
+            free(xbe_data);
+            return rc;
+        }
+    }
+    {
+        extern void conker_weapon_boot(const char *game_dir);
+        conker_weapon_boot(game_dir);
+    }
     xbox_WatchdogStart();
 
     entry = recomp_lookup(CONKER_ENTRY_POINT);
@@ -276,7 +293,12 @@ int main(int argc, char **argv)
     s_game_dir = game_dir;
     if (!s_save_path || !*s_save_path)
         s_save_path = default_save;
-    /* Mods in <data>/mods, laid over the game's files (conker_mods.c). */
+    /* Mods in <data>/mods, laid over the game's files (conker_mods.c), and
+     * the frying pan's folder when it is chosen (conker_weapon.c). */
+    {
+        extern void conker_weapon_init(const char *data_dir);
+        conker_weapon_init(data_dir);
+    }
     conker_mods_init(data_dir, s_save_path);
     /* The Vulkan renderer's list of the pipelines the game has used, built
      * again at every start so that nothing compiles while it plays. */

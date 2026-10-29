@@ -50,11 +50,14 @@ static volatile int s_vsync = 1;
 static volatile int s_fps = 30;
 static volatile int s_skip_cutscenes;    /* LT skips every cutscene, seen or not */
 static volatile int s_swing_button;      /* X swings the weapon (conker_swing.c) */
+static volatile int s_weapon;            /* 1: the frying pan (conker_weapon.c) */
+static volatile int s_last_game;         /* 0..2: the pub starts on Game 1..3 (conker_pub.c) */
 static volatile float s_hor_plus;
 
 static const char *const k_labels[CONKER_OPT_COUNT] = {
     "Display Mode", "Aspect Ratio", "Resolution",
-    "Render Resolution", "VSync", "FPS Limit", "Allow Skip Cutscenes", "Swing Button", "Uncensor",
+    "Render Resolution", "VSync", "FPS Limit", "Allow Skip Cutscenes", "Swing Button", "Weapon",
+    "Uncensor",
 };
 /* Uncensor: left and right pick, A carries it out (conker_mods.c). */
 static const char *const k_uncensor[CONKER_UNCENSOR_CHOICES] = { "Disable", "Enable", "Update" };
@@ -96,6 +99,8 @@ static void save(void)
     fprintf(f, "fps_limit=%d\n", s_fps);
     fprintf(f, "skip_cutscenes=%s\n", s_skip_cutscenes ? "yes" : "no");
     fprintf(f, "swing_button=%s\n", s_swing_button ? "x" : "off");
+    fprintf(f, "weapon=%s\n", s_weapon ? "pan" : "bat");
+    fprintf(f, "last_game=%d\n", s_last_game + 1);
     fclose(f);
 }
 
@@ -134,6 +139,12 @@ static void parse_line(char *line)
         s_vsync = strcmp(val, "off") != 0;
     } else if (!strcmp(key, "swing_button")) {
         s_swing_button = !strcmp(val, "x");
+    } else if (!strcmp(key, "weapon")) {
+        s_weapon = !strcmp(val, "pan");
+    } else if (!strcmp(key, "last_game")) {
+        i = atoi(val);
+        if (i >= 1 && i <= 3)
+            s_last_game = i - 1;
     } else if (!strcmp(key, "skip_cutscenes")) {
         s_skip_cutscenes = !strcmp(val, "yes");
     } else if (!strcmp(key, "fps_limit")) {
@@ -224,6 +235,25 @@ void conker_settings_load(void)
         apply_fps();
 }
 
+int conker_weapon_choice(void)
+{
+    return s_weapon;
+}
+
+int conker_settings_last_game(void)
+{
+    return s_last_game;
+}
+
+void conker_settings_set_last_game(int slot)
+{
+    if (slot < 0 || slot > 2 || slot == s_last_game)
+        return;
+    s_last_game = slot;
+    save();
+    fprintf(stderr, "[CONKER] last game: Game %d\n", slot + 1);
+}
+
 int conker_swing_enabled(void)
 {
     return s_swing_button;
@@ -300,6 +330,12 @@ void conker_options_value(int row, char *buf, size_t size)
     case CONKER_OPT_SWING_BUTTON:
         snprintf(buf, size, "%s", s_swing_button ? "X" : "Off");
         break;
+    case CONKER_OPT_WEAPON:
+        /* Applied at start: say so while the choice is not what is in hand. */
+        snprintf(buf, size, "%s%s", s_weapon ? "Frying Pan" : "Bat",
+                 s_weapon && conker_weapon_failed() ? " (failed)"
+                 : s_weapon != conker_weapon_active() ? " (restart)" : "");
+        break;
     case CONKER_OPT_UNCENSOR: {
         char status[96];
         int c = s_uncensor < 0 ? conker_mods_uncensor_choice() : s_uncensor;
@@ -370,6 +406,9 @@ static void change(int row, int dir)
         break;
     case CONKER_OPT_SWING_BUTTON:
         s_swing_button = !s_swing_button;
+        break;
+    case CONKER_OPT_WEAPON:
+        s_weapon = !s_weapon;
         break;
     case CONKER_OPT_UNCENSOR:
         if (s_uncensor < 0)
@@ -518,6 +557,8 @@ static void input_filter(DWORD port, XBOX_INPUT_STATE *st, int connected)
     unsigned bits, pressed, dirs;
     int page = now - s_page_ms < PAGE_FRESH_MS;
 
+    if (port == 0)
+        conker_pub_tick(now);
     if (port < PORTS)
         skip_cutscenes_filter(port, st, connected);
     if (!connected || port >= PORTS)
@@ -538,6 +579,14 @@ static void input_filter(DWORD port, XBOX_INPUT_STATE *st, int connected)
     }
 
     if (!s_open) {
+        int pub = conker_pub_pad(!!(pressed & P_LEFT), !!(pressed & P_RIGHT),
+                                 !!(pressed & P_A), !!(pressed & P_B));
+        if (pub) {
+            if (pub == 2)
+                swallow_all();
+            rest(st);
+            return;
+        }
         if (page && s_recomp_selected && (pressed & P_A)) {
             build_resolutions();
             s_row = 0;

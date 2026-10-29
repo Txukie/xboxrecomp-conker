@@ -122,7 +122,8 @@ static void draw_item(uint32_t item, uint32_t a1, uint32_t a2)
  * starts a text len * scale / 16 left of x, which ROW_X undoes so each
  * column has one left edge. */
 #define ROW_TOP      118.0f     /* above Vibration */
-#define ROW_STEP      56.0f
+#define ROW_SPAN     448.0f     /* first row to last: the page's height */
+#define ROW_STEP     (ROW_SPAN / (float)(CONKER_OPT_COUNT - 1))
 #define ROW_SCALE     25.0f
 #define LABEL_DX     -40.0f     /* from Vibration's x */
 #define VALUE_DX     400.0f

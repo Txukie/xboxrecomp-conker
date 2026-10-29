@@ -76,6 +76,7 @@ change it; B goes back. Changes apply immediately and are saved in
 | FPS Limit | 30, 60, 90, 120 (the game times its own frames, so it runs at the right speed above 30) | 30 |
 | Allow Skip Cutscenes | Yes: holding LT for a second skips any cutscene, even one not seen before (scenes the game never lets you skip, such as the intro, stay as they are) | No |
 | Swing Button | X: see below | Off |
+| Weapon | Bat, Frying Pan: see below | Bat |
 | Uncensor | Enable, Disable, Update: see below | — |
 
 **Swing Button.** With X selected, X swings the weapon in one press, as
@@ -86,11 +87,25 @@ without it. The weapon goes away by itself after a moment without a
 press, or at once when the right stick moves the camera. B and then RT
 still work as always.
 
+**Weapon.** Frying Pan gives Conker the frying pan he had on the Nintendo
+64 in place of the bat, with the pan's hit sound. The remake only has the
+pan in its training level; the first start with it chosen takes the pan's
+model out of that level in your own copy of the game (into
+`~/.local/share/conker-recomp/generated/pan`), so nothing of the game is
+shipped. The change takes effect when the game is restarted.
+
 **Uncensor** applies the [uncensor patch](https://gamebanana.com/mods/697391)
 (text and audio). Enable downloads it from GameBanana the first time
 (about 250 MB; needs `curl` and `bsdtar` or `7z` installed), Disable turns
 it off without deleting it, and Update looks for a new version. Changes
 take effect when the game is restarted.
+
+### Main menu
+
+The pub starts on **Game 1**, and after that on the save slot last played.
+The first title reads "Online & Co". B on any title asks "Do you want to
+exit?" (No is picked; left and right choose, A answers, B is No); Yes
+closes the game.
 
 ### Controls
 
@@ -188,8 +203,9 @@ Technical notes and the plan for each platform:
 - `external/xboxrecomp/`: the toolkit (runtime, tools, documentation), a
   submodule pinned to a release.
 - `work/conker/project/`: the Conker executable.
-  - `src/`: start-up, settings and menu, Swing Button, mods, first-launch
-    setup, host code per OS, manual overrides.
+  - `src/`: start-up, settings and menu, the pub, Swing Button, Weapon
+    (frying pan extraction), mods, first-launch setup, host code per OS,
+    manual overrides.
   - `src/recomp/gen/`: the C generated from the XBE.
   - `gfx/`: an early set of graphics backends from the start of the port,
     not used by the game (the renderer in use lives in the toolkit).
@@ -288,6 +304,7 @@ momento y se guardan en `~/.config/conker-recomp/settings.cfg`
 | FPS Limit | 30, 60, 90, 120 (el juego mide su propio tiempo por fotograma, así que por encima de 30 va a la velocidad correcta) | 30 |
 | Allow Skip Cutscenes | Yes: mantener LT un segundo salta cualquier escena, aunque no se haya visto antes (las que el juego nunca deja saltar, como las de la introducción, siguen igual) | No |
 | Swing Button | X: ver abajo | Off |
+| Weapon | Bat, Frying Pan: ver abajo | Bat |
 | Uncensor | Enable, Disable, Update: ver abajo | — |
 
 **Swing Button.** Con X, el botón X golpea con el arma de una sola
@@ -297,11 +314,25 @@ combo) y sigue corriendo hacia donde apunta el stick, como sin ella. El
 arma se guarda sola al poco de dejar de pulsar, o en cuanto el stick
 derecho mueve la cámara. B y luego RT siguen funcionando como siempre.
 
+**Weapon.** Frying Pan le da a Conker la sartén que llevaba en la Nintendo
+64 en lugar del bate, con el sonido de golpe de la sartén. El remake solo
+tiene la sartén en su nivel de entrenamiento; el primer arranque con ella
+elegida saca el modelo de la sartén de ese nivel de tu propia copia del
+juego (a `~/.local/share/conker-recomp/generated/pan`), así que no se
+distribuye nada del juego. El cambio se aplica al reiniciar el juego.
+
 **Uncensor** aplica el [parche de descensura](https://gamebanana.com/mods/697391)
 (textos y audio). Enable lo descarga de GameBanana la primera vez (unos
 250 MB; hacen falta `curl` y `bsdtar` o `7z` instalados), Disable lo
 desactiva sin borrarlo y Update busca una versión nueva. Los cambios se
 aplican al reiniciar el juego.
+
+### Menú principal
+
+El pub empieza en **Game 1** y, a partir de ahí, en la partida que se jugó
+la última vez. El primer título dice "Online & Co". B en cualquier título
+pregunta "Do you want to exit?" (con No elegido; izquierda y derecha
+eligen, A responde, B es No); Yes cierra el juego.
 
 ### Controles
 
@@ -401,8 +432,9 @@ Notas técnicas y el plan para cada plataforma:
 - `external/xboxrecomp/`: el toolkit (runtime, herramientas,
   documentación), como submódulo fijado a una versión.
 - `work/conker/project/`: el ejecutable de Conker.
-  - `src/`: arranque, ajustes y menú, Swing Button, mods, instalación del
-    primer arranque, código por sistema operativo, sustituciones manuales.
+  - `src/`: arranque, ajustes y menú, el pub, Swing Button, Weapon
+    (extracción de la sartén), mods, instalación del primer arranque,
+    código por sistema operativo, sustituciones manuales.
   - `src/recomp/gen/`: el C generado a partir del XBE.
   - `gfx/`: unos primeros backends gráficos del inicio del port, que el
     juego no usa (el renderizador en uso está en el toolkit).

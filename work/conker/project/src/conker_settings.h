@@ -11,6 +11,7 @@
 #define CONKER_SETTINGS_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 enum {
     CONKER_OPT_DISPLAY_MODE,
@@ -21,6 +22,7 @@ enum {
     CONKER_OPT_FPS,
     CONKER_OPT_SKIP_CUTSCENES,
     CONKER_OPT_SWING_BUTTON,
+    CONKER_OPT_WEAPON,
     CONKER_OPT_UNCENSOR,
     CONKER_OPT_COUNT
 };
@@ -36,6 +38,20 @@ void conker_settings_install_input(void);
 
 /* Swing Button (conker_swing.c): X swings the weapon in one press. */
 int conker_swing_enabled(void);
+
+/* Weapon (conker_weapon.c): 0 the bat, 1 the frying pan, as chosen; it
+ * takes effect at the next start. */
+int conker_weapon_choice(void);
+int conker_weapon_active(void);
+int conker_weapon_failed(void);
+
+/* The pub (conker_pub.c): the save slot it starts on, 0..2 for Game 1..3,
+ * kept in the cfg; its per-frame look at the front end and its use of the
+ * pad, from the input filter. */
+int  conker_settings_last_game(void);
+void conker_settings_set_last_game(int slot);
+void conker_pub_tick(uint64_t now_ms);
+int  conker_pub_pad(int left, int right, int a, int b);
 
 /* Hor+: how much wider the horizontal view is than 4:3's, or 0 at 4:3. */
 float conker_settings_hor_plus(void);
