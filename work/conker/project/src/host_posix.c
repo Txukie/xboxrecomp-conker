@@ -143,6 +143,10 @@ void conker_host_config_path(char *buf, size_t size)
     snprintf(buf, size, "%s/settings.cfg", dir);
 }
 
+void conker_host_open_log(void)
+{
+}
+
 void conker_host_setenv_default(const char *name, const char *value)
 {
     setenv(name, value, 0);

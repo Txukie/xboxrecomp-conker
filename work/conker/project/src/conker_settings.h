@@ -14,6 +14,7 @@
 #include <stdint.h>
 
 enum {
+    CONKER_OPT_LANGUAGE,
     CONKER_OPT_DISPLAY_MODE,
     CONKER_OPT_ASPECT,
     CONKER_OPT_RESOLUTION,
@@ -26,6 +27,23 @@ enum {
     CONKER_OPT_UNCENSOR,
     CONKER_OPT_COUNT
 };
+
+/* The languages the disc has text for, in the order the row offers them. */
+enum {
+    CONKER_LANG_ENGLISH,
+    CONKER_LANG_SPANISH,
+    CONKER_LANG_FRENCH,
+    CONKER_LANG_GERMAN,
+    CONKER_LANG_ITALIAN,
+    CONKER_LANG_JAPANESE,
+    CONKER_LANG_COUNT
+};
+
+/* conker_lang.c: the language of this launch, the given English text in it,
+ * and the next character of a UTF-8 string (these strings' encoding). */
+void conker_lang_set(int language);
+const char *conker_tr(const char *en);
+int conker_utf8_next(const char **s);
 
 /* main(), before the window opens: read the cfg file and apply it (window
  * mode and size, vsync, aspect, render scale, frame limit). Variables the
@@ -67,7 +85,7 @@ void conker_options_page_seen(int recomp_selected);
 int  conker_options_is_open(void);
 int  conker_options_row(void);
 
-/* A row's label and its current value, as plain ASCII. */
+/* A row's label and its current value, in UTF-8. */
 const char *conker_options_label(int row);
 void conker_options_value(int row, char *buf, size_t size);
 

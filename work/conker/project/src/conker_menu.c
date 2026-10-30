@@ -95,14 +95,26 @@ static int classify(uint32_t item)
     return ITEM_OTHER;
 }
 
-/* A UTF-16 copy of s on the guest stack (below g_esp, which moves down
- * past it). The caller puts g_esp back. */
+/* Characters in a UTF-8 string. */
+static size_t text_len(const char *s)
+{
+    size_t n = 0;
+    while (*s) {
+        conker_utf8_next(&s);
+        n++;
+    }
+    return n;
+}
+
+/* A UTF-16 copy of the UTF-8 s on the guest stack (below g_esp, which moves
+ * down past it). The caller puts g_esp back. */
 static uint32_t guest_wstr(const char *s)
 {
-    size_t n = strlen(s) + 1, i;
+    size_t n = text_len(s) + 1, i;
     g_esp -= (uint32_t)((n * 2 + 15) & ~(size_t)15);
-    for (i = 0; i < n; i++)
-        MEM16(g_esp + 2 * i) = (uint8_t)s[i];
+    for (i = 0; i + 1 < n; i++)
+        MEM16(g_esp + 2 * i) = (uint16_t)conker_utf8_next(&s);
+    MEM16(g_esp + 2 * i) = 0;
     return g_esp;
 }
 
@@ -133,7 +145,7 @@ static uint64_t s_hl_ms;
 
 static float row_x(float x, const char *text, float scale)
 {
-    return x + (float)strlen(text) * scale / 16.0f;
+    return x + (float)text_len(text) * scale / 16.0f;
 }
 
 static void draw_rows(uint32_t base, uint32_t a1, uint32_t a2)
@@ -199,7 +211,7 @@ static void conker_menu_draw(void)
     } else if (!conker_options_is_open()) {
         /* Recomp Options: the item's label is the demo's; ours for the draw. */
         const uint32_t label = MEM32(item + 0x14);
-        MEM32(item + 0x14) = guest_wstr("Recomp Options");
+        MEM32(item + 0x14) = guest_wstr(conker_tr("Recomp Options"));
         draw_item(item, a1, a2);
         MEM32(item + 0x14) = label;
     } else if (which == ITEM_VIBRATION) {
@@ -208,6 +220,33 @@ static void conker_menu_draw(void)
     /* Invert Aim and Recomp Options: hidden under the submenu. */
 
     g_esp = ret_sp + 12;               /* ret 8 */
+}
+
+/* ── The loading screen ──────────────────────────────────────────────────
+ * The game has a screen for a message on its boot picture, which it shows
+ * while starting (main_init_DrawSplashScreen, sub_002A6EA0: text, x, y,
+ * scale; drawn and flipped once). Level loads show nothing for as long as
+ * they take, so each one starts with this screen saying what is going on;
+ * the picture stays up until the level's first frame. */
+void sub_002A6EA0(void);
+#define SPLASH_X       0x140u
+#define SPLASH_Y       0x154u      /* under the logo, where the game puts its own */
+#define SPLASH_SCALE   0x3F800000u  /* 1.0f */
+
+void conker_loading_screen(void)
+{
+    const uint32_t a = g_eax, b = g_ebx, c = g_ecx, d = g_edx;
+    const uint32_t si = g_esi, di = g_edi, bp = g_ebp, seh = g_seh_ebp, sp = g_esp;
+    const uint32_t text = guest_wstr(conker_tr("Loading..."));
+
+    PUSH32(g_esp, SPLASH_SCALE);
+    PUSH32(g_esp, SPLASH_Y);
+    PUSH32(g_esp, SPLASH_X);
+    PUSH32(g_esp, text);
+    PUSH32(g_esp, MENU_DRAW_VA);       /* a return address nothing returns to */
+    sub_002A6EA0();
+    g_eax = a; g_ebx = b; g_ecx = c; g_edx = d;
+    g_esi = si; g_edi = di; g_ebp = bp; g_seh_ebp = seh; g_esp = sp;
 }
 
 recomp_func_t conker_menu_lookup(uint32_t xbox_va)

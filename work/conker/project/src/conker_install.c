@@ -24,6 +24,7 @@
 #include <io.h>
 #include <process.h>
 #include <windows.h>
+#include <commdlg.h>
 #define strcasecmp _stricmp
 #define fseeko _fseeki64
 #define ftello _ftelli64
@@ -412,10 +413,24 @@ void conker_install_cancel(void)
 static int run(char *const argv[])
 {
 #if defined(_WIN32)
+    /* _spawnvp joins the arguments with spaces as they are: a path with a
+     * space in it has to come quoted. */
+    static char quoted[8][4400];
+    const char *args[9];
     intptr_t rc;
+    int i;
     if (s_cancelled)
         return -1;
-    rc = _spawnvp(_P_WAIT, argv[0], (const char *const *)argv);
+    for (i = 0; argv[i] && i < 8; i++) {
+        if (strchr(argv[i], ' ')) {
+            snprintf(quoted[i], sizeof quoted[i], "\"%s\"", argv[i]);
+            args[i] = quoted[i];
+        } else {
+            args[i] = argv[i];
+        }
+    }
+    args[i] = NULL;
+    rc = _spawnvp(_P_WAIT, argv[0], args);
     return (int)rc;
 #else
     pid_t pid;
@@ -444,6 +459,10 @@ static int unpack_archive(const char *archive, const char *dir)
 {
     char opt[4300];
     char *bsdtar[] = { "bsdtar", "-xf", (char *)archive, "-C", (char *)dir, NULL };
+#if defined(_WIN32)
+    /* Windows 10 and later ship bsdtar as tar.exe. */
+    char *tar[] = { "tar", "-xf", (char *)archive, "-C", (char *)dir, NULL };
+#endif
     char *sevenz[] = { "7z", "x", "-y", opt, (char *)archive, NULL };
     char *sevenza[] = { "7za", "x", "-y", opt, (char *)archive, NULL };
 
@@ -452,6 +471,10 @@ static int unpack_archive(const char *archive, const char *dir)
         s_progress(0, 0, s_progress_ud);
     if (run(bsdtar) == 0 || run(sevenz) == 0 || run(sevenza) == 0)
         return 0;
+#if defined(_WIN32)
+    if (run(tar) == 0)
+        return 0;
+#endif
     if (s_cancelled)
         set_error("Cancelled.");
     else
@@ -535,7 +558,9 @@ int conker_install(const char *src, const char *installed, char *out, size_t n)
         char dir[4200];
         snprintf(dir, sizeof dir, "%s", src);
         if (!is_dir(src)) {
-            char *slash = strrchr(dir, '/');
+            char *slash = strrchr(dir, '/'), *back = strrchr(dir, '\\');
+            if (back > slash)
+                slash = back;
             if (slash)
                 *slash = 0;
         }
@@ -709,6 +734,24 @@ static int pick_file(char *out, size_t n)
     }
     return 0;
 }
+#else
+/* The Windows file dialog, where zenity asks elsewhere. */
+static int pick_file(char *out, size_t n)
+{
+    OPENFILENAMEA ofn;
+
+    memset(&ofn, 0, sizeof ofn);
+    out[0] = 0;
+    ofn.lStructSize = sizeof ofn;
+    ofn.lpstrFilter = "Conker disc (.iso, .7z, .zip, default.xbe)\0"
+                      "*.iso;*.xiso;*.7z;*.zip;default.xbe\0All files\0*.*\0";
+    ofn.lpstrFile = out;
+    ofn.nMaxFile = (DWORD)n;
+    ofn.lpstrTitle = "Conker: choose your disc image (.iso, .7z, .zip) or the "
+                     "default.xbe of the extracted disc";
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    return GetOpenFileNameA(&ofn) && out[0];
+}
 #endif
 
 int conker_find_game(const char *arg, const char *data_dir, const char *exe_dir,
@@ -744,14 +787,31 @@ int conker_find_game(const char *arg, const char *data_dir, const char *exe_dir,
         }
         src = picked;
 #else
+        /* No setup window here: a message, the file dialog, and the
+         * install runs before the game's window opens. */
         (void)exe_dir;
-        (void)picked;
-        fprintf(stderr, "No game found: pass the extracted disc's folder or the .iso.\n");
-        return -1;
+        if (MessageBoxA(NULL, "Conker needs your copy of the game: choose your disc "
+                        "image (.iso, .7z, .zip) or the default.xbe of the extracted "
+                        "disc.\n\nA disc image is installed once, which takes a minute "
+                        "or two; the game starts when it is done.",
+                        "Conker: Live & Reloaded", MB_OKCANCEL | MB_ICONINFORMATION) != IDOK
+                || !pick_file(picked, sizeof picked)) {
+            fprintf(stderr, "[INSTALL] no game chosen\n");
+            return -1;
+        }
+        src = picked;
 #endif
     }
     if (make_dirs(data_dir) != 0 || conker_install(src, installed, out, n) != 0) {
         fprintf(stderr, "The game could not be set up: %s\n", conker_install_error());
+#if defined(_WIN32)
+        {
+            char msg[1400];
+            snprintf(msg, sizeof msg, "The game could not be set up:\n\n%s",
+                     conker_install_error());
+            MessageBoxA(NULL, msg, "Conker: Live & Reloaded", MB_OK | MB_ICONERROR);
+        }
+#endif
         return -1;
     }
     if (!from_arg)

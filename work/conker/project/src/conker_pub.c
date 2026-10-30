@@ -12,7 +12,8 @@
  * from inside its page.
  *
  * "Xbox Live & Co" reads "Online & Co": the string of its first line is
- * rewritten in place each time the pub comes up.
+ * rewritten in place each time the pub comes up, as soon as the title exists
+ * (it can take several seconds after the pub does).
  *
  * At the top level B does nothing in the game. Here it asks "Do you want to
  * exit?" on the title showing, in the title's own lettering, with No picked;
@@ -54,13 +55,14 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 #define FE_PUB         3u
 #define SELECTION      0x0077625Du    /* and the two bytes after it */
 #define PAGE_OPEN      0x00776220u    /* float: 0 top level, 1 a page open */
-#define IDLE_TIME      0x008756A8u    /* float seconds */
 #define SLOT_TITLES    0x0084B120u    /* Game 1..3 */
+#define IDLE_TIME      0x008756A8u    /* float seconds */
 #define TEXT_ITEM_VT   0x005FBD90u
 #define HEAP_LO        0x00800000u
 #define HEAP_HI        0x04000000u
 #define GAME_1         3
 #define DEFAULT_MS     3000
+#define RENAME_TRIES   30             /* a look a second */
 
 #define G8(a)  (*(volatile uint8_t *)(g_xbox_mem_offset + (a)))
 #define G32(a) (*(volatile uint32_t *)(g_xbox_mem_offset + (a)))
@@ -74,6 +76,7 @@ static int s_played = -1;               /* slot whose page is open, or -1 */
 static uint64_t s_default_until;        /* putting it on the slot, until */
 static uint64_t s_rename_at;            /* look for Xbox Live's title then */
 static int s_rename_tries;
+static int s_asking, s_yes;
 
 static int in_pub(void)
 {
@@ -92,7 +95,8 @@ static int wstr_is(uint32_t w, const char *s);
 static void put_wstr(uint32_t w, const char *s);
 
 /* Xbox Live's title, as text items: its string becomes "Online". Whether
- * the title was found (or reads "Online" already). */
+ * that was done now: an "Online" already there can be the last pub's, in
+ * memory since freed. */
 static int rename_live(void)
 {
     uint32_t a;
@@ -101,9 +105,7 @@ static int rename_live(void)
     for (a = HEAP_LO; a < HEAP_HI; a += 4)
         if (G32(a) == TEXT_ITEM_VT) {
             if (wstr_is(G32(a + 0x14), "Xbox Live")) {
-                put_wstr(G32(a + 0x14), "Online");
-                n++;
-            } else if (wstr_is(G32(a + 0x14), "Online")) {
+                put_wstr(G32(a + 0x14), conker_tr("Online"));
                 n++;
             }
         }
@@ -123,12 +125,17 @@ void conker_pub_tick(uint64_t now)
         s_default_until = now + DEFAULT_MS;
     if (pub && (!s_in_pub || G32(LEVEL) != s_level)) {
         s_rename_at = now;
-        s_rename_tries = 5;
+        s_rename_tries = RENAME_TRIES;
     }
     s_level = G32(LEVEL);
     if (pub && s_rename_tries && now >= s_rename_at && G32(LEVEL) == LEVEL_FRONTEND) {
-        s_rename_tries = rename_live() ? 0 : s_rename_tries - 1;
-        s_rename_at = now + 500;
+        if (rename_live()) {
+            fprintf(stderr, "[PUB] Xbox Live reads %s\n", conker_tr("Online"));
+            s_rename_tries = 0;
+        } else {
+            s_rename_tries--;
+        }
+        s_rename_at = now + 1000;
     }
     if (!pub && s_in_pub && s_played >= 0 && G32(FE_STATE) != 0x10u)
         conker_settings_set_last_game(s_played);
@@ -159,22 +166,21 @@ void conker_pub_tick(uint64_t now)
 static struct { uint32_t at, was, now; } s_swap[MAX_SWAPS];
 static int s_nswap;
 static uint32_t s_text, s_blank;        /* guest strings */
-static int s_asking, s_yes;
 
 static int wstr_is(uint32_t w, const char *s)
 {
     if (w < 0x10000u || w >= HEAP_HI)
         return 0;
-    for (; *s; s++, w += 2)
-        if (*(volatile uint16_t *)(g_xbox_mem_offset + w) != (uint8_t)*s)
+    for (; *s; w += 2)
+        if (*(volatile uint16_t *)(g_xbox_mem_offset + w) != (uint16_t)conker_utf8_next(&s))
             return 0;
     return *(volatile uint16_t *)(g_xbox_mem_offset + w) == 0;
 }
 
 static void put_wstr(uint32_t w, const char *s)
 {
-    for (; *s; s++, w += 2)
-        *(volatile uint16_t *)(g_xbox_mem_offset + w) = (uint8_t)*s;
+    for (; *s; w += 2)
+        *(volatile uint16_t *)(g_xbox_mem_offset + w) = (uint16_t)conker_utf8_next(&s);
     *(volatile uint16_t *)(g_xbox_mem_offset + w) = 0;
 }
 
@@ -222,16 +228,19 @@ static void restore(void)
 
 static void show_answer(void)
 {
-    put_wstr(s_text, s_yes ? "Do you want to exit?\n   - Yes -    No"
-                           : "Do you want to exit?\n     Yes    - No -");
+    char text[96];
+
+    snprintf(text, sizeof text, s_yes ? "%s\n   - %s -    %s" : "%s\n     %s    - %s -",
+             conker_tr("Do you want to exit?"), conker_tr("Yes"), conker_tr("No"));
+    put_wstr(s_text, text);
 }
 
 static int ask(int sel)
 {
-    static const char *const names[] = { "Online", "Options", "Chapters" };
+    const char *const names[] = { conker_tr("Online"), conker_tr("Options"), conker_tr("Chapters") };
 
     if (!s_text) {
-        s_text = xbox_HeapAlloc(128, 16);
+        s_text = xbox_HeapAlloc(192, 16);
         s_blank = xbox_HeapAlloc(16, 16);
         if (!s_text || !s_blank)
             return 0;
@@ -243,12 +252,10 @@ static int ask(int sel)
     if (sel < GAME_1) {
         swap_items(names[sel], s_text, sel == 1 ? -200.0f : 0.0f, sel == 1 ? 110.0f : 0.0f);
         if (sel == 0)
-            swap_items("& Co", s_blank, 0.0f, 0.0f);
+            swap_items(conker_tr("& Co"), s_blank, 0.0f, 0.0f);
     } else if (sel <= GAME_1 + 2) {
         uint32_t title = G32(SLOT_TITLES + 4u * (uint32_t)(sel - GAME_1));
-        if (title && G32(title + 8))
-            swap(title + 8, s_text);
-        else if (title && G32(title + 0x2C4))
+        if (title && G32(title + 0x2C4))   /* what its title shows (recomp_manual.c) */
             swap(title + 0x2C4, s_text);
     }
     if (!s_nswap) {

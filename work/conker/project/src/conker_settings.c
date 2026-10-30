@@ -31,6 +31,14 @@
 
 /* ── The values ───────────────────────────────────────────────────────── */
 
+void xbox_SetLanguage(unsigned long language);   /* src/kernel/kernel_xbox.c */
+
+/* Names as each language writes its own, as far as the fonts have the letters
+ * (conker_lang.c). */
+static const struct { const char *name, *key; unsigned long xbox; } k_languages[CONKER_LANG_COUNT] = {
+    { "English", "english", 1 }, { "Español", "spanish", 5 }, { "Français", "french", 4 },
+    { "Deutsch", "german", 3 }, { "Italiano", "italian", 6 }, { "Japanese", "japanese", 2 },
+};
 static const char *const k_modes[] = { "Windowed", "Fullscreen", "Borderless Fullscreen" };
 static const char *const k_mode_keys[] = { "windowed", "fullscreen", "borderless" };
 static const struct { const char *name; int w, h; } k_aspects[] = {
@@ -42,6 +50,8 @@ static const int k_fps[] = { 30, 60, 90, 120 };
 #define N_FPS ((int)(sizeof k_fps / sizeof k_fps[0]))
 #define MAX_SCALE 10
 
+static volatile int s_language;          /* the choice; takes effect at the next launch */
+static int s_language_now;               /* this launch's */
 static volatile int s_mode;              /* index into k_modes */
 static volatile int s_aspect;            /* index into k_aspects */
 static volatile int s_res_w, s_res_h;    /* 0: the window's default size */
@@ -55,7 +65,7 @@ static volatile int s_last_game;         /* 0..2: the pub starts on Game 1..3 (c
 static volatile float s_hor_plus;
 
 static const char *const k_labels[CONKER_OPT_COUNT] = {
-    "Display Mode", "Aspect Ratio", "Resolution",
+    "Language", "Display Mode", "Aspect Ratio", "Resolution",
     "Render Resolution", "VSync", "FPS Limit", "Allow Skip Cutscenes", "Swing Button", "Weapon",
     "Uncensor",
 };
@@ -67,8 +77,15 @@ static volatile int s_uncensor = -1;     /* the choice showing; -1: the mod's st
  * 640x480 at the display's shape. */
 static void default_window_size(int *w, int *h)
 {
+    int dw, dh;
+
     *h = 960;
     *w = (int)(960.0 * k_aspects[s_aspect].w / k_aspects[s_aspect].h + 0.5);
+    /* A wide shape on a narrower desktop: as wide as the desktop. */
+    if (xbox_WindowDesktopSize(&dw, &dh) && *w > dw) {
+        *w = dw;
+        *h = (dw * k_aspects[s_aspect].h / k_aspects[s_aspect].w) & ~1;
+    }
 }
 
 /* ── The cfg file ─────────────────────────────────────────────────────── */
@@ -88,6 +105,7 @@ static void save(void)
     }
     fprintf(f, "# Conker: Live & Reloaded recomp -- Recomp Options\n"
                "# (front end: Options > Recomp Options). Rewritten on every change.\n");
+    fprintf(f, "language=%s\n", k_languages[s_language].key);
     fprintf(f, "display_mode=%s\n", k_mode_keys[s_mode]);
     fprintf(f, "aspect_ratio=%s\n", k_aspects[s_aspect].name);
     if (s_res_w > 0 && s_res_h > 0)
@@ -116,7 +134,11 @@ static void parse_line(char *line)
     for (end = val + strlen(val); end > val && (end[-1] == '\n' || end[-1] == '\r'
                                                  || end[-1] == ' '); end--)
         end[-1] = 0;
-    if (!strcmp(key, "display_mode")) {
+    if (!strcmp(key, "language")) {
+        for (i = 0; i < CONKER_LANG_COUNT; i++)
+            if (!strcmp(val, k_languages[i].key))
+                s_language = i;
+    } else if (!strcmp(key, "display_mode")) {
         for (i = 0; i < 3; i++)
             if (!strcmp(val, k_mode_keys[i]))
                 s_mode = i;
@@ -126,7 +148,7 @@ static void parse_line(char *line)
                 s_aspect = i;
     } else if (!strcmp(key, "resolution")) {
         int w = 0, h = 0;
-        if (sscanf(val, "%dx%d", &w, &h) == 2 && w >= 640 && h >= 480
+        if (sscanf(val, "%dx%d", &w, &h) == 2 && w >= 640 && h >= 360
                 && w <= 16384 && h <= 16384) {
             s_res_w = w;
             s_res_h = h;
@@ -201,6 +223,10 @@ void conker_settings_load(void)
         fprintf(stderr, "[CONKER] settings from %s\n", s_cfg_path);
     }
 
+    s_language_now = s_language;
+    conker_lang_set(s_language_now);
+    xbox_SetLanguage(k_languages[s_language_now].xbox);
+
     /* CONKER_ASPECT keeps working: the nearest shape on the list. */
     e = getenv("CONKER_ASPECT");
     if (e && *e) {
@@ -266,22 +292,43 @@ float conker_settings_hor_plus(void)
 
 /* ── The submenu's rows ──────────────────────────────────────────────── */
 
-/* The resolutions offered: the display's, plus the window's own size when
- * that is not one of them. Rebuilt when the submenu opens. */
-static int s_res[66][2];
+/* The resolutions offered are the ones of the chosen shape: the display's,
+ * and -- where the window can be any size -- the usual sizes of that shape
+ * that fit the desktop, and the largest that fits it, so that even a shape
+ * the display has no mode of has a choice. Largest first. Rebuilt when the
+ * submenu opens and when the shape or the display mode changes. */
+#define MAX_RES 96
+#define SHAPE_TOLERANCE 0.025          /* 2560x1080 and 1366x768 are "21:9", "16:9" */
+static const short k_sizes[N_ASPECTS][12][2] = {
+    { {640, 480}, {800, 600}, {1024, 768}, {1280, 960}, {1440, 1080}, {1600, 1200},
+      {1920, 1440}, {2048, 1536}, {2880, 2160} },
+    { {1280, 720}, {1366, 768}, {1600, 900}, {1920, 1080}, {2560, 1440}, {3200, 1800},
+      {3840, 2160} },
+    { {1152, 720}, {1280, 800}, {1440, 900}, {1680, 1050}, {1920, 1200}, {2560, 1600},
+      {3840, 2400} },
+    { {1720, 720}, {2560, 1080}, {3440, 1440}, {3840, 1600}, {5120, 2160} },
+    { {2560, 720}, {3840, 1080}, {5120, 1440} },
+};
+static int s_res[MAX_RES][2];
 static int s_nres;
 
-static void build_resolutions(void)
+static int fits_shape(int w, int h)
 {
-    int w = s_res_w, h = s_res_h, i;
+    double a = (double)k_aspects[s_aspect].w / k_aspects[s_aspect].h;
+    double d = (double)w / h / a - 1.0;
+    return d < SHAPE_TOLERANCE && d > -SHAPE_TOLERANCE;
+}
 
-    s_nres = xbox_WindowResolutions(s_res, 64);
-    if (w <= 0 || h <= 0)
-        default_window_size(&w, &h);
+/* Into the list, by area, so left/right step in order. */
+static void add_resolution(int w, int h)
+{
+    int i;
+
     for (i = 0; i < s_nres; i++)
         if (s_res[i][0] == w && s_res[i][1] == h)
             return;
-    /* Not a display mode: in, by area, so left/right still step in order. */
+    if (s_nres == MAX_RES)
+        return;
     for (i = s_nres; i > 0 && (long)s_res[i - 1][0] * s_res[i - 1][1] < (long)w * h; i--) {
         s_res[i][0] = s_res[i - 1][0];
         s_res[i][1] = s_res[i - 1][1];
@@ -291,16 +338,85 @@ static void build_resolutions(void)
     s_nres++;
 }
 
+static void build_resolutions(void)
+{
+    int modes[64][2], n = xbox_WindowResolutions(modes, 64), dw = 0, dh = 0, i;
+    int have_desk = xbox_WindowDesktopSize(&dw, &dh);
+
+    s_nres = 0;
+    for (i = 0; i < n; i++)
+        if (fits_shape(modes[i][0], modes[i][1]))
+            add_resolution(modes[i][0], modes[i][1]);
+    /* Fullscreen sets a mode of the display: only those, while there are any. */
+    if (s_mode == 1 && s_nres)
+        return;
+    for (i = 0; i < 12 && k_sizes[s_aspect][i][0]; i++)
+        if (!have_desk || (k_sizes[s_aspect][i][0] <= dw && k_sizes[s_aspect][i][1] <= dh))
+            add_resolution(k_sizes[s_aspect][i][0], k_sizes[s_aspect][i][1]);
+    if (have_desk) {
+        int w = dw, h = (dw * k_aspects[s_aspect].h / k_aspects[s_aspect].w) & ~1;
+        if (h > dh) {
+            h = dh;
+            w = (dh * k_aspects[s_aspect].w / k_aspects[s_aspect].h) & ~1;
+        }
+        if (w >= 640 && h >= 360)
+            add_resolution(w, h);
+    }
+    if (!s_nres)
+        add_resolution(k_sizes[s_aspect][0][0], k_sizes[s_aspect][0][1]);
+}
+
+/* The list again; a chosen size of another shape gives way to the nearest in
+ * height, and the window follows. The default size has the shape already. */
+static void refit_resolution(void)
+{
+    int best = 0, i;
+
+    build_resolutions();
+    if (s_res_w <= 0 || s_res_h <= 0) {
+        int w, h;
+        default_window_size(&w, &h);
+        add_resolution(w, h);
+        return;
+    }
+    for (i = 0; i < s_nres; i++) {
+        int d = s_res[i][1] - s_res_h, b = s_res[best][1] - s_res_h;
+        if (s_res[i][0] == s_res_w && s_res[i][1] == s_res_h)
+            return;
+        if ((d < 0 ? -d : d) < (b < 0 ? -b : b))
+            best = i;
+    }
+    s_res_w = s_res[best][0];
+    s_res_h = s_res[best][1];
+    apply_window();
+}
+
+static void log_resolutions(void)
+{
+    char list[512];
+    int i, n = 0;
+
+    list[0] = 0;
+    for (i = 0; i < s_nres && n < (int)sizeof list - 16; i++)
+        n += snprintf(list + n, sizeof list - (size_t)n, " %dx%d", s_res[i][0], s_res[i][1]);
+    fprintf(stderr, "[CONKER] resolutions at %s:%s\n", k_aspects[s_aspect].name, list);
+}
+
 const char *conker_options_label(int row)
 {
-    return row >= 0 && row < CONKER_OPT_COUNT ? k_labels[row] : "";
+    return row >= 0 && row < CONKER_OPT_COUNT ? conker_tr(k_labels[row]) : "";
 }
 
 void conker_options_value(int row, char *buf, size_t size)
 {
     switch (row) {
+    case CONKER_OPT_LANGUAGE:
+        /* Applied at start, like the Weapon. */
+        snprintf(buf, size, "%s%s", conker_tr(k_languages[s_language].name),
+                 s_language != s_language_now ? conker_tr(" (restart)") : "");
+        break;
     case CONKER_OPT_DISPLAY_MODE:
-        snprintf(buf, size, "%s", k_modes[s_mode]);
+        snprintf(buf, size, "%s", conker_tr(k_modes[s_mode]));
         break;
     case CONKER_OPT_ASPECT:
         snprintf(buf, size, "%s", k_aspects[s_aspect].name);
@@ -314,34 +430,34 @@ void conker_options_value(int row, char *buf, size_t size)
     }
     case CONKER_OPT_RENDER_SCALE:
         if (s_scale == 1)
-            snprintf(buf, size, "Original (1X)");
+            snprintf(buf, size, "%s", conker_tr("Original (1X)"));
         else
             snprintf(buf, size, "%dX", s_scale);
         break;
     case CONKER_OPT_VSYNC:
-        snprintf(buf, size, "%s", s_vsync ? "On" : "Off");
+        snprintf(buf, size, "%s", conker_tr(s_vsync ? "On" : "Off"));
         break;
     case CONKER_OPT_FPS:
         snprintf(buf, size, "%d FPS", s_fps);
         break;
     case CONKER_OPT_SKIP_CUTSCENES:
-        snprintf(buf, size, "%s", s_skip_cutscenes ? "Yes" : "No");
+        snprintf(buf, size, "%s", conker_tr(s_skip_cutscenes ? "Yes" : "No"));
         break;
     case CONKER_OPT_SWING_BUTTON:
-        snprintf(buf, size, "%s", s_swing_button ? "X" : "Off");
+        snprintf(buf, size, "%s", s_swing_button ? "X" : conker_tr("Off"));
         break;
     case CONKER_OPT_WEAPON:
         /* Applied at start: say so while the choice is not what is in hand. */
-        snprintf(buf, size, "%s%s", s_weapon ? "Frying Pan" : "Bat",
-                 s_weapon && conker_weapon_failed() ? " (failed)"
-                 : s_weapon != conker_weapon_active() ? " (restart)" : "");
+        snprintf(buf, size, "%s%s", conker_tr(s_weapon ? "Frying Pan" : "Bat"),
+                 s_weapon && conker_weapon_failed() ? conker_tr(" (failed)")
+                 : s_weapon != conker_weapon_active() ? conker_tr(" (restart)") : "");
         break;
     case CONKER_OPT_UNCENSOR: {
         char status[96];
         int c = s_uncensor < 0 ? conker_mods_uncensor_choice() : s_uncensor;
         conker_mods_uncensor_status(status, sizeof status);
         /* What happened last, while there is something to tell. */
-        snprintf(buf, size, "%s", status[0] ? status : k_uncensor[c]);
+        snprintf(buf, size, "%s", status[0] ? status : conker_tr(k_uncensor[c]));
         break;
     }
     default:
@@ -361,18 +477,25 @@ static void change(int row, int dir)
     int i;
 
     switch (row) {
+    case CONKER_OPT_LANGUAGE:
+        s_language = wrap(s_language + dir, CONKER_LANG_COUNT);
+        break;
     case CONKER_OPT_DISPLAY_MODE:
         s_mode = wrap(s_mode + dir, 3);
+        refit_resolution();
         apply_window();
         break;
     case CONKER_OPT_ASPECT:
         s_aspect = wrap(s_aspect + dir, N_ASPECTS);
         apply_aspect(1);
+        refit_resolution();
+        log_resolutions();
+        /* The default window size is of the new shape too. */
+        if (s_mode == 0 && s_res_w <= 0)
+            apply_window();
         break;
     case CONKER_OPT_RESOLUTION: {
         int w = s_res_w, h = s_res_h, at = 0;
-        if (!s_nres)
-            build_resolutions();
         if (!s_nres)
             return;
         if (w <= 0 || h <= 0)
@@ -588,7 +711,9 @@ static void input_filter(DWORD port, XBOX_INPUT_STATE *st, int connected)
             return;
         }
         if (page && s_recomp_selected && (pressed & P_A)) {
-            build_resolutions();
+            refit_resolution();
+            log_resolutions();
+            save();
             s_row = 0;
             s_open_ms = now;
             s_open = 1;

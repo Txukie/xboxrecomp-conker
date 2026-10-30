@@ -1,10 +1,12 @@
 # Conker: Live & Reloaded — static recompilation
 
-![Status](https://img.shields.io/badge/status-in%20development-f59e0b)
-![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Steam%20Deck-2563eb)
+![Status](https://img.shields.io/badge/status-alpha-f59e0b)
+![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Steam%20Deck%20%7C%20Windows-2563eb)
 ![License](https://img.shields.io/badge/license-MIT-16a34a)
 
 **[English](#english) · [Español](#español)**
+
+> ⚠️ **Alpha.** Expect bugs, and keep a copy of your saves. / **Versión alfa.** Puede tener errores: guarda una copia de tus partidas.
 
 ---
 
@@ -26,14 +28,19 @@ game, which is installed the first time you run it.
 
 ### Status
 
+**This project is in alpha:** it is playable, but expect bugs, and keep a
+copy of your saves.
+
 | Area | Status |
 |---|---|
 | Linux x86-64 | ✅ Builds and runs; released as an AppImage |
 | Steam Deck | ✅ Tested in Game Mode: 30 fps at native 1X render, smooth after the first run |
-| Windows / macOS | 🟡 Supported by the runtime, not yet built for this project |
+| Windows x86-64 | ✅ Tested on Windows and under Proton/Wine; released as a zip |
+| macOS | 🟡 Supported by the runtime, not yet built for this project |
 | Game | ✅ Single-player playable from a new game through the first chapters; later chapters are little tested; multiplayer and Xbox Live are not supported |
 | Graphics | ✅ Vulkan: everything is drawn on the GPU, including the game's vertex programs; render resolution 1X to 10X, 30/60/90/120 fps, widescreen |
 | Videos, sound, saves, controller | ✅ Working |
+| Languages | ✅ English, Spanish, French, German, Italian and Japanese menus and subtitles; voices stay in English |
 | Metal renderer | 🔴 Not started |
 | Known issues | The first run of each new version compiles its shaders and stutters in menus and loading screens; the CPU fallback renderer (no Vulkan) runs at about 3 fps and shows videos washed out |
 
@@ -59,6 +66,14 @@ the GPU drivers are the system's.
 On the **Steam Deck**, add the AppImage to Steam as a non-Steam game and
 start it from Game Mode.
 
+### Quick start (Windows)
+
+Download `Conker-Recomp-<version>-windows-x86_64.zip` from the
+[releases](https://github.com/Txukie/xboxrecomp-conker/releases), unpack it
+and run `conker_recomp.exe`. The first time, it asks for your copy of the
+game, as above. It needs 64-bit Windows 10 or later and a Vulkan 1.3 driver.
+Everything is kept in `%LOCALAPPDATA%\ConkerRecomp`.
+
 ### Recomp Options
 
 In the main menu, **Options** has a third entry under Vibration and Invert
@@ -68,9 +83,10 @@ change it; B goes back. Changes apply immediately and are saved in
 
 | Setting | Values | Default |
 |---|---|---|
+| Language | English, Español, Français, Deutsch, Italiano, Japanese: menus and subtitles, from the disc's own text (voices stay in English). Applies at the next start | English |
 | Display Mode | Windowed, Fullscreen, Borderless Fullscreen | Windowed |
 | Aspect Ratio | 4:3, 16:9, 16:10, 21:9, 32:9 (Hor+: wider, not stretched; videos keep 4:3 with black bars) | 4:3 |
-| Resolution | The monitor's modes | The window's default |
+| Resolution | The sizes of the chosen aspect ratio: the monitor's modes and, except in Fullscreen, the usual sizes that fit the desktop | The window's default |
 | Render Resolution | Original (1X) to 10X | 1X |
 | VSync | On, Off | On |
 | FPS Limit | 30, 60, 90, 120 (the game times its own frames, so it runs at the right speed above 30) | 30 |
@@ -96,7 +112,8 @@ shipped. The change takes effect when the game is restarted.
 
 **Uncensor** applies the [uncensor patch](https://gamebanana.com/mods/697391)
 (text and audio). Enable downloads it from GameBanana the first time
-(about 250 MB; needs `curl` and `bsdtar` or `7z` installed), Disable turns
+(about 250 MB; on Linux it needs `curl`). Its text covers English, Spanish,
+French and Italian; German and Japanese subtitles stay as they are, Disable turns
 it off without deleting it, and Update looks for a new version. Changes
 take effect when the game is restarted.
 
@@ -105,7 +122,10 @@ take effect when the game is restarted.
 The pub starts on **Game 1**, and after that on the save slot last played.
 The first title reads "Online & Co". B on any title asks "Do you want to
 exit?" (No is picked; left and right choose, A answers, B is No); Yes
-closes the game.
+closes the game. Titles, including the save slots', and this question follow
+the Language option.
+
+Loading a level shows the game's own loading screen.
 
 ### Controls
 
@@ -156,6 +176,9 @@ The project version is `project(conker_recomp VERSION …)` in
 `work/conker/project/CMakeLists.txt`; the executable prints it at start.
 Without glslang, vertex programs run in a slower interpreter shader;
 without Vulkan, the CPU renderer draws.
+
+The Windows build is cross-compiled on Linux with MinGW-w64: see
+[work/conker/packaging/windows/README.md](work/conker/packaging/windows/README.md).
 
 ### Useful environment variables
 
@@ -212,6 +235,8 @@ Technical notes and the plan for each platform:
 - `work/conker/patches/xboxrecomp/`: local fixes to the toolkit.
 - `work/conker/packaging/appimage/`: the AppImage's launcher, desktop entry,
   icon and build script.
+- `work/conker/packaging/windows/`: the Windows zip's dependencies, icon and
+  notes.
 - `work/conker/regenerate.sh`: regenerates `src/recomp/gen/` from the XBE.
 - `docs/technical/porting.md`: status and plans.
 
@@ -253,14 +278,19 @@ se instala la primera vez que lo abres.
 
 ### Estado
 
+**Este proyecto está en fase alfa:** se puede jugar, pero puede tener errores;
+guarda una copia de tus partidas.
+
 | Área | Estado |
 |---|---|
 | Linux x86-64 | ✅ Compila y funciona; se publica como AppImage |
 | Steam Deck | ✅ Probado en modo Juego: 30 fps a resolución original (1X), fluido desde la segunda vez que se abre |
-| Windows / macOS | 🟡 Soportados por el runtime, aún sin compilar para este proyecto |
+| Windows x86-64 | ✅ Probado en Windows y con Proton/Wine; se publica como zip |
+| macOS | 🟡 Soportado por el runtime, aún sin compilar para este proyecto |
 | Juego | ✅ El modo de un jugador se puede jugar desde una partida nueva durante los primeros capítulos; los siguientes están poco probados; el multijugador y Xbox Live no funcionan |
 | Gráficos | ✅ Vulkan: todo se dibuja en la GPU, también los vertex programs del juego; resolución de render de 1X a 10X, 30/60/90/120 fps, pantalla panorámica |
 | Vídeos, sonido, partidas, mando | ✅ Funcionan |
+| Idiomas | ✅ Menús y subtítulos en inglés, español, francés, alemán, italiano y japonés; las voces siguen en inglés |
 | Renderizador Metal | 🔴 Sin empezar |
 | Problemas conocidos | La primera vez que se abre cada versión nueva compila sus shaders y va a tirones en los menús y las cargas; el renderizador de reserva por CPU (sin Vulkan) va a unos 3 fps y muestra los vídeos lavados |
 
@@ -286,6 +316,14 @@ de Vulkan y los drivers de la GPU son los del sistema.
 En la **Steam Deck**, añade la AppImage a Steam como juego que no es de
 Steam y ábrela desde el modo Juego.
 
+### Prueba rápida (Windows)
+
+Descarga `Conker-Recomp-<versión>-windows-x86_64.zip` de las
+[releases](https://github.com/Txukie/xboxrecomp-conker/releases), descomprímelo
+y abre `conker_recomp.exe`. La primera vez pide tu copia del juego, como
+arriba. Necesita Windows 10 o posterior de 64 bits y un driver Vulkan 1.3. Todo
+se guarda en `%LOCALAPPDATA%\ConkerRecomp`.
+
 ### Recomp Options
 
 En el menú principal, **Options** tiene una tercera entrada bajo Vibration
@@ -296,9 +334,10 @@ momento y se guardan en `~/.config/conker-recomp/settings.cfg`
 
 | Ajuste | Valores | Por defecto |
 |---|---|---|
+| Language | English, Español, Français, Deutsch, Italiano, Japanese: menús y subtítulos, con el texto del propio disco (las voces siguen en inglés). Se aplica al volver a arrancar | English |
 | Display Mode | Windowed, Fullscreen, Borderless Fullscreen | Windowed |
 | Aspect Ratio | 4:3, 16:9, 16:10, 21:9, 32:9 (Hor+: más ancho, sin deformar; los vídeos conservan el 4:3 con barras negras) | 4:3 |
-| Resolution | Los modos del monitor | La de la ventana por defecto |
+| Resolution | Los tamaños de la relación de aspecto elegida: los modos del monitor y, salvo en Fullscreen, los tamaños habituales que caben en el escritorio | La de la ventana por defecto |
 | Render Resolution | Original (1X) a 10X | 1X |
 | VSync | On, Off | On |
 | FPS Limit | 30, 60, 90, 120 (el juego mide su propio tiempo por fotograma, así que por encima de 30 va a la velocidad correcta) | 30 |
@@ -323,7 +362,8 @@ distribuye nada del juego. El cambio se aplica al reiniciar el juego.
 
 **Uncensor** aplica el [parche de descensura](https://gamebanana.com/mods/697391)
 (textos y audio). Enable lo descarga de GameBanana la primera vez (unos
-250 MB; hacen falta `curl` y `bsdtar` o `7z` instalados), Disable lo
+250 MB; en Linux hace falta `curl`). Su texto cubre inglés, español,
+francés e italiano; los subtítulos en alemán y japonés se quedan como están, Disable lo
 desactiva sin borrarlo y Update busca una versión nueva. Los cambios se
 aplican al reiniciar el juego.
 
@@ -332,7 +372,10 @@ aplican al reiniciar el juego.
 El pub empieza en **Game 1** y, a partir de ahí, en la partida que se jugó
 la última vez. El primer título dice "Online & Co". B en cualquier título
 pregunta "Do you want to exit?" (con No elegido; izquierda y derecha
-eligen, A responde, B es No); Yes cierra el juego.
+eligen, A responde, B es No); Yes cierra el juego. Los títulos, también los de
+las partidas, y esta pregunta siguen la opción Language.
+
+Al cargar un nivel aparece la pantalla de carga del propio juego.
 
 ### Controles
 
@@ -384,6 +427,9 @@ veces más lento. La versión está en `project(conker_recomp VERSION …)` de
 `work/conker/project/CMakeLists.txt`, y el ejecutable la muestra al
 arrancar. Sin glslang, los vertex programs se ejecutan en un shader
 intérprete más lento; sin Vulkan, dibuja la CPU.
+
+La versión de Windows se compila desde Linux con MinGW-w64: consulta
+[work/conker/packaging/windows/README.md](work/conker/packaging/windows/README.md).
 
 ### Variables de entorno útiles
 
@@ -441,6 +487,8 @@ Notas técnicas y el plan para cada plataforma:
 - `work/conker/patches/xboxrecomp/`: correcciones locales al toolkit.
 - `work/conker/packaging/appimage/`: el lanzador, la entrada de escritorio,
   el icono y el script de la AppImage.
+- `work/conker/packaging/windows/`: las dependencias, el icono y las notas del
+  zip de Windows.
 - `work/conker/regenerate.sh`: regenera `src/recomp/gen/` a partir del XBE.
 - `docs/technical/porting.md`: estado y planes.
 

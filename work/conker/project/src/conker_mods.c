@@ -6,9 +6,12 @@
  * newest archive, checks it against the MD5 GameBanana lists, and unpacks
  * it next to the installed copy before swapping the two, so a failed or
  * interrupted update leaves the old one working. The system's curl fetches
- * and bsdtar (or 7-Zip) unpacks; the game ships neither.
+ * (WinHTTP on Windows: Wine and Proton have no curl.exe). A .7z is unpacked
+ * by the game itself (conker_7z.c); a .zip by the system's bsdtar or 7-Zip
+ * (tar.exe on Windows).
  */
 #include "conker_mods.h"
+#include "conker_settings.h"
 
 #include <errno.h>
 #include <stdarg.h>
@@ -20,13 +23,20 @@
 
 #include <xbox/xboxrecomp.h>
 
-#if !defined(_WIN32)
 #include <dirent.h>
 #include <pthread.h>
-#include <signal.h>
-#include <sys/wait.h>
 #include <unistd.h>
+#if defined(_WIN32)
+#include <windows.h>
+#include <bcrypt.h>
+#include <winhttp.h>
+#define make_dir(p) mkdir(p)
+#else
+#include <signal.h>
+#include <strings.h>
+#include <sys/wait.h>
 #include <openssl/evp.h>
+#define make_dir(p) mkdir(p, 0755)
 #endif
 
 #define MODS_DIR        "mods"
@@ -73,8 +83,6 @@ static int write_text(const char *path, const char *text)
     fputs(text, f);
     return fclose(f);
 }
-
-#if !defined(_WIN32)
 
 static void remove_tree(const char *path)
 {
@@ -137,8 +145,8 @@ void conker_mods_init(const char *data_dir, const char *save_dir)
 
     snprintf(s_mods, sizeof s_mods, "%s/" MODS_DIR, data_dir);
     snprintf(s_cache, sizeof s_cache, "%s/Cache", save_dir);
-    mkdir(data_dir, 0755);
-    mkdir(s_mods, 0755);
+    make_dir(data_dir);
+    make_dir(s_mods);
 
     /* The active set, with each mod's version: a changed set or an updated
      * mod empties the cache. */
@@ -175,7 +183,7 @@ void conker_mods_init(const char *data_dir, const char *save_dir)
         if (d)
             closedir(d);
     }
-    mkdir(save_dir, 0755);
+    make_dir(save_dir);
     write_text(applied_path, now);
 
     for (i = 0; i < n; i++) {
@@ -195,37 +203,21 @@ void conker_mods_init(const char *data_dir, const char *save_dir)
     xbox_path_set_overlays(dirs, n);
 }
 
-#else /* _WIN32 */
-
-void conker_mods_init(const char *data_dir, const char *save_dir)
-{
-    (void)save_dir;
-    snprintf(s_mods, sizeof s_mods, "%s\\" MODS_DIR, data_dir);
-}
-
-#endif
-
 /* ── Uncensor ──────────────────────────────────────────────────────────── */
 
 static char s_status[128];
 static volatile int s_busy;
 
-#if !defined(_WIN32)
 static pthread_mutex_t s_status_lock = PTHREAD_MUTEX_INITIALIZER;
-#endif
 
 static void set_status(const char *fmt, ...)
 {
     va_list ap;
-#if !defined(_WIN32)
     pthread_mutex_lock(&s_status_lock);
-#endif
     va_start(ap, fmt);
-    vsnprintf(s_status, sizeof s_status, fmt, ap);
+    vsnprintf(s_status, sizeof s_status, conker_tr(fmt), ap);
     va_end(ap);
-#if !defined(_WIN32)
     pthread_mutex_unlock(&s_status_lock);
-#endif
     fprintf(stderr, "[MODS] uncensor: %s\n", s_status);
 }
 
@@ -237,13 +229,9 @@ void conker_mods_uncensor_clear_status(void)
 
 void conker_mods_uncensor_status(char *buf, size_t size)
 {
-#if !defined(_WIN32)
     pthread_mutex_lock(&s_status_lock);
-#endif
     snprintf(buf, size, "%s", s_status);
-#if !defined(_WIN32)
     pthread_mutex_unlock(&s_status_lock);
-#endif
 }
 
 static void uncensor_path(char *buf, size_t size, const char *leaf)
@@ -276,8 +264,6 @@ static void set_enabled(int on)
         write_text(p, "Delete this file to turn the mod on again.\n");
 }
 
-#if !defined(_WIN32)
-
 /* ── The download, on its own thread ───────────────────────────────────── */
 
 typedef struct {
@@ -291,6 +277,36 @@ typedef struct {
 static int run(char *const argv[], const char *out_path,
                void (*progress)(unsigned long long bytes, void *), void *ud)
 {
+#if defined(_WIN32)
+    /* One command line, every argument quoted (none ends in a backslash),
+     * and no console window for it. */
+    char cmd[8192];
+    size_t len = 0;
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    DWORD code = (DWORD)-1;
+    int i;
+
+    for (i = 0; argv[i] && len < sizeof cmd; i++)
+        len += (size_t)snprintf(cmd + len, sizeof cmd - len, "%s\"%s\"", i ? " " : "", argv[i]);
+    if (len >= sizeof cmd)
+        return -1;
+    memset(&si, 0, sizeof si);
+    si.cb = sizeof si;
+    if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+        return -1;
+    while (WaitForSingleObject(pi.hProcess, 250) == WAIT_TIMEOUT) {
+        if (progress && out_path) {
+            struct stat st;
+            if (stat(out_path, &st) == 0)
+                progress((unsigned long long)st.st_size, ud);
+        }
+    }
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return (int)code;
+#else
     pid_t pid = fork();
     int status = -1;
     if (pid == 0) {
@@ -316,7 +332,109 @@ static int run(char *const argv[], const char *out_path,
         usleep(250000);
     }
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#endif
 }
+
+int conker_7z_extract(const char *archive, const char *dir, char *err, size_t err_size);
+
+/* URL into OUT_PATH; 0 when it came (HTTP 200). PROGRESS, if any, gets the
+ * bytes so far as they come. */
+#if defined(_WIN32)
+static int fetch_once(const char *url, const char *out_path, int timeout_s,
+                      void (*progress)(unsigned long long bytes, void *), void *ud)
+{
+    static char buf[1 << 16];
+    wchar_t wurl[2048], host[256], path[2048], extra[1024];
+    URL_COMPONENTS uc;
+    HINTERNET ses = NULL, con = NULL, req = NULL;
+    DWORD status = 0, size = sizeof status, got;
+    unsigned long long total = 0;
+    FILE *f = NULL;
+    int rc = -1;
+
+    if (!MultiByteToWideChar(CP_UTF8, 0, url, -1, wurl, 2048))
+        return -1;
+    memset(&uc, 0, sizeof uc);
+    uc.dwStructSize = sizeof uc;
+    uc.lpszHostName = host;
+    uc.dwHostNameLength = 256;
+    uc.lpszUrlPath = path;
+    uc.dwUrlPathLength = 2048;
+    uc.lpszExtraInfo = extra;
+    uc.dwExtraInfoLength = 1024;
+    if (!WinHttpCrackUrl(wurl, 0, 0, &uc) || wcslen(path) + wcslen(extra) >= 2048)
+        return -1;
+    wcscat(path, extra);                    /* the query string */
+    ses = WinHttpOpen(L"conker-recomp", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                      WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!ses)
+        goto out;
+    WinHttpSetTimeouts(ses, 15000, 15000, 30000, timeout_s * 1000);
+    con = WinHttpConnect(ses, host, uc.nPort, 0);
+    req = con ? WinHttpOpenRequest(con, L"GET", path, NULL, WINHTTP_NO_REFERER,
+                                   WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                   uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0)
+              : NULL;
+    if (!req || !WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                    WINHTTP_NO_REQUEST_DATA, 0, 0, 0)
+            || !WinHttpReceiveResponse(req, NULL)
+            || !WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                    WINHTTP_HEADER_NAME_BY_INDEX, &status, &size,
+                                    WINHTTP_NO_HEADER_INDEX)
+            || status != 200)
+        goto out;
+    if (!(f = fopen(out_path, "wb")))
+        goto out;
+    for (;;) {
+        if (!WinHttpReadData(req, buf, sizeof buf, &got))
+            goto out;
+        if (!got)
+            break;
+        if (fwrite(buf, 1, got, f) != got)
+            goto out;
+        total += got;
+        if (progress)
+            progress(total, ud);
+    }
+    rc = 0;
+out:
+    if (f && fclose(f) != 0)
+        rc = -1;
+    if (req)
+        WinHttpCloseHandle(req);
+    if (con)
+        WinHttpCloseHandle(con);
+    if (ses)
+        WinHttpCloseHandle(ses);
+    if (rc != 0)
+        fprintf(stderr, "[MODS] %s: failed (HTTP %lu, error %lu)\n", url,
+                (unsigned long)status, (unsigned long)GetLastError());
+    return rc;
+}
+
+static int fetch(const char *url, const char *out_path, int timeout_s, int retries,
+                 void (*progress)(unsigned long long bytes, void *), void *ud)
+{
+    int i;
+    for (i = 0; i <= retries; i++)
+        if (fetch_once(url, out_path, timeout_s, progress, ud) == 0)
+            return 0;
+    return -1;
+}
+#else
+static int fetch(const char *url, const char *out_path, int timeout_s, int retries,
+                 void (*progress)(unsigned long long bytes, void *), void *ud)
+{
+    char t[16], n[16];
+    char *with_timeout[] = { "curl", "-sfL", "--max-time", t, "-o", (char *)out_path,
+                             (char *)url, NULL };
+    char *with_retries[] = { "curl", "-sfL", "--retry", n, "-o", (char *)out_path,
+                             (char *)url, NULL };
+    snprintf(t, sizeof t, "%d", timeout_s);
+    snprintf(n, sizeof n, "%d", retries);
+    return run(timeout_s ? with_timeout : with_retries, out_path, progress, ud);
+}
+#endif
 
 /* The string value after "key": in json (from p), unescaped, into out. */
 static const char *json_string(const char *p, const char *end, const char *key,
@@ -404,10 +522,10 @@ static int newest_release(const char *json, Release *best)
 
 static int md5_matches(const char *path, const char *want)
 {
-    unsigned char buf[1 << 16], digest[EVP_MAX_MD_SIZE];
+    static unsigned char buf[1 << 16];
+    unsigned char digest[64];
     unsigned int len = 0, i;
-    char hex[2 * EVP_MAX_MD_SIZE + 1];
-    EVP_MD_CTX *ctx;
+    char hex[2 * 64 + 1];
     FILE *f;
     size_t n;
 
@@ -415,13 +533,37 @@ static int md5_matches(const char *path, const char *want)
         return 1;                           /* nothing to check against */
     if (!(f = fopen(path, "rb")))
         return 0;
-    ctx = EVP_MD_CTX_new();
-    EVP_DigestInit_ex(ctx, EVP_md5(), NULL);
-    while ((n = fread(buf, 1, sizeof buf, f)) > 0)
-        EVP_DigestUpdate(ctx, buf, n);
+#if defined(_WIN32)
+    {
+        /* CNG's MD5, as OpenSSL's is elsewhere. */
+        BCRYPT_ALG_HANDLE alg = NULL;
+        BCRYPT_HASH_HANDLE h = NULL;
+        if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_MD5_ALGORITHM, NULL, 0) != 0
+                || BCryptCreateHash(alg, &h, NULL, 0, NULL, 0, 0) != 0) {
+            if (alg)
+                BCryptCloseAlgorithmProvider(alg, 0);
+            fclose(f);
+            return 0;
+        }
+        while ((n = fread(buf, 1, sizeof buf, f)) > 0)
+            BCryptHashData(h, buf, (ULONG)n, 0);
+        len = 16;
+        BCryptFinishHash(h, digest, len, 0);
+        BCryptDestroyHash(h);
+        BCryptCloseAlgorithmProvider(alg, 0);
+    }
     fclose(f);
-    EVP_DigestFinal_ex(ctx, digest, &len);
-    EVP_MD_CTX_free(ctx);
+#else
+    {
+        EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+        EVP_DigestInit_ex(ctx, EVP_md5(), NULL);
+        while ((n = fread(buf, 1, sizeof buf, f)) > 0)
+            EVP_DigestUpdate(ctx, buf, n);
+        fclose(f);
+        EVP_DigestFinal_ex(ctx, digest, &len);
+        EVP_MD_CTX_free(ctx);
+    }
+#endif
     for (i = 0; i < len; i++)
         sprintf(hex + 2 * i, "%02x", digest[i]);
     hex[2 * len] = 0;
@@ -489,14 +631,10 @@ static void *uncensor_thread(void *arg)
     free(arg);
     set_status("Checking...");
     snprintf(json_path, sizeof json_path, "%s/.uncensor-api.json", s_mods);
-    {
-        char *argv[] = { "curl", "-sfL", "--max-time", "60", "-o", json_path,
-                         UNCENSOR_API, NULL };
-        if (run(argv, json_path, NULL, NULL) != 0) {
-            fprintf(stderr, "[MODS] cannot reach %s (is curl installed?)\n", UNCENSOR_API);
-            set_status("No connection");
-            goto out;
-        }
+    if (fetch(UNCENSOR_API, json_path, 60, 0, NULL, NULL) != 0) {
+        fprintf(stderr, "[MODS] cannot reach %s\n", UNCENSOR_API);
+        set_status("No connection");
+        goto out;
     }
     if (!(f = fopen(json_path, "rb"))) {
         set_status("Bad reply");
@@ -528,14 +666,11 @@ static void *uncensor_thread(void *arg)
     }
 
     snprintf(part, sizeof part, "%s/.uncensor-%s.part", s_mods, r.id);
-    {
-        char *argv[] = { "curl", "-sfL", "--retry", "2", "-o", part, r.url, NULL };
-        set_status("Downloading 0%%");
-        if (run(argv, part, download_progress, &r) != 0) {
-            remove(part);
-            set_status("Download failed");
-            goto out;
-        }
+    set_status("Downloading 0%%");
+    if (fetch(r.url, part, 0, 2, download_progress, &r) != 0) {
+        remove(part);
+        set_status("Download failed");
+        goto out;
     }
     set_status("Verifying...");
     if (!md5_matches(part, r.md5)) {
@@ -548,15 +683,26 @@ static void *uncensor_thread(void *arg)
     set_status("Unpacking...");
     snprintf(unpack, sizeof unpack, "%s/.uncensor-unpack", s_mods);
     remove_tree(unpack);
-    mkdir(unpack, 0755);
-    {
+    make_dir(unpack);
+    if (!strcmp(strrchr(r.file, '.'), ".7z")) {
+        char err[512];
+        if (conker_7z_extract(part, unpack, err, sizeof err) != 0) {
+            remove(part);
+            remove_tree(unpack);
+            fprintf(stderr, "[MODS] cannot unpack %s: %s\n", part, err);
+            set_status("Bad download");
+            goto out;
+        }
+    } else {
         char opt[2500];
         char *bsdtar[] = { "bsdtar", "-xf", part, "-C", unpack, NULL };
+        char *tar[] = { "tar", "-xf", part, "-C", unpack, NULL };
         char *sevenz[] = { "7z", "x", "-y", opt, part, NULL };
         char *sevenza[] = { "7za", "x", "-y", opt, part, NULL };
         snprintf(opt, sizeof opt, "-o%s", unpack);
+        /* tar is bsdtar on Windows 10 and later. */
         if (run(bsdtar, NULL, NULL, NULL) != 0 && run(sevenz, NULL, NULL, NULL) != 0
-                && run(sevenza, NULL, NULL, NULL) != 0) {
+                && run(sevenza, NULL, NULL, NULL) != 0 && run(tar, NULL, NULL, NULL) != 0) {
             remove(part);
             remove_tree(unpack);
             fprintf(stderr, "[MODS] cannot unpack %s: install bsdtar (libarchive) or 7-Zip\n", part);
@@ -579,7 +725,7 @@ static void *uncensor_thread(void *arg)
     snprintf(old, sizeof old, "%s/.uncensor-old", s_mods);
     remove_tree(fresh);
     remove_tree(old);
-    mkdir(fresh, 0755);
+    make_dir(fresh);
     {
         char from[4500], to[2500], line[400];
         snprintf(from, sizeof from, "%s/dvddata", payload);
@@ -641,16 +787,6 @@ static void start_job(int enable_after)
     }
     pthread_detach(t);
 }
-
-#else
-
-static void start_job(int enable_after)
-{
-    (void)enable_after;
-    set_status("Not supported");
-}
-
-#endif
 
 void conker_mods_uncensor_apply(int choice)
 {

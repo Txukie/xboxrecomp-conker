@@ -1,0 +1,305 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index e61bbfb..a293019 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -24,6 +24,17 @@ add_compile_definitions(
+ 
+ # Option to build examples
+ 
++# Windows hosts normally get native windows: the D3D11/GDI framebuffer
++# window (src/video/fb_present.c) and XInput pads. With this on they get the
++# POSIX hosts' SDL2 window instead (fb_present_sdl.c: render scale, window
++# modes, resolutions, screenshots) and SDL2 game controllers, so one window
++# and one input path serve every host. Audio stays on XAudio2.
++option(XBOXRECOMP_WIN32_SDL "Windows: SDL2 window and pads, as on POSIX" OFF)
++if(WIN32 AND XBOXRECOMP_WIN32_SDL)
++    find_package(SDL2 REQUIRED)
++    find_package(Threads REQUIRED)
++endif()
++
+ # ── Runtime Libraries ─────────────────────────────────────────
+ 
+ # Platform: Win32/NT type vocabulary + POSIX implementation of generic
+diff --git a/src/input/CMakeLists.txt b/src/input/CMakeLists.txt
+index ae6228d..6372fb4 100644
+--- a/src/input/CMakeLists.txt
++++ b/src/input/CMakeLists.txt
+@@ -12,7 +12,13 @@ target_include_directories(xbox_input PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+ add_subdirectory(mapping)
+ target_link_libraries(xbox_input PUBLIC xbox_input_map)
+ 
+-if(WIN32)
++if(WIN32 AND XBOXRECOMP_WIN32_SDL)
++    # The SDL window's keys and SDL2 game controllers, as on POSIX
++    # (XBOXRECOMP_WIN32_SDL in the top-level CMakeLists.txt).
++    target_sources(xbox_input PRIVATE keyboard_sdl.c)
++    target_compile_definitions(xbox_input PUBLIC XBOXRECOMP_WIN32_SDL)
++    target_link_libraries(xbox_input PUBLIC platform SDL2::SDL2)
++elseif(WIN32)
+     # Mouse+keyboard pad (RECOMP_MKB) reads Win32 raw input.
+     target_sources(xbox_input PRIVATE mkb_input.c)
+     # mingw-w64's libxinput.a imports XINPUT1_3.dll, the DirectX June 2010
+diff --git a/src/input/xinput_device.c b/src/input/xinput_device.c
+index a761d79..abf866a 100644
+--- a/src/input/xinput_device.c
++++ b/src/input/xinput_device.c
+@@ -54,7 +54,7 @@ static void keyboard_merge(XBOX_INPUT_STATE *pState)
+ static DWORD input_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState);
+ 
+ /* ======================================================================== */
+-#if defined(_WIN32)
++#if defined(_WIN32) && !defined(XBOXRECOMP_WIN32_SDL)
+ /* ====================  XInput backend  ================================== */
+ /* ======================================================================== */
+ 
+diff --git a/src/video/CMakeLists.txt b/src/video/CMakeLists.txt
+index 331d2e2..423c000 100644
+--- a/src/video/CMakeLists.txt
++++ b/src/video/CMakeLists.txt
+@@ -11,7 +11,14 @@ target_include_directories(xbox_video PUBLIC
+ # xbox_input: the windows record keys in its key table (keyboard.c).
+ # xbox_nv2a: the window scans out the PVIDEO overlay (nv2a_mmio_hook.c).
+ target_link_libraries(xbox_video PUBLIC xbox_d3d8 xbox_input xbox_nv2a)
+-if(WIN32)
++if(WIN32 AND XBOXRECOMP_WIN32_SDL)
++    # The SDL2 window of the POSIX hosts (XBOXRECOMP_WIN32_SDL in the
++    # top-level CMakeLists.txt); Media Foundation still decodes video.
++    target_sources(xbox_video PRIVATE fb_present_sdl.c)
++    target_compile_definitions(xbox_video PUBLIC XBOXRECOMP_WIN32_SDL)
++    target_link_libraries(xbox_video PUBLIC mfplat mfreadwrite mfuuid mf ole32
++                          SDL2::SDL2 Threads::Threads)
++elseif(WIN32)
+     # gpu_present.c: the framebuffer window's D3D11 presenter.
+     target_sources(xbox_video PRIVATE gpu_present.c)
+     target_link_libraries(xbox_video PUBLIC mfplat mfreadwrite mfuuid mf ole32
+diff --git a/src/video/fb_present.c b/src/video/fb_present.c
+index 5059760..65b7ed2 100644
+--- a/src/video/fb_present.c
++++ b/src/video/fb_present.c
+@@ -24,7 +24,7 @@
+  */
+ #include <stdint.h>
+ 
+-#if defined(_WIN32)
++#if defined(_WIN32) && !defined(XBOXRECOMP_WIN32_SDL)
+ #include <windows.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+diff --git a/src/video/fb_present_sdl.c b/src/video/fb_present_sdl.c
+index 549c35c..78a2b5c 100644
+--- a/src/video/fb_present_sdl.c
++++ b/src/video/fb_present_sdl.c
+@@ -39,7 +39,7 @@
+  * size (xbox_FramebufferWindowPresentPixels) in place of the 640x480 copy;
+  * the frame is shown at the same shape.
+  */
+-#if !defined(_WIN32)
++#if !defined(_WIN32) || defined(XBOXRECOMP_WIN32_SDL)
+ 
+ #include <SDL.h>
+ #include "display_aspect.h"
+@@ -49,7 +49,9 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#if !defined(_WIN32)
+ #include <sys/resource.h>
++#endif
+ #include <time.h>
+ 
+ #include "video_player.h"
+@@ -422,15 +424,20 @@ static int start_guest(void)
+ {
+     pthread_attr_t attr;
+     pthread_t th;
+-    struct rlimit rl;
+     size_t stack = 64u << 20;
+     int rc;
+ 
+     /* At least the main thread's stack (8 MB by default), and generously
+-     * more: lifted code recurses on the native stack. */
+-    if (getrlimit(RLIMIT_STACK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY
+-            && rl.rlim_cur > stack)
+-        stack = (size_t)rl.rlim_cur;
++     * more: lifted code recurses on the native stack. (Windows has no
++     * stack rlimit; its main thread gets the executable's 1 MB or so.) */
++#if !defined(_WIN32)
++    {
++        struct rlimit rl;
++        if (getrlimit(RLIMIT_STACK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY
++                && rl.rlim_cur > stack)
++            stack = (size_t)rl.rlim_cur;
++    }
++#endif
+ 
+     pthread_attr_init(&attr);
+     pthread_attr_setstacksize(&attr, stack);
+@@ -739,4 +746,4 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+     return s_guest_rc;
+ }
+ 
+-#endif /* !_WIN32 */
++#endif /* !_WIN32 || XBOXRECOMP_WIN32_SDL */
+diff --git a/src/video/video_player.h b/src/video/video_player.h
+index c3229f6..5d9c013 100644
+--- a/src/video/video_player.h
++++ b/src/video/video_player.h
+@@ -84,7 +84,7 @@ void xbox_WindowSetVsync(int on);
+ int  xbox_WindowResolutions(int (*wh)[2], int max);
+ int  xbox_WindowDesktopSize(int *w, int *h);
+ 
+-#if !defined(_WIN32)
++#if !defined(_WIN32) || defined(XBOXRECOMP_WIN32_SDL)
+ /* POSIX hosts: the framebuffer window needs the process main thread (AppKit
+  * on macOS), so a title that wants it calls this from main() with its boot
+  * sequence. With RECOMP_FB_WINDOW set it opens the window, runs guest_main on
+diff --git a/src/vulkan/CMakeLists.txt b/src/vulkan/CMakeLists.txt
+index d45440c..c59665e 100644
+--- a/src/vulkan/CMakeLists.txt
++++ b/src/vulkan/CMakeLists.txt
+@@ -45,14 +45,27 @@ find_library(XBOXRECOMP_GLSLANG_RES_LIB libglslang-default-resource-limits.a)
+ find_library(XBOXRECOMP_SPIRV_OPT_LIB SPIRV-Tools-opt)
+ find_library(XBOXRECOMP_SPIRV_LIB SPIRV-Tools)
+ 
++# Windows (MinGW): glslang cross-built on its own without its optimizer
++# (ENABLE_OPT=OFF), so without SPIRV-Tools, and linked in whole with the
++# C++ runtime (-static); a distribution's glslang elsewhere has the optimizer.
++if(WIN32)
++    set(_vk_spirv_libs)
++    set(_vk_spirv_found TRUE)
++elseif(XBOXRECOMP_SPIRV_OPT_LIB AND XBOXRECOMP_SPIRV_LIB)
++    set(_vk_spirv_libs ${XBOXRECOMP_SPIRV_OPT_LIB} ${XBOXRECOMP_SPIRV_LIB})
++    set(_vk_spirv_found TRUE)
++else()
++    set(_vk_spirv_found FALSE)
++endif()
++
+ add_library(xbox_nv2a_vk STATIC nv2a_vk.c nv2a_vk_vprog.c ${_vk_spv})
+ if(XBOXRECOMP_GLSLANG_INCLUDE AND XBOXRECOMP_GLSLANG_LIB AND XBOXRECOMP_GLSLANG_RES_LIB
+-   AND XBOXRECOMP_SPIRV_OPT_LIB AND XBOXRECOMP_SPIRV_LIB AND NOT WIN32)
++   AND _vk_spirv_found)
+     target_include_directories(xbox_nv2a_vk PRIVATE ${XBOXRECOMP_GLSLANG_INCLUDE})
+     target_compile_definitions(xbox_nv2a_vk PRIVATE XBOXRECOMP_VK_GLSLANG=1)
+     target_link_libraries(xbox_nv2a_vk PUBLIC
+         ${XBOXRECOMP_GLSLANG_RES_LIB} ${XBOXRECOMP_GLSLANG_LIB}
+-        ${XBOXRECOMP_SPIRV_OPT_LIB} ${XBOXRECOMP_SPIRV_LIB} stdc++ m)
++        ${_vk_spirv_libs} stdc++ m)
+ else()
+     message(STATUS "xboxrecomp: no glslang (static) and SPIRV-Tools; vertex programs run in the interpreter")
+ endif()
+diff --git a/src/vulkan/c11_threads.h b/src/vulkan/c11_threads.h
+new file mode 100644
+index 0000000..b86b878
+--- /dev/null
++++ b/src/vulkan/c11_threads.h
+@@ -0,0 +1,73 @@
++/*
++ * C11 <threads.h>, or on Windows the part of it nv2a_vk.c uses, over Win32:
++ * MinGW-w64's C runtime has no <threads.h> (MSVC's has it since 17.8).
++ * Plain mutexes are SRW locks, which need no destroy; a thread is a
++ * CreateThread whose handle detach closes.
++ */
++#ifndef XBOXRECOMP_C11_THREADS_H
++#define XBOXRECOMP_C11_THREADS_H
++
++#if !defined(_WIN32) || (defined(_MSC_VER) && !defined(__clang__))
++#include <threads.h>
++#else
++#include <windows.h>
++#include <time.h>
++
++enum { thrd_success = 0, thrd_error = 2 };
++enum { mtx_plain = 0 };
++
++typedef SRWLOCK mtx_t;
++typedef CONDITION_VARIABLE cnd_t;
++typedef HANDLE thrd_t;
++typedef int (*thrd_start_t)(void *);
++
++static inline int mtx_init(mtx_t *m, int type)
++{
++    (void)type;
++    InitializeSRWLock(m);
++    return thrd_success;
++}
++static inline int mtx_lock(mtx_t *m) { AcquireSRWLockExclusive(m); return thrd_success; }
++static inline int mtx_unlock(mtx_t *m) { ReleaseSRWLockExclusive(m); return thrd_success; }
++
++static inline int cnd_init(cnd_t *c) { InitializeConditionVariable(c); return thrd_success; }
++static inline int cnd_signal(cnd_t *c) { WakeConditionVariable(c); return thrd_success; }
++static inline int cnd_wait(cnd_t *c, mtx_t *m)
++{
++    return SleepConditionVariableSRW(c, m, INFINITE, 0) ? thrd_success : thrd_error;
++}
++
++struct c11_thrd_start { thrd_start_t fn; void *arg; };
++
++static DWORD WINAPI c11_thrd_trampoline(LPVOID p)
++{
++    struct c11_thrd_start s = *(struct c11_thrd_start *)p;
++    HeapFree(GetProcessHeap(), 0, p);
++    return (DWORD)s.fn(s.arg);
++}
++
++static inline int thrd_create(thrd_t *t, thrd_start_t fn, void *arg)
++{
++    struct c11_thrd_start *s = HeapAlloc(GetProcessHeap(), 0, sizeof *s);
++    if (!s)
++        return thrd_error;
++    s->fn = fn;
++    s->arg = arg;
++    *t = CreateThread(NULL, 0, c11_thrd_trampoline, s, 0, NULL);
++    if (!*t) {
++        HeapFree(GetProcessHeap(), 0, s);
++        return thrd_error;
++    }
++    return thrd_success;
++}
++static inline int thrd_detach(thrd_t t) { return CloseHandle(t) ? thrd_success : thrd_error; }
++
++static inline int thrd_sleep(const struct timespec *d, struct timespec *rem)
++{
++    (void)rem;
++    Sleep((DWORD)(d->tv_sec * 1000 + (d->tv_nsec + 999999) / 1000000));
++    return 0;
++}
++#endif
++
++#endif /* XBOXRECOMP_C11_THREADS_H */
+diff --git a/src/vulkan/nv2a_vk.c b/src/vulkan/nv2a_vk.c
+index 1dbb88c..1f2105e 100644
+--- a/src/vulkan/nv2a_vk.c
++++ b/src/vulkan/nv2a_vk.c
+@@ -36,7 +36,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <stdatomic.h>
+-#include <threads.h>
++#include "c11_threads.h"
+ #include <time.h>
+ 
+ #include <vulkan/vulkan.h>
+diff --git a/src/vulkan/nv2a_vk_vprog.c b/src/vulkan/nv2a_vk_vprog.c
+index d37a133..448a32f 100644
+--- a/src/vulkan/nv2a_vk_vprog.c
++++ b/src/vulkan/nv2a_vk_vprog.c
+@@ -13,8 +13,8 @@
+  * ilu(), with the opcode a constant, so the two cannot drift apart.
+  *
+  * GLSL to SPIR-V is glslang's, through its C interface, linked statically
+- * where the build finds it; without it (and on Windows, for now) every
+- * program stays in the interpreter. */
++ * where the build finds it; without it every program stays in the
++ * interpreter. */
+ #include "nv2a_vk_vprog.h"
+ 
+ #include <stdarg.h>
+@@ -22,7 +22,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
+-#if defined(XBOXRECOMP_VK_GLSLANG) && !defined(_WIN32)
++#if defined(XBOXRECOMP_VK_GLSLANG)
+ #include <math.h>
+ #include <glslang/Include/glslang_c_interface.h>
+ #include <glslang/Public/resource_limits_c.h>

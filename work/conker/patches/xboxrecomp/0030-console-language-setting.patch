@@ -1,0 +1,39 @@
+--- a/src/kernel/kernel_xbox.c
++++ b/src/kernel/kernel_xbox.c
+@@ -199,6 +199,16 @@
+ #endif
+ }
+ 
++/* The console's language, as a title reads it (XGetLanguage): 1 English,
++ * 2 Japanese, 3 German, 4 French, 5 Spanish, 6 Italian. Set before the title
++ * starts: titles read it once. */
++static ULONG s_xbox_language = 1;
++
++void xbox_SetLanguage(unsigned long language)
++{
++    s_xbox_language = (ULONG)language;
++}
++
+ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
+     ULONG ValueIndex, PULONG Type, PVOID Value, ULONG ValueLength, PULONG ResultLength)
+ {
+@@ -211,9 +221,8 @@
+ 
+     switch (ValueIndex) {
+     case XC_LANGUAGE:
+-        /* English = 1 */
+         if (ValueLength >= sizeof(ULONG)) {
+-            *(PULONG)Value = 1;
++            *(PULONG)Value = s_xbox_language;
+             if (Type) *Type = 4; /* REG_DWORD */
+             if (ResultLength) *ResultLength = sizeof(ULONG);
+         }
+@@ -312,7 +321,7 @@
+         memcpy(blk + 0x1C, &s_tz.dlt_date, 4);
+         memcpy(blk + 0x28, &s_tz.std_bias, 4);
+         memcpy(blk + 0x2C, &s_tz.dlt_bias, 4);
+-        { ULONG v = 1; memcpy(blk + 0x30, &v, 4); }                       /* English */
++        memcpy(blk + 0x30, &s_xbox_language, 4);
+         { ULONG v = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV; memcpy(blk + 0x34, &v, 4); }
+         /* 0x58 is MiscFlags (0); DvdRegion is the last field, at 0x5C. */
+         { ULONG v = 1; memcpy(blk + 0x5C, &v, 4); }                       /* DVD region 1 */

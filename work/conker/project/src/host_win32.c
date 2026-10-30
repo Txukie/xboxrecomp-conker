@@ -114,6 +114,24 @@ void conker_host_config_path(char *buf, size_t size)
     snprintf(buf, size, "%s\\settings.cfg", dir);
 }
 
+void conker_host_open_log(void)
+{
+    char base[MAX_PATH], dir[MAX_PATH], log[MAX_PATH], old[MAX_PATH];
+    HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
+
+    if (err && err != INVALID_HANDLE_VALUE)
+        return;                         /* a console or a redirect has it */
+    if (!SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, base)))
+        return;
+    snprintf(dir, sizeof dir, "%s\\ConkerRecomp", base);
+    SHCreateDirectoryExA(NULL, dir, NULL);
+    snprintf(log, sizeof log, "%s\\conker.log", dir);
+    snprintf(old, sizeof old, "%s\\conker.old.log", dir);
+    MoveFileExA(log, old, MOVEFILE_REPLACE_EXISTING);
+    if (freopen(log, "w", stdout))
+        freopen(log, "a", stderr);
+}
+
 void conker_host_setenv_default(const char *name, const char *value)
 {
     if (!getenv(name))

@@ -96,9 +96,9 @@ known-good output.
 
 | | Windows x64 | Linux x86-64 | macOS arm64 / x86-64 |
 |---|---|---|---|
-| Runtime (upstream) | supported upstream | **builds here** | supported upstream |
-| Conker host code | written (VEH + dbghelp) | **builds, links** | written (sigaction), not compiled |
-| Vulkan backend | needs Vulkan SDK + SDL2 | **tested** | via MoltenVK, not compiled |
+| Runtime (upstream) | **builds here** | **builds here** | supported upstream |
+| Conker host code | **tested** (VEH + dbghelp, MinGW-w64) | **tested** | written (sigaction), not compiled |
+| Vulkan backend | **tested** | **tested** | via MoltenVK, not compiled |
 | Metal backend | — | — | skeleton |
 
 ## Runtime fixes carried locally
@@ -125,7 +125,7 @@ applies to the submodule. Each should go upstream:
 2. **First frames** from the CPU rasteriser (`[GPU] ... pixels written`).
 3. **Write the `Nv2aBackend` → `xbox_gfx` adapter** and register it from
    `main.c`.
-4. **Compile on Windows and macOS.**
+4. **Compile on macOS.**
 
 ## Performance
 
@@ -234,6 +234,32 @@ Next steps, in the order they would be taken (none investigated yet):
 6. **Texture decode fast paths** for the formats that still go texel by
    texel through `sample_tex` (seen: 0x00, 0x13, 0x1A, 0x24, 0x28), which
    matter on level loads.
+
+## Language and the loading screen
+
+A save slot's name (+8 of the slot object at 0x84B120, `Name=` in SaveMeta.xbx)
+is in the language the save was made in, and the game finds the save on disk by
+it (sub_0034FC90): changing it gives the "damaged save" page. Only what is drawn
+changes: sub_00204E80/EE0/F40, which copy a slot's title into its text, give the
+default name in this launch's language (+0x2C4) instead.
+
+The game takes its language from the console (XGetLanguage, sub_0042C91F,
+read once at start by sub_002A7840, which picks `aid/text/<language>` and the
+Japanese fonts); toolkit patch 0030 makes that answer settable. The disc has
+every language's text, and the voices are English in all of them. Strings this
+port adds are in `src/conker_lang.c`, looked up by their English text. The menu
+pages draw in the title font (`aid/font/FrontendTitle[Japanese]`), far smaller
+than the text font: its character table is the open-addressed list of
+`{UTF-16 code, glyph}` pairs in the font's file, and a character it lacks draws
+as a box, so check strings against it.
+
+Level loads (sub_002AB0C0) flip nothing while they run. Their first act is now
+the game's own message screen, main_init_DrawSplashScreen (sub_002A6EA0: wide
+text, x, y, scale), which stays up until the level's first frame; the text is
+the game's TRANS_Loading in each language. The hook is hand-added to the
+generated sub_002AB0C0, matching what `regenerate.sh` emits for
+`sub_002AB0C0_enter`. `misc\loading_screen` and `misc\loading_disk` are names
+nothing in the XBE points at, with no files on the disc.
 
 ## Parked
 

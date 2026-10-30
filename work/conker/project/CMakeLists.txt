@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 # The release version: the AppImage is named after it, and the executable
 # prints it.
-project(conker_recomp VERSION 0.3.1 LANGUAGES C)
+project(conker_recomp VERSION 0.4.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -73,6 +73,11 @@ foreach(_patch IN LISTS _xboxrecomp_patches)
     endif()
 endforeach()
 
+# Windows gets the SDL2 window and pads of the Linux build (render scale,
+# window modes, screenshots), not the toolkit's native GDI/D3D11 window.
+if(WIN32)
+    set(XBOXRECOMP_WIN32_SDL ON CACHE BOOL "" FORCE)
+endif()
 add_subdirectory("${XBOXRECOMP_DIR}" "${CMAKE_BINARY_DIR}/xboxrecomp")
 
 # ── Host graphics backends (Vulkan / Metal / legacy D3D8 / null) ────────
@@ -104,10 +109,31 @@ else()
     set(CONKER_HOST_SOURCES src/host_posix.c)
 endif()
 
+# The LZMA SDK's .7z decoder (third_party/lzma-sdk, public domain, 26.03):
+# src/conker_7z.c unpacks the Uncensor download with it.
+add_library(lzma_sdk_7z STATIC
+    third_party/lzma-sdk/7zAlloc.c third_party/lzma-sdk/7zArcIn.c
+    third_party/lzma-sdk/7zBuf.c third_party/lzma-sdk/7zBuf2.c
+    third_party/lzma-sdk/7zCrc.c third_party/lzma-sdk/7zCrcOpt.c
+    third_party/lzma-sdk/7zDec.c third_party/lzma-sdk/7zFile.c
+    third_party/lzma-sdk/7zStream.c third_party/lzma-sdk/Bcj2.c
+    third_party/lzma-sdk/Bra.c third_party/lzma-sdk/Bra86.c
+    third_party/lzma-sdk/BraIA64.c third_party/lzma-sdk/CpuArch.c
+    third_party/lzma-sdk/Delta.c third_party/lzma-sdk/Lzma2Dec.c
+    third_party/lzma-sdk/LzmaDec.c third_party/lzma-sdk/Ppmd7.c
+    third_party/lzma-sdk/Ppmd7Dec.c)
+target_include_directories(lzma_sdk_7z PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lzma-sdk")
+target_compile_definitions(lzma_sdk_7z PUBLIC Z7_PPMD_SUPPORT Z7_EXTRACT_ONLY)
+if(NOT MSVC)
+    target_compile_options(lzma_sdk_7z PRIVATE -O2 -w)
+endif()
+
 if(CONKER_BUILD_GAME)
     add_executable(conker_recomp
         src/main.c
         src/recomp_manual.c
+        src/conker_lang.c
         src/conker_menu.c
         src/conker_settings.c
         src/conker_swing.c
@@ -116,6 +142,7 @@ if(CONKER_BUILD_GAME)
         src/conker_caff.c
         src/conker_weapon.c
         src/conker_pub.c
+        src/conker_7z.c
         ${CONKER_HOST_SOURCES}
         ${RECOMP_GEN_SOURCES}
     )
@@ -135,7 +162,7 @@ if(CONKER_BUILD_GAME)
         "${XBOXRECOMP_DIR}/include"
     )
 
-    target_link_libraries(conker_recomp PRIVATE xboxrecomp xbox_gfx)
+    target_link_libraries(conker_recomp PRIVATE xboxrecomp xbox_gfx lzma_sdk_7z)
     # The GPU renderer (RECOMP_RENDERER=vulkan), when the toolkit built it.
     if(TARGET xbox_nv2a_vk)
         target_link_libraries(conker_recomp PRIVATE xbox_nv2a_vk)
@@ -147,8 +174,21 @@ if(CONKER_BUILD_GAME)
     if(WIN32)
         target_compile_definitions(conker_recomp PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
         target_link_libraries(conker_recomp PRIVATE
-            d3d11 dxgi dxguid winmm shell32 dbghelp
+            d3d11 dxgi dxguid winmm shell32 dbghelp comdlg32 winhttp
             $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput>)
+        if(MINGW)
+            # The GCC runtime and winpthreads inside the executable: only
+            # SDL2.dll (an imported target, still a DLL) ships beside it.
+            target_link_options(conker_recomp PRIVATE -static)
+        endif()
+        # A GUI program (no console window; the log goes to a file when
+        # nothing else takes it, conker_host_open_log), with its icon and
+        # version.
+        set_target_properties(conker_recomp PROPERTIES WIN32_EXECUTABLE ON)
+        set(CONKER_ICON "${CMAKE_CURRENT_SOURCE_DIR}/../packaging/windows/conker-recomp.ico")
+        configure_file("${CMAKE_CURRENT_SOURCE_DIR}/../packaging/windows/conker-recomp.rc.in"
+                       "${CMAKE_BINARY_DIR}/conker-recomp.rc" @ONLY)
+        target_sources(conker_recomp PRIVATE "${CMAKE_BINARY_DIR}/conker-recomp.rc")
     else()
         # dladdr/backtrace for crash reports; -rdynamic gives them the names
         # of the generated functions (sub_XXXXXXXX = guest address).
@@ -222,12 +262,52 @@ if(TARGET conker_recomp AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
         VERBATIM)
 endif()
 
+# ── Windows zip ────────────────────────────────────────────────────────
+# `cmake --build <build> --target windows-zip` packs the executable and
+# SDL2.dll into CONKER_APPIMAGE_DIR/Conker-Recomp-<version>-windows-x86_64.zip,
+# next to the AppImages (../packaging/windows/README.md has the build).
+if(TARGET conker_recomp AND WIN32)
+    get_filename_component(_dist_default
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../../appimage" ABSOLUTE)
+    set(CONKER_APPIMAGE_DIR "${_dist_default}" CACHE PATH
+        "Where the windows-zip target writes the zip")
+    set(_zip_name "Conker-Recomp-${PROJECT_VERSION}-windows-x86_64")
+    set(_zip_stage "${CMAKE_BINARY_DIR}/windows-zip/${_zip_name}")
+    # The toolkit's SDL2::SDL2 is local to its directories.
+    find_package(SDL2 REQUIRED)
+    set(_sdl_readme "")
+    get_target_property(_sdl_dll SDL2::SDL2 IMPORTED_LOCATION)
+    if(_sdl_dll)
+        get_filename_component(_sdl_root "${_sdl_dll}" DIRECTORY)
+        get_filename_component(_sdl_root "${_sdl_root}/../.." ABSOLUTE)
+        if(EXISTS "${_sdl_root}/README-SDL.txt")
+            set(_sdl_readme "${_sdl_root}/README-SDL.txt")
+        endif()
+    endif()
+    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/windows-zip")
+    add_custom_target(windows-zip
+        COMMAND "${CMAKE_COMMAND}" -E rm -rf "${_zip_stage}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${_zip_stage}" "${CONKER_APPIMAGE_DIR}"
+        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:conker_recomp>"
+                "$<TARGET_FILE:SDL2::SDL2>" ${_sdl_readme}
+                "${CMAKE_CURRENT_SOURCE_DIR}/../packaging/windows/README.txt"
+                "${_zip_stage}/"
+        COMMAND "${CMAKE_COMMAND}" -E rm -f "${CONKER_APPIMAGE_DIR}/${_zip_name}.zip"
+        COMMAND "${CMAKE_COMMAND}" -E tar cf "${CONKER_APPIMAGE_DIR}/${_zip_name}.zip"
+                --format=zip "${_zip_name}"
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/windows-zip"
+        DEPENDS conker_recomp
+        COMMENT "Packing ${_zip_name}.zip"
+        VERBATIM)
+endif()
+
 # ── Host code check that needs no generated code ───────────────────────
 # Compiles main.c / recomp_manual.c / the host layer against the current
 # runtime headers so API drift shows up even before regeneration.
 add_library(conker_host_check OBJECT
     src/main.c
     src/recomp_manual.c
+    src/conker_lang.c
     src/conker_menu.c
     src/conker_settings.c
     src/conker_swing.c
@@ -236,6 +316,7 @@ add_library(conker_host_check OBJECT
     src/conker_caff.c
     src/conker_weapon.c
     src/conker_pub.c
+    src/conker_7z.c
     ${CONKER_HOST_SOURCES}
 )
 target_include_directories(conker_host_check PRIVATE
@@ -243,4 +324,4 @@ target_include_directories(conker_host_check PRIVATE
     "${XBOXRECOMP_DIR}/templates/runtime"
     "${XBOXRECOMP_DIR}/include"
 )
-target_link_libraries(conker_host_check PRIVATE xboxrecomp)
+target_link_libraries(conker_host_check PRIVATE xboxrecomp lzma_sdk_7z)

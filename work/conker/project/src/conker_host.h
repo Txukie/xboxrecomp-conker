@@ -35,6 +35,11 @@ void conker_host_config_path(char *buf, size_t size);
  * cannot be found). */
 void conker_host_exe_dir(char *buf, size_t size);
 
+/* Windows, where the game is a GUI program: with no console or redirect to
+ * write to, stdout and stderr go to %LOCALAPPDATA%\ConkerRecomp\conker.log
+ * (the previous run's kept as conker.old.log). Nothing on POSIX. */
+void conker_host_open_log(void);
+
 /* Set an environment variable unless the user already set it. */
 void conker_host_setenv_default(const char *name, const char *value);
 

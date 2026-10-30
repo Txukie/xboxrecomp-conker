@@ -100,13 +100,11 @@ static int load_file(const char *path, void **data_out, size_t *size_out)
     return 1;
 }
 
-#if !defined(_WIN32)
-/* src/video/fb_present_sdl.c. With RECOMP_FB_WINDOW set it opens the SDL
- * window on the process main thread (where macOS requires it) and runs the
- * boot on a second thread; otherwise it calls the boot directly. The Win32
- * window runs on a thread of its own instead (xbox_FramebufferWindowStart). */
+/* src/video/fb_present_sdl.c, on every host (Windows builds it with
+ * XBOXRECOMP_WIN32_SDL). With RECOMP_FB_WINDOW set it opens the SDL window
+ * on the process main thread (where macOS requires it) and runs the boot on
+ * a second thread; otherwise it calls the boot directly. */
 extern int xbox_HostWindowMain(int (*guest_main)(void));
-#endif
 
 static const char *s_game_dir;
 static const char *s_save_path;
@@ -236,6 +234,7 @@ int main(int argc, char **argv)
     static char default_save[4096], data_dir[4096], exe_dir[4096], game_dir[4096];
     char *slash;
 
+    conker_host_open_log();
     s_save_path = argc > 2 ? argv[2] : getenv("CONKER_SAVE_DIR");
 
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -273,6 +272,14 @@ int main(int argc, char **argv)
     conker_host_setenv_default("RECOMP_USB", "1");
     conker_host_setenv_default("RECOMP_KEYBOARD", "1");
     conker_host_setenv_default("RECOMP_DISPATCH_GATE", "1");
+#if defined(_WIN32)
+    /* RECOMP_WIN_PLACEHOLDER holds the whole 4 GB guest window before
+     * mapping into it. Without it the tiled aperture (0xF0000000) landed on
+     * host memory already taken under Wine and the first frame faulted. */
+    conker_host_setenv_default("RECOMP_WIN_PLACEHOLDER", "1");
+    /* The game window, which the AppImage's AppRun turns on elsewhere. */
+    conker_host_setenv_default("RECOMP_FB_WINDOW", "1");
+#endif
     /* Recomp Options (the front end's Options page): the cfg file sets the
      * window, aspect (Hor+, recomp_manual.c), render scale and frame limit
      * before anything opens; the submenu takes the pad while it shows. */
@@ -308,9 +315,5 @@ int main(int argc, char **argv)
         conker_host_setenv_default("RECOMP_VK_PIPELINE_LIST", list);
     }
 
-#if defined(_WIN32)
-    return conker_boot();
-#else
     return xbox_HostWindowMain(conker_boot);
-#endif
 }

@@ -277,12 +277,59 @@ void sub_0003D200_enter(void)
             MEM32(cam + 0x120) = MEM32(cam + 0x118);
             MEM32(cam + 0x178) = MEM32(cam + 0x170);
             MEM32(cam + 0x1D0) = MEM32(cam + 0x1C8);
+            /* The distance index too: cutscenes pop slot 1, and 999 here
+             * (unset) reads past the table at 0x58BF00, distance about 0:
+             * a first-person view nothing resets. */
+            MEM16(cam + 0x224) = MEM16(cam + 0x220);
+            MEM16(cam + 0x250) = MEM16(cam + 0x24C);
             MEM16(cam + CAM_SLOT1_USED) = CAM_SLOT1_MARK;
         }
     } else if (MEM16(cam + CAM_SLOT1_USED) == CAM_SLOT1_MARK) {
         MEM16(cam + CAM_SLOT1_USED) = 0;
     }
 }
+
+/* A level load starts here (conker_menu.c). */
+void sub_002AB0C0_enter(void)
+{
+    extern void conker_loading_screen(void);
+    conker_loading_screen();
+}
+
+/* ── The save slots' titles (sub_00204E80, sub_00204EE0, sub_00204F40) ─────
+ *
+ * The text the pub draws for Game 1..3, with its colour. The game gives the
+ * save's own name (+8 of the slot, Name= in SaveMeta.xbx, in the language the
+ * save was made in), or for an empty slot the default in this launch's
+ * language (+0x2C4). Here the default always: the game has no way to rename a
+ * save. Only the drawing changes: the game finds a save on disk by its name
+ * (sub_0034FC90), so +8 itself must stay as saved.
+ */
+extern void sub_0046E49A(void);
+
+static void slot_title_text(uint32_t slot)
+{
+    uint32_t title = MEM32(slot * 4 + 0x84B120);
+    uint32_t name = MEM32(title + 0x2C4);
+
+    eax = MEM32(esp + 0xC);
+    MEMF(eax) = MEMF(0x649114);
+    MEMF(eax + 4) = MEMF(0x649110);
+    MEMF(eax + 8) = MEMF(0x6494E8);
+    if (!name)
+        name = MEM32(title + 8);
+    PUSH32(esp, name);
+    eax = MEM32(esp + 0xC);
+    ecx = MEM32(eax);
+    PUSH32(esp, ecx);
+    PUSH32(esp, 0x00204EC5u); RECOMP_ABI_CALL(0x0046E49Au, sub_0046E49A); /* call 0x0046E49A */
+    esp = esp + 8;
+    esp += 4; /* ret */
+}
+
+void sub_00204E80(void) { slot_title_text(0); }
+void sub_00204EE0(void) { slot_title_text(1); }
+void sub_00204F40(void) { slot_title_text(2); }
 
 /* ── Swing Button: running with the weapon out (sub_002DEF80) ──────────────
  *
