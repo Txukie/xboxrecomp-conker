@@ -12808,6 +12808,8 @@ loc_0001E01A: ;
     PUSH32(esp, 0x0001E020u); RECOMP_ABI_CALL(0x0001EC30u, sub_0001EC30); /* call 0x0001EC30 */
 
 loc_0001E020: ;
+    extern int conker_music_commands_wait(void);
+    if (conker_music_commands_wait()) goto loc_0001E026;
     PUSH32(esp, edi);
     PUSH32(esp, 0x0001E026u); RECOMP_ABI_CALL(0x0001E1C0u, sub_0001E1C0); /* call 0x0001E1C0 */
 

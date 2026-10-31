@@ -147,6 +147,33 @@ static int conker_boot(void)
         extern void conker_menu_install(void);
         conker_menu_install();
     }
+    /* RECOMP_RENDERER: vulkan (the default) draws on the host GPU, and the
+     * CPU rasteriser takes over when no Vulkan device is usable; cpu draws
+     * on the CPU from the start. The CPU rasteriser is correct but slow,
+     * and its intro video came out washed out. */
+    {
+        const char *r = getenv("RECOMP_RENDERER");
+        if (!r || !*r || !strcmp(r, "vulkan")) {
+#ifdef CONKER_HAVE_VULKAN
+            /* The pipelines every player will want, on top of the player's
+             * own list (data/pipeline_seed.bin: GPU settings only, none of
+             * the game's programs). */
+            extern const unsigned char conker_pipeline_seed[];
+            extern const size_t conker_pipeline_seed_size;
+            if (!getenv("CONKER_NO_PIPELINE_SEED"))
+                nv2a_vk_set_pipeline_seed(conker_pipeline_seed, conker_pipeline_seed_size);
+            nv2a_vk_install();
+#else
+            fprintf(stderr, "[CONKER] built without the Vulkan renderer\n");
+#endif
+        }
+    }
+
+    /* The pipelines are built before the game, with a glass to watch filling.
+     * Before the USB model's init: with this wait after it, the game came up
+     * with the pad's input filter never called. */
+    conker_firstrun_wait_for_pipelines();
+
     /* The USB host controllers' registers are trapped once guest memory is
      * mapped; nothing happens unless RECOMP_USB is set. */
     xbox_OhciInit();
@@ -164,21 +191,6 @@ static int conker_boot(void)
     {
         extern void conker_install_d3d_hooks(void);
         conker_install_d3d_hooks();
-    }
-
-    /* RECOMP_RENDERER: vulkan (the default) draws on the host GPU, and the
-     * CPU rasteriser takes over when no Vulkan device is usable; cpu draws
-     * on the CPU from the start. The CPU rasteriser is correct but slow,
-     * and its intro video came out washed out. */
-    {
-        const char *r = getenv("RECOMP_RENDERER");
-        if (!r || !*r || !strcmp(r, "vulkan")) {
-#ifdef CONKER_HAVE_VULKAN
-            nv2a_vk_install();
-#else
-            fprintf(stderr, "[CONKER] built without the Vulkan renderer\n");
-#endif
-        }
     }
 
     xbox_kernel_init();
@@ -205,6 +217,10 @@ static int conker_boot(void)
     {
         extern void conker_weapon_boot(const char *game_dir);
         conker_weapon_boot(game_dir);
+    }
+    {
+        extern void conker_intro_boot(const char *game_dir);
+        conker_intro_boot(game_dir);
     }
     xbox_WatchdogStart();
 
@@ -297,6 +313,10 @@ int main(int argc, char **argv)
     if (conker_find_game(argc > 1 ? argv[1] : NULL, data_dir, exe_dir,
                          game_dir, sizeof game_dir) != 0)
         return 1;
+    /* A first run: every Recomp Option, chosen before anything starts. */
+    if (conker_settings_no_cfg() && !getenv("RECOMP_HEADLESS")
+            && conker_firstrun_show() != 0)
+        return 0;
     s_game_dir = game_dir;
     if (!s_save_path || !*s_save_path)
         s_save_path = default_save;
@@ -306,7 +326,12 @@ int main(int argc, char **argv)
         extern void conker_weapon_init(const char *data_dir);
         conker_weapon_init(data_dir);
     }
+    {
+        extern void conker_intro_init(const char *data_dir);
+        conker_intro_init(data_dir);
+    }
     conker_mods_init(data_dir, s_save_path);
+    conker_first_run_apply_mods();
     /* The Vulkan renderer's list of the pipelines the game has used, built
      * again at every start so that nothing compiles while it plays. */
     {

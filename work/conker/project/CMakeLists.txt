@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 # The release version: the AppImage is named after it, and the executable
 # prints it.
-project(conker_recomp VERSION 0.4.0 LANGUAGES C)
+project(conker_recomp VERSION 0.4.2 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -141,8 +141,10 @@ if(CONKER_BUILD_GAME)
         src/conker_mods.c
         src/conker_caff.c
         src/conker_weapon.c
+        src/conker_intro.c
         src/conker_pub.c
         src/conker_7z.c
+        src/conker_firstrun.c
         ${CONKER_HOST_SOURCES}
         ${RECOMP_GEN_SOURCES}
     )
@@ -163,6 +165,19 @@ if(CONKER_BUILD_GAME)
     )
 
     target_link_libraries(conker_recomp PRIVATE xboxrecomp xbox_gfx lzma_sdk_7z)
+    # The first-run page and the pipeline build's screen (conker_firstrun.c).
+    find_package(SDL2 REQUIRED)
+    target_link_libraries(conker_recomp PRIVATE SDL2::SDL2)
+    # data/pipeline_seed.bin (tools/make_pipeline_seed.py) inside the
+    # executable. GPU settings only: see that script.
+    set(_seed_bin "${CMAKE_CURRENT_SOURCE_DIR}/data/pipeline_seed.bin")
+    set(_seed_c "${CMAKE_BINARY_DIR}/conker_pipeline_seed.c")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_seed_bin}")
+    file(READ "${_seed_bin}" _seed_hex HEX)
+    string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," _seed_bytes "${_seed_hex}")
+    file(GENERATE OUTPUT "${_seed_c}" CONTENT
+        "#include <stddef.h>\nconst unsigned char conker_pipeline_seed[] = {${_seed_bytes}};\nconst size_t conker_pipeline_seed_size = sizeof conker_pipeline_seed;\n")
+    target_sources(conker_recomp PRIVATE "${_seed_c}")
     # The GPU renderer (RECOMP_RENDERER=vulkan), when the toolkit built it.
     if(TARGET xbox_nv2a_vk)
         target_link_libraries(conker_recomp PRIVATE xbox_nv2a_vk)
@@ -315,6 +330,7 @@ add_library(conker_host_check OBJECT
     src/conker_mods.c
     src/conker_caff.c
     src/conker_weapon.c
+    src/conker_intro.c
     src/conker_pub.c
     src/conker_7z.c
     ${CONKER_HOST_SOURCES}

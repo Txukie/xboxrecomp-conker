@@ -24,6 +24,7 @@ enum {
     CONKER_OPT_SKIP_CUTSCENES,
     CONKER_OPT_SWING_BUTTON,
     CONKER_OPT_WEAPON,
+    CONKER_OPT_INTRO_FIX,
     CONKER_OPT_UNCENSOR,
     CONKER_OPT_COUNT
 };
@@ -63,6 +64,12 @@ int conker_weapon_choice(void);
 int conker_weapon_active(void);
 int conker_weapon_failed(void);
 
+/* Intro Fix (conker_intro.c): the glass of milk, as chosen; it takes effect
+ * at the next start. */
+int conker_intro_choice(void);
+int conker_intro_active(void);
+int conker_intro_failed(void);
+
 /* The pub (conker_pub.c): the save slot it starts on, 0..2 for Game 1..3,
  * kept in the cfg; its per-frame look at the front end and its use of the
  * pad, from the input filter. */
@@ -88,5 +95,27 @@ int  conker_options_row(void);
 /* A row's label and its current value, in UTF-8. */
 const char *conker_options_label(int row);
 void conker_options_value(int row, char *buf, size_t size);
+
+/* ── The first-run page (conker_firstrun.c) ──────────────────────────── */
+
+/* There was no cfg file when conker_settings_load looked. */
+int conker_settings_no_cfg(void);
+
+/* While the page shows, nothing is saved: the page starts from defaults
+ * fitted to the display (language -1: leave it), steps the rows' values, and
+ * its end makes them this run's and writes the cfg. A window closed before
+ * that asks again at the next start. */
+void conker_first_run_begin(int desk_w, int desk_h, const int (*modes)[2], int nmodes, int language);
+int  conker_first_run_language(void);
+void conker_first_run_step(int row, int dir);
+void conker_first_run_end(void);
+void conker_first_run_apply_mods(void);
+
+/* conker_firstrun.c: the page itself, from main() before the game's window
+ * opens: 0 to carry on, -1 when the player closed it. */
+int conker_firstrun_show(void);
+/* conker_firstrun.c: from the guest thread at boot, shows the build of the
+ * pipelines until it is done. */
+void conker_firstrun_wait_for_pipelines(void);
 
 #endif /* CONKER_SETTINGS_H */

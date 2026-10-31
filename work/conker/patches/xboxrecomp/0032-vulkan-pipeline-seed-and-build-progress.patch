@@ -1,0 +1,170 @@
+diff --git a/src/vulkan/nv2a_vk.c b/src/vulkan/nv2a_vk.c
+index e4a4b8a..7c45a84 100644
+--- a/src/vulkan/nv2a_vk.c
++++ b/src/vulkan/nv2a_vk.c
+@@ -38,6 +38,11 @@
+ #include <stdatomic.h>
+ #include "c11_threads.h"
+ #include <time.h>
++#if defined(_WIN32)
++#include <windows.h>
++#else
++#include <unistd.h>
++#endif
+ 
+ #include <vulkan/vulkan.h>
+ 
+@@ -2410,7 +2415,8 @@ static void precompile(const PipeRec *r)
+     mtx_lock(&s_pipe_mtx);
+     pipe_find_locked(&k, &found);
+     mtx_unlock(&s_pipe_mtx);
+-    if (!found && (p = pipe_build(&k, 1)))
++    /* The interpreter only stands in: its link need not be optimised. */
++    if (!found && (p = pipe_build(&k, k.vsh != 1)))
+         pipe_add(&k, p, &added);
+     if (atomic_fetch_add(&s_pre_done, 1) + 1 == s_pre_n) {
+         timespec_get(&t1, TIME_UTC);
+@@ -2460,6 +2466,35 @@ static int compile_thread(void *arg)
+     return 0;
+ }
+ 
++/* Help with the list at start, when nothing else wants the CPU, then go. */
++static int list_thread(void *arg)
++{
++    (void)arg;
++    s_compile_thread = 1;
++    for (;;) {
++        const PipeRec *r = NULL;
++
++        mtx_lock(&s_job_mtx);
++        if (s_pre_next < s_pre_n)
++            r = &s_pre[s_pre_next++];
++        mtx_unlock(&s_job_mtx);
++        if (!r)
++            return 0;
++        precompile(r);
++    }
++}
++
++static int cpu_count(void)
++{
++#if defined(_WIN32)
++    SYSTEM_INFO si;
++    GetSystemInfo(&si);
++    return (int)si.dwNumberOfProcessors;
++#else
++    return (int)sysconf(_SC_NPROCESSORS_ONLN);
++#endif
++}
++
+ static void jobs_start(void)
+ {
+     thrd_t t;
+@@ -2475,6 +2510,9 @@ static void jobs_start(void)
+         thrd_detach(t);
+         s_jobs_up = 1;
+     }
++    for (i = VK_COMPILE_THREADS + 1; s_pre_n && s_jobs_up > 0 && i < cpu_count(); i++)
++        if (thrd_create(&t, list_thread, NULL) == thrd_success)
++            thrd_detach(t);
+ }
+ 
+ static void job_push_vprog(uint32_t slot)
+@@ -2587,6 +2625,61 @@ static void pl_record(const PipeKey *key)
+     fflush(s_pl_file);
+ }
+ 
++/* The seed: pipelines known to be wanted, handed in by the title's port, on
++ * the list after the player's own and never written to the file. Header
++ * (magic, key size), then keys: render state with no vertex program in them,
++ * vsh 0, or 1 for the interpreter that stands in until a program compiles.
++ * What makes those worth building is the fragment stage they leave compiled,
++ * which the program's pipeline links to when it comes. */
++static const char k_ps_magic[8] = "NV2APS1";
++static const void *s_seed;
++static size_t s_seed_size;
++
++void nv2a_vk_set_pipeline_seed(const void *data, size_t size)
++{
++    s_seed = data;
++    s_seed_size = size;
++}
++
++void nv2a_vk_pipeline_progress(unsigned *done, unsigned *total)
++{
++    *total = s_jobs_up > 0 ? s_pre_n : 0;
++    *done = atomic_load(&s_pre_done);
++}
++
++static void pl_load_seed(void)
++{
++    const uint8_t *b = s_seed;
++    uint32_t ks, cap = s_pre_n;
++    size_t at;
++
++    if (!b || s_seed_size < 12 || memcmp(b, k_ps_magic, 8))
++        return;
++    memcpy(&ks, b + 8, 4);
++    if (ks != sizeof(PipeKey)) {
++        fprintf(stderr, "[VK] pipeline seed is of another build (key %u, here %u)\n", ks,
++                (unsigned)sizeof(PipeKey));
++        return;
++    }
++    for (at = 12; at + ks <= s_seed_size; at += ks) {
++        PipeKey k;
++        PipeRec *g;
++
++        memcpy(&k, b + at, ks);
++        if (k.vsh > 1 || !pl_note(pl_hash(&k, 0, NULL)))
++            continue;
++        if (s_pre_n >= cap) {
++            if (!(g = realloc(s_pre, (cap = s_pre_n + 256) * sizeof *g)))
++                return;
++            s_pre = g;
++        }
++        s_pre[s_pre_n].k = k;
++        s_pre[s_pre_n].n = 0;
++        s_pre[s_pre_n].words = NULL;
++        s_pre_n++;
++    }
++}
++
+ /* Read the list (keeping what checks out, written back compacted), queue
+  * it for the compile threads, and keep the file open to add to. */
+ static void pl_load(const char *path)
+@@ -2658,6 +2751,7 @@ static void pl_load(const char *path)
+         }
+     }
+     s_pl_file = fopen(path, "ab");
++    pl_load_seed();
+     timespec_get(&s_pre_t0, TIME_UTC);
+     fprintf(stderr, "[VK] pipeline list %s: %u pipelines to build\n", path, s_pre_n);
+ }
+diff --git a/src/vulkan/nv2a_vk.h b/src/vulkan/nv2a_vk.h
+index 13a58e6..460e449 100644
+--- a/src/vulkan/nv2a_vk.h
++++ b/src/vulkan/nv2a_vk.h
+@@ -34,6 +34,8 @@
+ #ifndef XBOXRECOMP_NV2A_VK_H
+ #define XBOXRECOMP_NV2A_VK_H
+ 
++#include <stddef.h>
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+@@ -49,6 +51,14 @@ int nv2a_vk_install(void);
+  * effect at the next flip. RECOMP_VK_SCALE sets it at start. */
+ void nv2a_vk_set_render_scale(unsigned scale);
+ 
++/* Pipelines to build at start beside the list's (nv2a_vk.c): set before
++ * nv2a_vk_install; the data stays the caller's. */
++void nv2a_vk_set_pipeline_seed(const void *data, size_t size);
++
++/* How far the build at start has got: done of total, total 0 with nothing to
++ * build. */
++void nv2a_vk_pipeline_progress(unsigned *done, unsigned *total);
++
+ #ifdef __cplusplus
+ }
+ #endif

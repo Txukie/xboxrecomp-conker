@@ -235,6 +235,54 @@ Next steps, in the order they would be taken (none investigated yet):
    texel through `sample_tex` (seen: 0x00, 0x13, 0x1A, 0x24, 0x28), which
    matter on level loads.
 
+## Polygon offset and the intro's glass
+
+NV2A's polygon offset (SET_POLY_OFFSET_FILL_ENABLE, 0x384 factor, 0x388 units)
+is a dynamic depth bias in the Vulkan backend (toolkit patch 0031). Conker's
+blob shadows draw over the floor with factor -4, units -16, depth LEQUAL; with
+no bias they fought the floor and came out hatched.
+
+Intro Fix (`src/conker_intro.c`) swaps the goblet, object 49 of the held-object
+name table, for `effects_models_whiskey_glass_filled`: the same hand's
+coordinates, so no fitting. Its .gpu part holds, in order, colours, positions
+(3 int16) and normals (11:11:10) of the glass (161 vertices at 0, 0x284, 0x64C)
+and of the drink (57 at 0x8D0, 0x9B4, 0xB0C), then the push buffer; textures
+follow, 128-aligned.
+
+## Music and ambience at a level's start
+
+A level asks for its music and its ambience set in the same frame. The music
+starts at once from the audio manager's command queue, but the ambience waits
+until its banks are ready, then stops every tune outside its set
+(`sub_0001EFC0`). With the banks a few frames late it stopped the music it had
+just started. In the intro, the track came back only 77 s later, when the
+monologue's volume command found it gone and played it again from the top.
+`conker_music_commands_wait` (`src/recomp_manual.c`, hook in
+`recomp/gen/recomp_0001.c`) holds the queue until the ambience is in.
+
+## First run and the pipeline seed
+
+With no cfg file, `src/conker_firstrun.c` shows every Recomp Option before the
+game's window opens. It uses the submenu's own rows and is drawn by CPU into an
+SDL texture (wood and chalk from noise, a 5x8 font drawn for this port), so one
+page serves Linux, the Deck and Windows, by pad, keys or mouse. Japanese runs
+in English there, since its letters are Latin only.
+
+`data/pipeline_seed.bin` goes in the executable and is built at every start on
+top of the player's `pipelines.bin` (toolkit patch 0032). A player's list holds
+the game's vertex programs, so it is not what ships: the seed keeps each
+record's GPU settings and points the vertex stage at the interpreter. That
+compiles the fragment stages, which is where the stalls were; a program's own
+pipeline links to them when it comes. On a fresh shader cache, the intro's
+level through to the first 50 s took 27 s of compiling on the game thread
+without the seed and none with it.
+
+The wait happens before `xbox_OhciInit`: placed after it, the game came up with
+the pad's input filter never called, which also silences `conker_pub.c`.
+
+Remake the seed from lists kept by the game:
+`tools/make_pipeline_seed.py data/pipeline_seed.bin LIST...`
+
 ## Language and the loading screen
 
 A save slot's name (+8 of the slot object at 0x84B120, `Name=` in SaveMeta.xbx)

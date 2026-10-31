@@ -42,7 +42,7 @@ copy of your saves.
 | Videos, sound, saves, controller | ✅ Working |
 | Languages | ✅ English, Spanish, French, German, Italian and Japanese menus and subtitles; voices stay in English |
 | Metal renderer | 🔴 Not started |
-| Known issues | The first run of each new version compiles its shaders and stutters in menus and loading screens; the CPU fallback renderer (no Vulkan) runs at about 3 fps and shows videos washed out |
+| Known issues | Scenes not yet seen can still stutter briefly while their vertex programs compile; the CPU fallback renderer (no Vulkan) runs at about 3 fps and shows videos washed out |
 
 ### Quick start (AppImage)
 
@@ -55,6 +55,12 @@ copy of your saves.
    installed once (about 4.5 GB) into `~/.local/share/conker-recomp/game`; a
    folder is used where it is and remembered. Only the USA version, the one
    the code was recompiled from, is accepted.
+
+   Then a chalkboard page offers every Recomp Option (by pad, keyboard or
+   mouse; fitted to your screen and language to begin with), and from then
+   on a glass fills while the shaders build before the game. The first time
+   can take a few minutes, then seconds. You can change the options later
+   in the game's Options menu.
 3. A game folder or image can also be given as the first argument or in
    `CONKER_GAME_DIR`, which skips the window.
 
@@ -93,6 +99,7 @@ change it; B goes back. Changes apply immediately and are saved in
 | Allow Skip Cutscenes | Yes: holding LT for a second skips any cutscene, even one not seen before (scenes the game never lets you skip, such as the intro, stay as they are) | No |
 | Swing Button | X: see below | Off |
 | Weapon | Bat, Frying Pan: see below | Bat |
+| Intro Fix | On: in the opening scene Conker holds a low glass half full of milk instead of the goblet, made at the next start from your own copy of the game | Off |
 | Uncensor | Enable, Disable, Update: see below | — |
 
 **Swing Button.** With X selected, X swings the weapon in one press, as
@@ -254,7 +261,10 @@ Technical notes and the plan for each platform:
 
 This repository contains no ISO, `default.xbe`, assets or saves from the
 game; you must provide your own legally owned copy. The project is
-experimental and is not affiliated with Microsoft, Rare or Xbox.
+experimental and is not affiliated with Microsoft, Rare or Xbox. The art and
+lettering of the first-run page are drawn by its code, not taken from the
+game. `data/pipeline_seed.bin` holds GPU settings only; the game's vertex
+programs are left out (`tools/make_pipeline_seed.py`).
 xboxrecomp includes code derived from xemu under the LGPL-2.1+; see
 `external/xboxrecomp/NOTICE`.
 
@@ -292,7 +302,7 @@ guarda una copia de tus partidas.
 | Vídeos, sonido, partidas, mando | ✅ Funcionan |
 | Idiomas | ✅ Menús y subtítulos en inglés, español, francés, alemán, italiano y japonés; las voces siguen en inglés |
 | Renderizador Metal | 🔴 Sin empezar |
-| Problemas conocidos | La primera vez que se abre cada versión nueva compila sus shaders y va a tirones en los menús y las cargas; el renderizador de reserva por CPU (sin Vulkan) va a unos 3 fps y muestra los vídeos lavados |
+| Problemas conocidos | Las escenas aún no vistas pueden dar algún tirón breve mientras compilan sus programas de vértices; el renderizador de reserva por CPU (sin Vulkan) va a unos 3 fps y muestra los vídeos lavados |
 
 ### Prueba rápida (AppImage)
 
@@ -305,6 +315,12 @@ guarda una copia de tus partidas.
    imagen se instala una sola vez (unos 4,5 GB) en
    `~/.local/share/conker-recomp/game`; una carpeta se usa donde está y se
    recuerda. Solo se acepta la versión USA, la que se recompiló.
+
+   Después, una pizarra ofrece todas las Recomp Options (con mando, teclado o
+   ratón; de entrada ajustadas a tu pantalla e idioma), y desde entonces un
+   vaso se llena mientras se compilan los shaders antes del juego. La primera
+   vez puede tardar unos minutos; luego, segundos. Las opciones se pueden cambiar
+   más tarde en el menú Opciones del juego.
 3. La carpeta o imagen del juego también se puede pasar como primer
    argumento o en `CONKER_GAME_DIR`, y entonces no aparece la ventana.
 
@@ -344,6 +360,7 @@ momento y se guardan en `~/.config/conker-recomp/settings.cfg`
 | Allow Skip Cutscenes | Yes: mantener LT un segundo salta cualquier escena, aunque no se haya visto antes (las que el juego nunca deja saltar, como las de la introducción, siguen igual) | No |
 | Swing Button | X: ver abajo | Off |
 | Weapon | Bat, Frying Pan: ver abajo | Bat |
+| Intro Fix | Activado: en la escena inicial Conker lleva un vaso bajo medio lleno de leche en lugar de la copa, creado en el siguiente arranque a partir de tu propia copia del juego | Desactivado |
 | Uncensor | Enable, Disable, Update: ver abajo | — |
 
 **Swing Button.** Con X, el botón X golpea con el arma de una sola
@@ -506,5 +523,8 @@ Notas técnicas y el plan para cada plataforma:
 
 Este repositorio no incluye la ISO, `default.xbe`, assets ni partidas del
 juego; debes aportar tu propia copia legal. El proyecto es experimental y
-no está afiliado con Microsoft, Rare ni Xbox. xboxrecomp incluye código
+no está afiliado con Microsoft, Rare ni Xbox. El arte y las letras de la
+página del primer arranque los dibuja su código, no vienen del juego.
+`data/pipeline_seed.bin` solo contiene ajustes de la GPU; los programas de
+vértices del juego quedan fuera (`tools/make_pipeline_seed.py`). xboxrecomp incluye código
 derivado de xemu bajo LGPL-2.1+; ver `external/xboxrecomp/NOTICE`.

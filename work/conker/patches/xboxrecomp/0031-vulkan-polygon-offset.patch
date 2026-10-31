@@ -1,0 +1,64 @@
+diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
+index 5939029..81dd626 100644
+--- a/src/kernel/nv2a_backend.h
++++ b/src/kernel/nv2a_backend.h
+@@ -83,6 +83,9 @@ typedef struct {
+     uint32_t cull_enable, cull_face, front_face;
+     uint32_t zeta_va;                                    /* 0: no depth surface */
+     float    depth_min, depth_max;                       /* SET_CLIP_MIN/MAX */
++    /* SET_POLY_OFFSET_FILL_ENABLE, SET_POLYGON_OFFSET_SCALE_FACTOR and _BIAS. */
++    uint32_t poly_offset_fill;
++    float    poly_offset_factor, poly_offset_units;
+     /* SET_STENCIL_*: compare function as above; ops GL_KEEP 0x1E00, GL_ZERO 0,
+      * GL_REPLACE 0x1E01, GL_INCR 0x1E02, GL_DECR 0x1E03, GL_INVERT 0x150A,
+      * GL_INCR_WRAP 0x8507, GL_DECR_WRAP 0x8508. Reset values GL_ALWAYS, masks
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index 64893da..e96e219 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -843,6 +843,9 @@ static void current_render_state(Nv2aRenderState *r)
+     r->zeta_va           = s_gpu.zeta_offset ? dma_resolve(s_gpu.zeta_offset) : 0;
+     r->depth_min         = reg_f(0x0394);            /* SET_CLIP_MIN */
+     r->depth_max         = reg_f(0x0398);            /* SET_CLIP_MAX */
++    r->poly_offset_fill  = s_reg[0x0338 / 4];        /* SET_POLY_OFFSET_FILL_ENABLE */
++    memcpy(&r->poly_offset_factor, &s_reg[0x0384 / 4], 4); /* SET_POLYGON_OFFSET_SCALE_FACTOR */
++    memcpy(&r->poly_offset_units, &s_reg[0x0388 / 4], 4);  /* SET_POLYGON_OFFSET_BIAS */
+     r->stencil_enable    = s_reg[0x032C / 4];        /* SET_STENCIL_TEST_ENABLE */
+     r->stencil_write_mask = s_reg[0x0360 / 4];       /* SET_STENCIL_MASK */
+     r->stencil_func      = s_reg[0x0364 / 4];        /* SET_STENCIL_FUNC */
+diff --git a/src/vulkan/nv2a_vk.c b/src/vulkan/nv2a_vk.c
+index 1f2105e..e4a4b8a 100644
+--- a/src/vulkan/nv2a_vk.c
++++ b/src/vulkan/nv2a_vk.c
+@@ -1991,6 +1991,7 @@ static VkBlendOp blend_op(uint32_t e)
+ static const VkDynamicState k_dyn_pre[] = {
+     VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+     VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE,
++    VK_DYNAMIC_STATE_DEPTH_BIAS,
+ };
+ static const VkDynamicState k_dyn_fs[] = {
+     VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
+@@ -2065,6 +2066,7 @@ static void pipe_states(const PipeKey *k, PipeStates *ps)
+     ps->rs.depthClampEnable = s_depth_clamp ? VK_TRUE : VK_FALSE;
+     ps->rs.polygonMode = VK_POLYGON_MODE_FILL;
+     ps->rs.cullMode = VK_CULL_MODE_NONE;
++    ps->rs.depthBiasEnable = VK_TRUE;     /* zero unless the title asks */
+     ps->rs.lineWidth = 1.0f;
+     ps->ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+     ps->ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+@@ -2914,6 +2916,15 @@ static void set_dynamic_state(VkCommandBuffer c, const Surf *s,
+     vkCmdSetDepthCompareOp(c, (rs->depth_func >= 0x200 && rs->depth_func <= 0x207)
+                               ? (VkCompareOp)(rs->depth_func - 0x200)
+                               : VK_COMPARE_OP_ALWAYS);
++    /* SET_POLY_OFFSET: without it a pass over a surface already drawn fights
++     * it for depth (Conker's blob shadows, factor -4, units -16, came out
++     * hatched). Units are the guest depth buffer's: a Z16 step is 256 of the
++     * 24-bit steps Vulkan counts in, and a slope is per guest pixel. */
++    if (has_z && rs->poly_offset_fill)
++        vkCmdSetDepthBias(c, rs->poly_offset_units * (rs->zeta_format == 1 ? 256.0f : 1.0f),
++                          0.0f, rs->poly_offset_factor * (float)s->sc);
++    else
++        vkCmdSetDepthBias(c, 0.0f, 0.0f, 0.0f);
+     vkCmdSetStencilTestEnable(c, stencil);
+     if (stencil) {
+         VkStencilOp fail, zfail, zpass;

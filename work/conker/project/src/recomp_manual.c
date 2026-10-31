@@ -249,6 +249,32 @@ void sub_004C7FFF_enter(void)
         MEM32(alive) = CONKER_DSP_ALIVE_SIGNATURE;
 }
 
+/* A level's ambience goes in once its banks are ready (sub_00017CF0, the
+ * set pending at +0x10 of the audio manager, flags at +0x14 and +0x15), and
+ * stops every tune not in the set (sub_0001EFC0). The music starts from the
+ * command queue the same frame the set is asked for, so with the banks a few
+ * frames late the ambience stopped the music it had just started: the intro's
+ * track only came back when the monologue's volume command found it gone and
+ * played it anew, a minute late and ducked.
+ *
+ * The queue waits for the ambience (hook added by hand at 0x0001E020 in
+ * recomp/gen/recomp_0001.c), for at most AMBIENCE_WAIT_TICKS of the audio
+ * manager's ticks in case a set never gets its banks. */
+#define AUDIO_MANAGER       0x00847024u
+#define AMBIENCE_WAIT_TICKS 600
+
+int conker_music_commands_wait(void)
+{
+    static int ticks;
+    const uint32_t m = MEM32(AUDIO_MANAGER);
+
+    if (!MEM32(m + 0x10) || !MEM8(m + 0x14) || !MEM8(m + 0x15)) {
+        ticks = 0;
+        return 0;
+    }
+    return ticks < AMBIENCE_WAIT_TICKS && ++ticks;
+}
+
 /* sub_0003D200 pushes a camera mode on the player camera's stack (edx the
  * camera, ecx the slot; on the guest stack the mode mask and two more
  * words), and does nothing when the slot is taken. The weapon's

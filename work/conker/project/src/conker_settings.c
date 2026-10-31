@@ -61,17 +61,35 @@ static volatile int s_fps = 30;
 static volatile int s_skip_cutscenes;    /* LT skips every cutscene, seen or not */
 static volatile int s_swing_button;      /* X swings the weapon (conker_swing.c) */
 static volatile int s_weapon;            /* 1: the frying pan (conker_weapon.c) */
+static volatile int s_intro_fix;         /* 1: the glass of milk (conker_intro.c) */
 static volatile int s_last_game;         /* 0..2: the pub starts on Game 1..3 (conker_pub.c) */
 static volatile float s_hor_plus;
+static int s_no_cfg;                     /* no cfg file at the start of this run */
+static int s_first_run;                  /* the first-run page is choosing (conker_firstrun.c) */
 
 static const char *const k_labels[CONKER_OPT_COUNT] = {
     "Language", "Display Mode", "Aspect Ratio", "Resolution",
-    "Render Resolution", "VSync", "FPS Limit", "Allow Skip Cutscenes", "Swing Button", "Weapon",
+    "Render Resolution", "VSync", "FPS Limit", "Allow Skip Cutscenes", "Swing Button", "Weapon", "Intro Fix",
     "Uncensor",
 };
 /* Uncensor: left and right pick, A carries it out (conker_mods.c). */
 static const char *const k_uncensor[CONKER_UNCENSOR_CHOICES] = { "Disable", "Enable", "Update" };
 static volatile int s_uncensor = -1;     /* the choice showing; -1: the mod's state */
+
+/* The window reports the display once it is open; the first-run page, before
+ * it, hands in what it found. */
+static int s_page_desk_w, s_page_desk_h;
+static int s_page_modes[64][2], s_page_nmodes;
+
+static int desktop_size(int *w, int *h)
+{
+    if (s_first_run && s_page_desk_w) {
+        *w = s_page_desk_w;
+        *h = s_page_desk_h;
+        return 1;
+    }
+    return xbox_WindowDesktopSize(w, h);
+}
 
 /* The default window: what fb_present_sdl.c opens without a size, twice
  * 640x480 at the display's shape. */
@@ -82,7 +100,7 @@ static void default_window_size(int *w, int *h)
     *h = 960;
     *w = (int)(960.0 * k_aspects[s_aspect].w / k_aspects[s_aspect].h + 0.5);
     /* A wide shape on a narrower desktop: as wide as the desktop. */
-    if (xbox_WindowDesktopSize(&dw, &dh) && *w > dw) {
+    if (desktop_size(&dw, &dh) && *w > dw) {
         *w = dw;
         *h = (dw * k_aspects[s_aspect].h / k_aspects[s_aspect].w) & ~1;
     }
@@ -96,7 +114,7 @@ static void save(void)
 {
     FILE *f;
 
-    if (!s_cfg_path[0])
+    if (!s_cfg_path[0] || s_first_run)
         return;
     f = fopen(s_cfg_path, "w");
     if (!f) {
@@ -118,6 +136,7 @@ static void save(void)
     fprintf(f, "skip_cutscenes=%s\n", s_skip_cutscenes ? "yes" : "no");
     fprintf(f, "swing_button=%s\n", s_swing_button ? "x" : "off");
     fprintf(f, "weapon=%s\n", s_weapon ? "pan" : "bat");
+    fprintf(f, "intro_fix=%s\n", s_intro_fix ? "yes" : "no");
     fprintf(f, "last_game=%d\n", s_last_game + 1);
     fclose(f);
 }
@@ -163,6 +182,8 @@ static void parse_line(char *line)
         s_swing_button = !strcmp(val, "x");
     } else if (!strcmp(key, "weapon")) {
         s_weapon = !strcmp(val, "pan");
+    } else if (!strcmp(key, "intro_fix")) {
+        s_intro_fix = !strcmp(val, "yes");
     } else if (!strcmp(key, "last_game")) {
         i = atoi(val);
         if (i >= 1 && i <= 3)
@@ -221,6 +242,8 @@ void conker_settings_load(void)
             parse_line(line);
         fclose(f);
         fprintf(stderr, "[CONKER] settings from %s\n", s_cfg_path);
+    } else {
+        s_no_cfg = s_cfg_path[0] != 0;
     }
 
     s_language_now = s_language;
@@ -264,6 +287,11 @@ void conker_settings_load(void)
 int conker_weapon_choice(void)
 {
     return s_weapon;
+}
+
+int conker_intro_choice(void)
+{
+    return s_intro_fix;
 }
 
 int conker_settings_last_game(void)
@@ -340,8 +368,15 @@ static void add_resolution(int w, int h)
 
 static void build_resolutions(void)
 {
-    int modes[64][2], n = xbox_WindowResolutions(modes, 64), dw = 0, dh = 0, i;
-    int have_desk = xbox_WindowDesktopSize(&dw, &dh);
+    int modes[64][2], n, dw = 0, dh = 0, i;
+    int have_desk = desktop_size(&dw, &dh);
+
+    if (s_first_run) {
+        n = s_page_nmodes;
+        memcpy(modes, s_page_modes, sizeof modes);
+    } else {
+        n = xbox_WindowResolutions(modes, 64);
+    }
 
     s_nres = 0;
     for (i = 0; i < n; i++)
@@ -413,7 +448,7 @@ void conker_options_value(int row, char *buf, size_t size)
     case CONKER_OPT_LANGUAGE:
         /* Applied at start, like the Weapon. */
         snprintf(buf, size, "%s%s", conker_tr(k_languages[s_language].name),
-                 s_language != s_language_now ? conker_tr(" (restart)") : "");
+                 !s_first_run && s_language != s_language_now ? conker_tr(" (restart)") : "");
         break;
     case CONKER_OPT_DISPLAY_MODE:
         snprintf(buf, size, "%s", conker_tr(k_modes[s_mode]));
@@ -450,7 +485,12 @@ void conker_options_value(int row, char *buf, size_t size)
         /* Applied at start: say so while the choice is not what is in hand. */
         snprintf(buf, size, "%s%s", conker_tr(s_weapon ? "Frying Pan" : "Bat"),
                  s_weapon && conker_weapon_failed() ? conker_tr(" (failed)")
-                 : s_weapon != conker_weapon_active() ? conker_tr(" (restart)") : "");
+                 : !s_first_run && s_weapon != conker_weapon_active() ? conker_tr(" (restart)") : "");
+        break;
+    case CONKER_OPT_INTRO_FIX:
+        snprintf(buf, size, "%s%s", conker_tr(s_intro_fix ? "On" : "Off"),
+                 s_intro_fix && conker_intro_failed() ? conker_tr(" (failed)")
+                 : !s_first_run && s_intro_fix != conker_intro_active() ? conker_tr(" (restart)") : "");
         break;
     case CONKER_OPT_UNCENSOR: {
         char status[96];
@@ -533,16 +573,95 @@ static void change(int row, int dir)
     case CONKER_OPT_WEAPON:
         s_weapon = !s_weapon;
         break;
+    case CONKER_OPT_INTRO_FIX:
+        s_intro_fix = !s_intro_fix;
+        break;
     case CONKER_OPT_UNCENSOR:
         if (s_uncensor < 0)
             s_uncensor = conker_mods_uncensor_choice();
-        s_uncensor = wrap(s_uncensor + dir, CONKER_UNCENSOR_CHOICES);
+        /* Nothing is installed yet to update on the first-run page. */
+        s_uncensor = wrap(s_uncensor + dir, s_first_run ? CONKER_UNCENSOR_UPDATE
+                                                        : CONKER_UNCENSOR_CHOICES);
         conker_mods_uncensor_clear_status();
         return;                         /* nothing to save: A carries it out */
     default:
         return;
     }
     save();
+}
+
+/* ── The first-run page (conker_firstrun.c) ──────────────────────────── */
+
+int conker_settings_no_cfg(void)
+{
+    return s_no_cfg;
+}
+
+/* The nearest shape to the display's, and what a handheld wants: its whole
+ * screen. Everything else keeps its default. */
+void conker_first_run_begin(int desk_w, int desk_h, const int (*modes)[2], int nmodes, int language)
+{
+    int i, best = 0;
+    double best_d = 1e9;
+
+    s_first_run = 1;
+    s_page_desk_w = desk_w;
+    s_page_desk_h = desk_h;
+    s_page_nmodes = nmodes > 64 ? 64 : nmodes;
+    if (s_page_nmodes)
+        memcpy(s_page_modes, modes, (size_t)s_page_nmodes * sizeof modes[0]);
+    if (language >= 0 && language < CONKER_LANG_COUNT)
+        s_language = language;
+    s_uncensor = CONKER_UNCENSOR_DISABLE;
+    if (desk_w > 0 && desk_h > 0) {
+        for (i = 0; i < N_ASPECTS; i++) {
+            double d = (double)k_aspects[i].w / k_aspects[i].h - (double)desk_w / desk_h;
+            if (d < 0)
+                d = -d;
+            if (d < best_d) {
+                best_d = d;
+                best = i;
+            }
+        }
+        s_aspect = best;
+        apply_aspect(!getenv("RECOMP_DISPLAY_ASPECT"));
+        if (desk_w <= 1280 || desk_h <= 800) {
+            s_mode = 1;
+            s_res_w = desk_w;
+            s_res_h = desk_h;
+            apply_window();
+        }
+    }
+    refit_resolution();
+}
+
+int conker_first_run_language(void)
+{
+    return s_language;
+}
+
+void conker_first_run_step(int row, int dir)
+{
+    change(row, dir);
+}
+
+/* The choices become this run's and go in the cfg. */
+void conker_first_run_end(void)
+{
+    s_first_run = 0;
+    s_no_cfg = 0;
+    s_language_now = s_language;
+    conker_lang_set(s_language_now);
+    xbox_SetLanguage(k_languages[s_language_now].xbox);
+    save();
+}
+
+/* Once the mods are up: the Uncensor choice, carried out as A would. */
+void conker_first_run_apply_mods(void)
+{
+    if (s_uncensor == CONKER_UNCENSOR_ENABLE)
+        conker_mods_uncensor_apply(s_uncensor);
+    s_uncensor = -1;
 }
 
 /* A on a row: what right does, except where A has its own meaning. */

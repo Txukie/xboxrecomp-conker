@@ -200,6 +200,12 @@ void conker_mods_init(const char *data_dir, const char *save_dir)
         if (gen && n < MAX_MODS)
             dirs[n++] = gen;
     }
+    {
+        extern const char *conker_intro_overlay(void);
+        const char *gen = conker_intro_overlay();
+        if (gen && n < MAX_MODS)
+            dirs[n++] = gen;
+    }
     xbox_path_set_overlays(dirs, n);
 }
 
