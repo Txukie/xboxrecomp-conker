@@ -1,0 +1,46 @@
+diff --git a/src/video/fb_present_sdl.c b/src/video/fb_present_sdl.c
+--- a/src/video/fb_present_sdl.c
++++ b/src/video/fb_present_sdl.c
+@@ -515,6 +515,7 @@ void xbox_WindowAdopt(void *sdl_window)
+ int xbox_HostWindowMain(int (*guest_main)(void))
+ {
+     SDL_Window *win;
++    int adopted = 0;
+     SDL_Renderer *ren;
+     SDL_Texture *tex = NULL;
+     uint32_t tex_bpp = 0, tex_w = 0, tex_h = 0;
+@@ -552,6 +553,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+             h = s_req_h;
+         }
+         if (s_adopted) {
++            adopted = 1;
+             win = s_adopted;
+             s_adopted = NULL;
+             SDL_SetWindowTitle(win, s_title);
+@@ -567,6 +569,14 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+     }
+     /* A pad game: no pointer over its window. */
+     SDL_ShowCursor(SDL_DISABLE);
++    /* SDL stayed up with an adopted window, and the page before the game read
++     * the events that report the controllers already plugged in: none comes
++     * again, so nothing would open them. */
++    if (adopted) {
++        fprintf(stderr, "  [FBWIN] adopted window, input focus %s\n",
++                SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS ? "yes" : "no");
++        xbox_InputControllersChanged();
++    }
+     ren = win ? SDL_CreateRenderer(win, -1,
+                                    vsync ? SDL_RENDERER_PRESENTVSYNC : 0)
+               : NULL;
+@@ -642,6 +652,11 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+                 else if (ev.type == SDL_CONTROLLERDEVICEADDED
+                          || ev.type == SDL_CONTROLLERDEVICEREMOVED)
+                     xbox_InputControllersChanged();
++                else if (ev.type == SDL_CONTROLLERBUTTONDOWN && getenv("RECOMP_INPUT_TRACE"))
++                    fprintf(stderr, "  [INPUT] button %s, pad %d, input focus %s\n",
++                            SDL_GameControllerGetStringForButton(ev.cbutton.button),
++                            (int)ev.cbutton.which,
++                            SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS ? "yes" : "no");
+                 else if (ev.type == SDL_WINDOWEVENT
+                          && (ev.window.event == SDL_WINDOWEVENT_FOCUS_GAINED
+                              || ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST))

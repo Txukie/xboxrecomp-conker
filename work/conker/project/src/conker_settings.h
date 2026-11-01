@@ -77,6 +77,7 @@ int  conker_settings_last_game(void);
 void conker_settings_set_last_game(int slot);
 void conker_pub_tick(uint64_t now_ms);
 int  conker_pub_pad(int left, int right, int a, int b);
+int  conker_pub_intro_skip(int a, uint64_t now_ms);
 
 /* Hor+: how much wider the horizontal view is than 4:3's, or 0 at 4:3. */
 float conker_settings_hor_plus(void);

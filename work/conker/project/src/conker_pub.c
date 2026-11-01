@@ -160,6 +160,43 @@ void conker_pub_tick(uint64_t now)
     s_played = GF(PAGE_OPEN) > 0.5f && sel >= GAME_1 && sel <= GAME_1 + 2 ? sel - GAME_1 : -1;
 }
 
+/* ── The intro on the first boot ──────────────────────────────────────── */
+
+/* The first boot fills Z:, the game's cache, behind the intro video (15 to
+ * 25 s). Until that is done the game does not look at the pad, so A does
+ * nothing and the game seems not to have the focus. Once A has been pressed
+ * it is pressed again and again until the pub shows, which ends the video as
+ * soon as the game can. Any other boot ends it on the first press. The video
+ * lasts 65 s, so that bounds it should the pub never come. */
+#define INTRO_SKIP_MS  70000
+#define INTRO_PULSE_MS 100
+
+/* From the input filter, A just pressed or not. -1: the game gets the pad;
+ * else A as the game should see it, 0 up or 1 down. */
+int conker_pub_intro_skip(int a, uint64_t now)
+{
+    static int s_pub_seen;
+    static uint64_t s_since;
+
+    if (s_pub_seen || !g_xbox_mem_offset)
+        return -1;
+    if (in_pub()) {
+        s_pub_seen = 1;
+        return s_since ? 0 : -1;
+    }
+    if (!s_since) {
+        if (!a)
+            return -1;
+        s_since = now;
+        fprintf(stderr, "[PUB] A held on to until the intro can end\n");
+    }
+    if (now - s_since > INTRO_SKIP_MS) {
+        s_pub_seen = 1;
+        return 0;
+    }
+    return (now - s_since) / INTRO_PULSE_MS % 2 == 0;
+}
+
 /* ── Do you want to exit? ─────────────────────────────────────────────── */
 
 #define MAX_SWAPS 16

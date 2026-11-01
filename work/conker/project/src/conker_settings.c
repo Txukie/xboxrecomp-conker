@@ -811,6 +811,14 @@ static void input_filter(DWORD port, XBOX_INPUT_STATE *st, int connected)
     pressed = bits & ~s_prev[port];
     s_prev[port] = bits;
 
+    if (port == 0 && !s_open) {
+        int skip = conker_pub_intro_skip(!!(pressed & P_A), now);
+        if (skip >= 0) {
+            st->Gamepad.bAnalogButtons[XBOX_BUTTON_A] = skip ? 255 : 0;
+            return;
+        }
+    }
+
     if (s_swallow[port]) {
         if (bits)
             rest(st);

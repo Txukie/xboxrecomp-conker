@@ -1,0 +1,72 @@
+diff --git a/src/video/fb_present_sdl.c b/src/video/fb_present_sdl.c
+index 78a2b5c..1884f3c 100644
+--- a/src/video/fb_present_sdl.c
++++ b/src/video/fb_present_sdl.c
+@@ -502,6 +502,16 @@ static void window_shot(SDL_Renderer *ren)
+     SDL_FreeSurface(sf);
+ }
+ 
++/* A window a title's own page opened before the game: kept rather than closed
++ * and opened anew, since a desktop or compositor may not give focus to a
++ * window that opens by itself, and then the pad does nothing. */
++static SDL_Window *s_adopted;
++
++void xbox_WindowAdopt(void *sdl_window)
++{
++    s_adopted = sdl_window;
++}
++
+ int xbox_HostWindowMain(int (*guest_main)(void))
+ {
+     SDL_Window *win;
+@@ -541,9 +551,22 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+             w = s_req_w;
+             h = s_req_h;
+         }
+-        win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+-                               w, h, SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
++        if (s_adopted) {
++            win = s_adopted;
++            s_adopted = NULL;
++            SDL_SetWindowTitle(win, s_title);
++            if (s_req_mode <= 0) {
++                SDL_SetWindowFullscreen(win, 0);
++                SDL_SetWindowSize(win, w, h);
++                SDL_SetWindowPosition(win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
++            }
++        } else {
++            win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
++                                   w, h, SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
++        }
+     }
++    /* A pad game: no pointer over its window. */
++    SDL_ShowCursor(SDL_DISABLE);
+     ren = win ? SDL_CreateRenderer(win, -1,
+                                    vsync ? SDL_RENDERER_PRESENTVSYNC : 0)
+               : NULL;
+@@ -619,6 +642,11 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+                 else if (ev.type == SDL_CONTROLLERDEVICEADDED
+                          || ev.type == SDL_CONTROLLERDEVICEREMOVED)
+                     xbox_InputControllersChanged();
++                else if (ev.type == SDL_WINDOWEVENT
++                         && (ev.window.event == SDL_WINDOWEVENT_FOCUS_GAINED
++                             || ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST))
++                    fprintf(stderr, "  [FBWIN] focus %s\n",
++                            ev.window.event == SDL_WINDOWEVENT_FOCUS_GAINED ? "gained" : "lost");
+                 else if (ev.type == SDL_WINDOWEVENT
+                          && (ev.window.event == SDL_WINDOWEVENT_EXPOSED
+                              || ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED))
+diff --git a/src/video/video_player.h b/src/video/video_player.h
+index 5d9c013..0e4c965 100644
+--- a/src/video/video_player.h
++++ b/src/video/video_player.h
+@@ -79,6 +79,9 @@ void xbox_FramebufferWindowPresentPixels(uint32_t fb_va, const void *px,
+  * nearest width x height, 2 borderless fullscreen at the desktop's size. */
+ void xbox_WindowSetMode(int mode, int width, int height);
+ void xbox_WindowSetVsync(int on);
++/* Before xbox_HostWindowMain: use this SDL_Window, already open, for the game
++ * instead of opening one. */
++void xbox_WindowAdopt(void *sdl_window);
+ /* The display's resolutions, largest first, once the window is open (0
+  * before); and the desktop's own size. */
+ int  xbox_WindowResolutions(int (*wh)[2], int max);

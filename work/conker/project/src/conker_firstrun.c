@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include "conker_settings.h"
+#include "video_player.h"
 #ifdef CONKER_HAVE_VULKAN
 #include "nv2a_vk.h"
 #endif
@@ -213,9 +214,9 @@ static const char *const k_hints[CONKER_OPT_COUNT] = {
     "Waits for the screen, which stops tearing.",
     "30 is the console's rate.",
     "Hold LT to skip any cutscene, even one you have not seen.",
-    "X swings the weapon in one press, without the camera change.",
-    "The bat, or the frying pan from the training level, made from your own copy of the game.",
-    "In the opening scene, a low glass half full of milk instead of the goblet.",
+    "The attack mode as you remember it from the N64",
+    "The weapon as you remember it from the N64",
+    "The prologue as you remember it from the N64",
     "Downloads a patch made by others, separate from this project. Applies at the next start.",
 };
 
@@ -425,7 +426,8 @@ int conker_firstrun_show(void)
         int small = dw > 0 && (dw <= PAGE_W || dh <= PAGE_H);
         win = SDL_CreateWindow("Conker: Live & Reloaded recomp", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                PAGE_W, PAGE_H,
-                               SDL_WINDOW_RESIZABLE | (small ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0));
+                               SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
+                               | (small ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0));
     }
     ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_PRESENTVSYNC) : NULL;
     tex = ren ? SDL_CreateTexture(ren, SDL_PIXELFORMAT_XRGB8888, SDL_TEXTUREACCESS_STREAMING,
@@ -544,13 +546,20 @@ int conker_firstrun_show(void)
     if (pad)
         SDL_GameControllerClose(pad);
     SDL_DestroyTexture(tex);
+    if (result == 0) {
+        /* The game keeps this window: it has the focus. */
+        SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+        SDL_RenderClear(ren);
+        SDL_RenderPresent(ren);
+        SDL_DestroyRenderer(ren);
+        xbox_WindowAdopt(win);
+        conker_first_run_end();
+        return 0;
+    }
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
     SDL_Quit();
-    if (result == 0)
-        conker_first_run_end();
-    else
-        fprintf(stderr, "[CONKER] first-run page closed: nothing saved\n");
+    fprintf(stderr, "[CONKER] first-run page closed: nothing saved\n");
     return result;
 }
 
