@@ -1,0 +1,137 @@
+diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
+index 81dd626..69526fd 100644
+--- a/src/kernel/nv2a_backend.h
++++ b/src/kernel/nv2a_backend.h
+@@ -202,6 +202,9 @@ typedef struct {
+     float              aa_sx, aa_sy, near_z;
+     uint32_t           fog_enable, fog_mode;
+     float              fog_param[2];
++    /* oFog.x before the program runs: what the last program left
++     * (nv2a_vsh_carry_fog), for a program that does not write it. */
++    float              carry_fog;
+ } Nv2aProgramBatch;
+ 
+ typedef struct {
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index e96e219..c0664cf 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -3506,6 +3506,7 @@ static void backend_program_batch(void)
+     pb.fog_mode = s_gpu.fog_mode;
+     pb.fog_param[0] = s_gpu.fog_param[0];
+     pb.fog_param[1] = s_gpu.fog_param[1];
++    pb.carry_fog = nv2a_vsh_carry_fog()[0];
+     current_surface(&surf);
+     full_batch_state(&pb.pix, &rs, 1, 1);
+     s_gpu.batches_program++;
+@@ -3712,6 +3713,18 @@ static void raster_batch(void)
+     note_video_batch();
+     if (batch_uses_program() || batch_is_ffp()) {
+         raster_batch_program();
++        /* Not for a program that writes constants: one more run would. */
++        if (batch_uses_program() && !nv2a_vsh_cxt_write()) {
++            float in[NV2A_VSH_INPUTS][4];
++            uint32_t a;
++            for (a = 0; a < NV2A_VSH_INPUTS; a++) {
++                in[a][0] = in[a][1] = in[a][2] = 0.0f;
++                in[a][3] = 1.0f;
++                if (a < NV_VERTEX_ATTRS)
++                    memcpy(in[a], s_gpu.imm_attr[a], sizeof in[a]);
++            }
++            nv2a_vsh_carry_update((const float (*)[4])in);
++        }
+         return;
+     }
+     if (!batch_is_screen_space()) {
+diff --git a/src/kernel/nv2a_vsh_interp.c b/src/kernel/nv2a_vsh_interp.c
+index c065159..6e7971e 100644
+--- a/src/kernel/nv2a_vsh_interp.c
++++ b/src/kernel/nv2a_vsh_interp.c
+@@ -454,6 +454,28 @@ static inline void run_ilu(uint32_t op, const vec4 *pc, vec4 *pr)
+     *pr = r;
+ }
+ 
++/* The fog output a program does not write keeps the value the previous
++ * program left in it. Conker's dust puffs draw with fog on and a program
++ * that never writes oFog; read as 0, that is fully fogged, and every puff
++ * came out a solid blot of the level's fog colour (blue in the bank).
++ * xemu's model (pgraph/vertex.c, vsh_carryover): after each program batch,
++ * run the program once on the current SET_VERTEX_DATA values, starting from
++ * the carried oFog, and carry what it leaves. Starts at 0,0,0,1. */
++static float s_carry_fog[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
++
++const float *nv2a_vsh_carry_fog(void)
++{
++    return s_carry_fog;
++}
++
++void nv2a_vsh_carry_update(const float in[NV2A_VSH_INPUTS][4])
++{
++    Nv2aVshOutput o;
++
++    if (nv2a_vsh_run(in, &o))
++        memcpy(s_carry_fog, o.fog, sizeof s_carry_fog);
++}
++
+ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+ {
+     static int dump = -1;
+@@ -488,6 +510,8 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+     memset(&opos, 0, sizeof opos);
+     memset(outregs, 0, sizeof outregs);
+     outregs[3][3] = outregs[4][3] = 1.0f;      /* colours default opaque */
++    /* oFog starts as what the last program left there (nv2a_vsh_carry_fog). */
++    memcpy(outregs[5], s_carry_fog, sizeof outregs[5]);
+     /* Unwritten texture coordinates are (0,0,0,1), as xemu initialises them:
+      * a projective stage divides by q, and q = 0 would put every texel of an
+      * unwritten stage at infinity. */
+diff --git a/src/kernel/nv2a_vsh_interp.h b/src/kernel/nv2a_vsh_interp.h
+index a2ab36d..e4b77bf 100644
+--- a/src/kernel/nv2a_vsh_interp.h
++++ b/src/kernel/nv2a_vsh_interp.h
+@@ -57,6 +57,12 @@ void nv2a_vsh_prepare(void);
+  * transform this batch" rather than drawing garbage. */
+ int  nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
+ 
++/* oFog as the last program left it, which is where a program that does not
++ * write oFog starts; and, after a program batch, run the program once on the
++ * current attribute values to carry its oFog on (xemu's vsh carryover). */
++const float *nv2a_vsh_carry_fog(void);
++void nv2a_vsh_carry_update(const float in[NV2A_VSH_INPUTS][4]);
++
+ /* The program from the start slot, decoded, for a back end that runs it on
+  * a GPU: one entry of eight words per instruction, returning how many (0:
+  * no FINAL, nothing to run). Layout -- keep src/vulkan/shaders/nv2a_vsh.vert
+diff --git a/src/vulkan/nv2a_vk.c b/src/vulkan/nv2a_vk.c
+index 7c45a84..bd2c9ee 100644
+--- a/src/vulkan/nv2a_vk.c
++++ b/src/vulkan/nv2a_vk.c
+@@ -3561,6 +3561,7 @@ static void vk_draw_program(const Nv2aSurface *ns, const Nv2aProgramBatch *b)
+     vd->vp2[0] = b->aa_sy;
+     vd->vp2[1] = b->near_z;
+     vd->vp2[2] = (float)b->ninst;
++    vd->vp2[3] = b->carry_fog;
+     vd->fogp[0] = (float)(b->fog_enable != 0);
+     vd->fogp[1] = (float)b->fog_mode;
+     vd->fogp[2] = b->fog_param[0];
+diff --git a/src/vulkan/shaders/nv2a_vsh.vert b/src/vulkan/shaders/nv2a_vsh.vert
+index 7452d8a..eaf4c81 100644
+--- a/src/vulkan/shaders/nv2a_vsh.vert
++++ b/src/vulkan/shaders/nv2a_vsh.vert
+@@ -40,7 +40,7 @@ layout(set = 0, binding = 12, std140) uniform VshDraw {
+                        * | present << 16, - */
+     vec4  value[16];  /* what an absent attribute reads */
+     vec4  vp;         /* 2 / width, 2 / height, 1 / zmax, aa x */
+-    vec4  vp2;        /* aa y, near-plane screen z, instructions, - */
++    vec4  vp2;        /* aa y, near-plane screen z, instructions, carried oFog.x */
+     vec4  fogp;       /* enable, mode, param 0, param 1 */
+ } u;
+ 
+@@ -217,6 +217,7 @@ void main()
+         O[i] = vec4(0.0);
+     }
+     O[3].w = O[4].w = 1.0;
++    O[5].x = u.vp2.w;    /* oFog as the last program left it (carry_fog) */
+     O[9].w = O[10].w = O[11].w = O[12].w = 1.0;
+     a0 = 0;
+ 

@@ -251,6 +251,15 @@ int main(int argc, char **argv)
     char *slash;
 
     conker_host_open_log();
+#ifdef CONKER_DEBUG
+    /* The debug build's log and readout (conker_debug.c). */
+    {
+        extern void conker_debug_open_log(void);
+        extern void conker_debug_install(void);
+        conker_debug_open_log();
+        conker_debug_install();
+    }
+#endif
     s_save_path = argc > 2 ? argv[2] : getenv("CONKER_SAVE_DIR");
 
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -313,13 +322,21 @@ int main(int argc, char **argv)
     if (conker_find_game(argc > 1 ? argv[1] : NULL, data_dir, exe_dir,
                          game_dir, sizeof game_dir) != 0)
         return 1;
-    /* A first run: every Recomp Option, chosen before anything starts. */
-    if (conker_settings_no_cfg() && !getenv("RECOMP_HEADLESS")
-            && conker_firstrun_show() != 0)
-        return 0;
     s_game_dir = game_dir;
     if (!s_save_path || !*s_save_path)
         s_save_path = default_save;
+    /* The launcher, at every start: the options, chosen before anything
+     * starts (CONKER_SKIP_LAUNCHER=1 goes straight to the game, as a
+     * headless run does). Quitting it quits. */
+    conker_mods_set_dirs(data_dir, s_save_path);
+    {
+        const char *skip = getenv("CONKER_SKIP_LAUNCHER");
+        if (!getenv("RECOMP_HEADLESS") && !(skip && *skip && *skip != '0')
+                && conker_firstrun_show(data_dir) != 0)
+            return 0;
+    }
+    /* An Uncensor choice left showing there, before the mods are laid. */
+    conker_first_run_apply_mods();
     /* Mods in <data>/mods, laid over the game's files (conker_mods.c), and
      * the frying pan's folder when it is chosen (conker_weapon.c). */
     {
@@ -331,7 +348,6 @@ int main(int argc, char **argv)
         conker_intro_init(data_dir);
     }
     conker_mods_init(data_dir, s_save_path);
-    conker_first_run_apply_mods();
     /* The Vulkan renderer's list of the pipelines the game has used, built
      * again at every start so that nothing compiles while it plays. */
     {

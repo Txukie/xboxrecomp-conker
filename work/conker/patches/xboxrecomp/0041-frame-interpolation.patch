@@ -1,0 +1,1046 @@
+diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
+index 69526fd..c96663a 100644
+--- a/src/kernel/nv2a_backend.h
++++ b/src/kernel/nv2a_backend.h
+@@ -232,11 +232,17 @@ typedef struct {
+     /* draw_program: vertex-program batches, transformed by the back end.
+      * Optional; without it they arrive through draw_full, transformed. */
+     void (*draw_program)(const Nv2aSurface *s, const Nv2aProgramBatch *b);
++    /* tick: optional, called by the executor's thread on every pass of its
++     * loop (also while the title sends nothing): work of the back end's own
++     * that is due at a time rather than at a method. */
++    void (*tick)(void);
+ } Nv2aBackend;
+ 
+ /* Register (or, with NULL, remove) the back end. Call before the title starts
+  * submitting work; the executor must also be enabled (RECOMP_PB_EXEC). */
+ void nv2a_backend_register(const Nv2aBackend *backend);
++/* The executor thread's pass: the back end's tick, if it has one. */
++void nv2a_backend_tick(void);
+ 
+ /* Decode a whole texture to 0xAARRGGBB, row-major, width*height entries.
+  * Handles every format the executor can sample (swizzled, linear, DXT).
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index c0664cf..35a9616 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -785,6 +785,12 @@ static void surface_apply_clip(void)
+ 
+ static const Nv2aBackend *s_backend;
+ 
++void nv2a_backend_tick(void)
++{
++    if (s_backend && s_backend->tick)
++        s_backend->tick();
++}
++
+ void nv2a_backend_register(const Nv2aBackend *backend)
+ {
+     s_backend = backend;
+diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
+index 911ef89..01a0f4d 100644
+--- a/src/kernel/xbox_memory_layout.c
++++ b/src/kernel/xbox_memory_layout.c
+@@ -1470,7 +1470,10 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+          * its segment and the two are the same; a segment carrying two
+          * flips paces only the last. */
+         extern int nv2a_pb_exec_flip_poll(void);
+-        int flip_held = nv2a_pb_exec_flip_poll();
++        extern void nv2a_backend_tick(void);
++        int flip_held;
++        nv2a_backend_tick();
++        flip_held = nv2a_pb_exec_flip_poll();
+         nv2a_ack_busy_bits(flip_held);
+         for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
+             volatile uint32_t *r =
+diff --git a/src/video/fb_present.c b/src/video/fb_present.c
+index 65b7ed2..016159e 100644
+--- a/src/video/fb_present.c
++++ b/src/video/fb_present.c
+@@ -661,6 +661,8 @@ void xbox_FramebufferWindowPresentPixels(uint32_t fb_va, const void *px,
+     (void)fb_va; (void)px; (void)w; (void)h; (void)pitch; (void)bpp;
+ }
+ 
++void xbox_FramebufferWindowClaimFlip(uint32_t fb_va) { (void)fb_va; }
++
+ void xbox_WindowSetMode(int mode, int width, int height)
+ {
+     (void)mode; (void)width; (void)height;
+diff --git a/src/video/fb_present_sdl.c b/src/video/fb_present_sdl.c
+index db2efdf..619bb35 100644
+--- a/src/video/fb_present_sdl.c
++++ b/src/video/fb_present_sdl.c
+@@ -225,6 +225,11 @@ void xbox_FramebufferWindowPresentPixels(uint32_t fb_va, const void *px,
+     __atomic_sub_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
+ }
+ 
++void xbox_FramebufferWindowClaimFlip(uint32_t fb_va)
++{
++    s_hires_va = fb_va;
++}
++
+ /* ── Window settings a title can change while it runs ─────────────────── */
+ 
+ /* Requested by any thread, applied by the main loop when s_req_gen moves.
+diff --git a/src/video/video_player.h b/src/video/video_player.h
+index d977d07..eef744c 100644
+--- a/src/video/video_player.h
++++ b/src/video/video_player.h
+@@ -72,6 +72,9 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws);
+ void xbox_FramebufferWindowPresentPixels(uint32_t fb_va, const void *px,
+                                          uint32_t w, uint32_t h,
+                                          uint32_t pitch, uint32_t bpp);
++/* The flip of the surface at fb_va is the back end's to show (it shows frames
++ * of its own, at its own times): that flip's 640x480 copy is not shown. */
++void xbox_FramebufferWindowClaimFlip(uint32_t fb_va);
+ 
+ /* Window settings a title's menu can change while it runs; the window
+  * applies them at its next pass (or opens with them). Mode: 0 windowed at
+diff --git a/src/vulkan/nv2a_vk.c b/src/vulkan/nv2a_vk.c
+index bd2c9ee..48a3b96 100644
+--- a/src/vulkan/nv2a_vk.c
++++ b/src/vulkan/nv2a_vk.c
+@@ -35,6 +35,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <math.h>
+ #include <stdatomic.h>
+ #include "c11_threads.h"
+ #include <time.h>
+@@ -154,6 +155,7 @@ static int s_cur;
+ /* Program batches' constants and program, as last copied to s_ru (a flush
+  * rewinds the ring and forgets them). */
+ #define NV2A_VSH_SLOTS_VK 136
++#define NV2A_VSH_CONSTANTS 192   /* c[0..191], as nv2a_vsh_interp.h */
+ static VkDeviceSize s_kc_off = UINT64_MAX, s_kp_off = UINT64_MAX;
+ static float s_kc_last[192][4];
+ static uint32_t s_kp_last[NV2A_VSH_SLOTS_VK][8], s_kp_n;
+@@ -477,8 +479,21 @@ typedef struct {
+     VkImageView dview, sview;
+ } Zeta;
+ 
+-static Surf s_surfs[VK_MAX_SURFACES];
+-static Zeta s_zetas[VK_MAX_ZETAS];
++/* The title's surfaces, and while an in-between frame is drawn a second set
++ * of its own (s_replay, "Frame interpolation"): that frame draws into the
++ * same addresses, and must not disturb the title's next frame, half drawn in
++ * the first set. */
++static Surf s_surfs_title[VK_MAX_SURFACES], s_surfs_replay[VK_MAX_SURFACES];
++static Zeta s_zetas_title[VK_MAX_ZETAS], s_zetas_replay[VK_MAX_ZETAS];
++static Surf *s_surfs = s_surfs_title;
++static Zeta *s_zetas = s_zetas_title;
++static int s_replay;            /* drawing an in-between frame */
++/* The vertex program a program draw used (vk_draw_program), and one to use
++ * instead of looking it up: an in-between frame knows it from before. */
++static uint32_t s_vsh_last, s_vsh_force;
++static unsigned s_interp_k = 1; /* frames shown per frame drawn */
++static void interp_shown(uint32_t va);
++static void interp_reset_surfaces(void);
+ 
+ static void zeta_views_retire(Zeta *z)
+ {
+@@ -643,6 +658,8 @@ static void surf_queue_readback(Surf *s)
+     VkBufferImageCopy r;
+     int i;
+ 
++    if (s_replay)                 /* an in-between frame is not the title's */
++        return;
+     for (i = 0; i < s_nreads; i++)
+         if (s_reads[i].s == s)
+             return;
+@@ -824,7 +841,9 @@ static Surf *surf_get(const Nv2aSurface *ns, uint32_t need_h)
+      * and this one picks it up from there. On the console both are just the
+      * bytes. Conker's front end clears its 256x256 text target as one layout
+      * and draws into it as the other; kept apart, the drawn image was never
+-     * cleared, and a frame's worth of text piled onto every frame before. */
++     * cleared, and a frame's worth of text piled onto every frame before.
++     * An in-between frame takes the GPU copy too, among its own surfaces; it
++     * never writes guest memory (surf_queue_readback). */
+     {
+         int i, any = 0, newer = 0, done = 0;
+         Surf *last = NULL;
+@@ -876,7 +895,7 @@ static Surf *surf_get(const Nv2aSurface *ns, uint32_t need_h)
+             s_alias_syncs++;
+         }
+     }
+-    if (s->force_upload || s->checked_frame != s_frame) {
++    if (s->force_upload || (!s_replay && s->checked_frame != s_frame)) {
+         uint64_t hsh = surf_hash_guest(s);
+         if (s->force_upload || hsh != s->guest_hash) {
+             surf_upload(s);
+@@ -1003,6 +1022,39 @@ typedef struct {
+ 
+ static Tex s_tex[VK_MAX_TEXTURES];
+ static int s_ntex;
++
++/* s_tex by key: a draw used to scan it whole for each stage, and an
++ * in-between frame draws a frame's worth of them many times a second.
++ * Rebuilt when an entry comes, goes or changes key (s_tex_ix_ok = 0). */
++#define VK_TEX_IX 8192            /* power of two, twice VK_MAX_TEXTURES */
++static uint16_t s_tex_ix[VK_TEX_IX];
++static int s_tex_ix_ok;
++
++static uint32_t tex_key_hash(uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch,
++                             uint32_t color, uint32_t palette, uint32_t cube,
++                             uint32_t levels, uint32_t drawn)
++{
++    uint32_t v[9] = { offset, w, h, pitch, color, palette, cube, levels, drawn }, x = 2166136261u;
++    int i;
++    for (i = 0; i < 9; i++)
++        x = (x ^ v[i]) * 16777619u;
++    return x ^ (x >> 15);
++}
++
++static void tex_ix_build(void)
++{
++    int i;
++    memset(s_tex_ix, 0, sizeof s_tex_ix);
++    for (i = 0; i < s_ntex; i++) {
++        const Tex *c = &s_tex[i];
++        uint32_t h = tex_key_hash(c->offset, c->width, c->height, c->pitch, c->color,
++                                  c->palette, c->cube, c->levels, c->drawn);
++        while (s_tex_ix[h & (VK_TEX_IX - 1)])
++            h++;
++        s_tex_ix[h & (VK_TEX_IX - 1)] = (uint16_t)(i + 1);
++    }
++    s_tex_ix_ok = 1;
++}
+ static Img s_white2d, s_whitecube;
+ static uint32_t *s_decode;
+ static size_t s_decode_cap;
+@@ -1020,7 +1072,16 @@ static uint32_t zeta_span(const Zeta *z)
+  * flush. A title can sample its depth buffer as a texture: Conker's glow
+  * reads the 640x480 Z24S8 zeta surface as LIN_R8G8B8A8 for a depth mask,
+  * and with nothing written there it read whatever the memory held. */
++static void zeta_queue_readback_now(Zeta *z);
++
++/* Depth into guest memory at the next flush; not for an in-between frame. */
+ static void zeta_queue_readback(Zeta *z)
++{
++    if (!s_replay)
++        zeta_queue_readback_now(z);
++}
++
++static void zeta_queue_readback_now(Zeta *z)
+ {
+     uint32_t bpp = z->zfmt == 1 ? 2u : 4u, w, h, i, step = 1, cw, ch;
+     VkDeviceSize doff, soff = 0;
+@@ -1120,6 +1181,8 @@ static void zeta_write_guest(const ZetaReadback *zr)
+ static int resolve_overlaps(uint32_t va, uint32_t bytes)
+ {
+     int i, any = 0;
++    if (s_replay)          /* an in-between frame reads texels as they are */
++        return 0;
+     for (i = 0; i < VK_MAX_SURFACES; i++) {
+         Surf *s = &s_surfs[i];
+         if (s->color.image && s->gpu_dirty && va < s->va + surf_span(s)
+@@ -1705,7 +1768,24 @@ static Img *tex_get(const Nv2aStage *st)
+     if (zsrc && !zpack_pipeline())
+         zsrc = NULL;
+     drawn = zsrc ? 2u : src != NULL;
+-    for (i = 0; i < s_ntex; i++) {
++    if (!s_tex_ix_ok)
++        tex_ix_build();
++    {
++        uint32_t h = tex_key_hash(st->offset, st->width, st->height, st->pitch, st->color,
++                                  st->palette, st->cube, st->levels, drawn);
++        for (; s_tex_ix[h & (VK_TEX_IX - 1)]; h++) {
++            Tex *c = &s_tex[s_tex_ix[h & (VK_TEX_IX - 1)] - 1];
++            if (c->offset == st->offset && c->width == st->width
++                && c->height == st->height && c->pitch == st->pitch
++                && c->color == st->color && c->palette == st->palette
++                && c->cube == st->cube && c->levels == st->levels
++                && c->drawn == drawn) {
++                t = c;
++                break;
++            }
++        }
++    }
++    for (i = 0; !t && i < s_ntex; i++) {
+         Tex *c = &s_tex[i];
+         if (c->offset == st->offset && c->width == st->width
+             && c->height == st->height && c->pitch == st->pitch
+@@ -1726,6 +1806,7 @@ static Img *tex_get(const Nv2aStage *st)
+             img_retire(&t->img);
+         }
+         memset(t, 0, sizeof *t);
++        s_tex_ix_ok = 0;
+         t->offset = st->offset;
+         t->width = st->width;
+         t->height = st->height;
+@@ -3571,8 +3652,8 @@ static void vk_draw_program(const Nv2aSurface *ns, const Nv2aProgramBatch *b)
+     for (k = 0; k < b->count; k++)
+         ix[k] = b->indices[k] - b->min_index;
+ 
+-    pipe_key(&pk, s, z, rs, (int)vprog_for(b->program, b->ninst),
+-             pix, (const VkDraw *)(s_ru.map + uoff));
++    s_vsh_last = s_vsh_force ? s_vsh_force : vprog_for(b->program, b->ninst);
++    pipe_key(&pk, s, z, rs, (int)s_vsh_last, pix, (const VkDraw *)(s_ru.map + uoff));
+     pipe = pipe_get(&pk);
+     if (!pipe)
+         return;
+@@ -3691,6 +3772,14 @@ static void vk_resolve(uint32_t va)
+             && (!shown || s->last_use > shown->last_use))
+             shown = s;
+     }
++    /* Interpolating, the window shows the in-between frames (vk_tick), and
++     * this flip is theirs: the title's own frame goes to guest memory only. */
++    if (s_interp_k > 1) {
++        extern void xbox_FramebufferWindowClaimFlip(uint32_t);
++        interp_shown(va);
++        xbox_FramebufferWindowClaimFlip(va);
++        shown = NULL;
++    }
+     /* The window shows the top-left 640x480 of the surface. */
+     if (shown) {
+         pw = (shown->w < 640 ? shown->w : 640) * shown->sc;
+@@ -3742,6 +3831,7 @@ static void scale_change(unsigned to)
+     }
+     s_rt = NULL;
+     s_rt_z = NULL;
++    interp_reset_surfaces();
+     s_resolve_gen++;
+     fprintf(stderr, "[VK] render scale %ux (%ux%u)\n", to, 640 * to, 480 * to);
+     s_scale = to;
+@@ -3774,6 +3864,7 @@ static void vk_flip(void)
+         if (s_tex[i].img.image && s_frame - s_tex[i].last_use > VK_TEX_IDLE_FLIPS) {
+             img_destroy_now(&s_tex[i].img);
+             s_tex[i] = s_tex[--s_ntex];
++            s_tex_ix_ok = 0;
+             i--;
+         }
+     if (s_verbose && s_frame % 300 == 0)
+@@ -3786,6 +3877,703 @@ static void vk_flip(void)
+                 atomic_load(&s_vprog_us) / 1000.0);
+ }
+ 
++/* ---- Frame interpolation -------------------------------------------- *
++ *
++ * The title draws 30 frames a second, and everything it does is paced to
++ * that; drawing more frames a second than it does meant running it faster,
++ * and part of it then ran at the wrong speed. Instead it keeps its 30, and
++ * nv2a_vk_set_interpolation(k) shows k frames for each of its own: the title's
++ * last two frames, A and B, blended.
++ *
++ * Each frame's clears and draws are recorded as they come, whole: the batch
++ * with everything it points to (render state, combiners, vertices or the
++ * vertex arrays' used range, indices, the vertex program and its constants).
++ * At B's flip each draw of A is matched to the same draw in B -- the same
++ * target, textures, vertex array, program and size, the n-th such draw of
++ * the frame -- and over the next 1/30 s A is drawn k times again, its vertex
++ * program constants (which hold every transform: camera, objects, bones)
++ * moved from A's toward B's by 0/k, 1/k ... (k-1)/k of the way, and B itself
++ * last. Pre-transformed draws with a partner of the same size have their
++ * vertices moved the same way. A frame where most draws have no partner or
++ * jump far (a camera cut, a new scene) is shown without blending.
++ *
++ * The shown frames are one of the title's frames late: A is on screen when
++ * B has just been drawn.
++ *
++ * These frames are drawn into surfaces of their own (s_surfs_replay), by the
++ * same draw path as the title's, and never go to guest memory: no write-backs,
++ * no guest uploads after a surface is made, no occlusion queries. They are
++ * drawn by the executor's thread when they are due (vk_tick), between the
++ * title's own commands, so the title's next frame goes on being drawn
++ * meanwhile. */
++
++#define REC_CONSTS (NV2A_VSH_CONSTANTS * 16)
++
++typedef struct {
++    uint8_t  kind;              /* 0 clear, 1 pre-transformed, 2 program */
++    uint8_t  blend;             /* constants close enough to blend */
++    uint16_t dlo, dhi;          /* the floats that differ from B's, dlo > dhi none */
++    uint32_t vsh;               /* its compiled vertex program, once ready */
++    Nv2aSurface ns;
++    Nv2aRenderState rs;
++    Nv2aCombiner rc;
++    uint32_t flags, argb, zs;   /* clear */
++    Nv2aFullBatch fb;           /* pre-transformed batch */
++    Nv2aProgramBatch pb;        /* program batch */
++    size_t   data;              /* vertices, or indices */
++    size_t   consts, prog;
++    size_t   attr[16];          /* element 0's offset, (size_t)-1 none */
++    uint64_t key, key2;         /* key2: without the textures (rec_keys) */
++    int      partner;           /* the same draw in B, -1 none */
++} Rec;
++
++typedef struct {
++    Rec     *r;
++    int      n, cap;
++    uint8_t *mem;
++    size_t   used, size;
++    size_t   last_consts, last_prog;
++    uint32_t last_ninst;
++    uint32_t shown_va;
++    int      cut;               /* as A of a pair: shown without blending */
++} RecFrame;
++
++static RecFrame s_recf[3];
++static int s_rec_cur, s_pair_a = -1, s_pair_b = -1, s_prev_done = -1;
++static int s_sub_done, s_in_tick, s_showed_b;
++/* RECOMP_VK_VERBOSE: per 300 frames drawn, how the blending went. */
++static unsigned s_is_frames, s_is_cuts, s_is_shown, s_is_skipped;
++static uint64_t s_is_draws, s_is_matched, s_is_blended, s_is_us;
++static uint64_t s_pair_t0, s_last_flip_us, s_period_us = 33333;
++static atomic_uint s_interp_req = 1;
++
++void nv2a_vk_set_interpolation(unsigned factor)
++{
++    if (factor < 1) factor = 1;
++    if (factor > 8) factor = 8;
++    atomic_store(&s_interp_req, factor);
++}
++
++static size_t rec_push(RecFrame *f, const void *src, size_t n)
++{
++    size_t at = (f->used + 15) & ~(size_t)15;
++    if (at + n > f->size) {
++        size_t sz = f->size ? f->size : ((size_t)8 << 20);
++        uint8_t *m;
++        while (at + n > sz)
++            sz *= 2;
++        m = (uint8_t *)realloc(f->mem, sz);
++        if (!m)
++            return (size_t)-1;
++        f->mem = m;
++        f->size = sz;
++    }
++    if (src)
++        memcpy(f->mem + at, src, n);
++    f->used = at + n;
++    return at;
++}
++
++static Rec *rec_new(RecFrame *f, int kind)
++{
++    Rec *r;
++    if (f->n == f->cap) {
++        int cap = f->cap ? f->cap * 2 : 1024;
++        Rec *n = (Rec *)realloc(f->r, (size_t)cap * sizeof *n);
++        if (!n)
++            return NULL;
++        f->r = n;
++        f->cap = cap;
++    }
++    r = &f->r[f->n++];
++    memset(r, 0, sizeof *r);
++    r->kind = (uint8_t)kind;
++    r->partner = -1;
++    return r;
++}
++
++static void rec_reset(RecFrame *f)
++{
++    f->n = 0;
++    f->used = 0;
++    f->last_consts = f->last_prog = (size_t)-1;
++    f->last_ninst = 0;
++    f->shown_va = 0;
++    f->cut = 0;
++}
++
++static uint64_t rec_mix(uint64_t h, uint64_t v)
++{
++    h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
++    return h * 0xFF51AFD7ED558CCDull;
++}
++
++/* An address as a draw's identity: the frame's back buffer as one token,
++ * since the title draws to and samples a different one each frame. */
++static uint64_t rec_addr(const RecFrame *f, uint32_t va)
++{
++    return va && va == f->shown_va ? 0xB0B0B0B0u : va;
++}
++
++static uint64_t rec_stage_key(const RecFrame *f, uint64_t h, const Nv2aFullBatch *b,
++                              const Nv2aCombiner *rc, int textures)
++{
++    int st;
++    for (st = 0; textures && st < 4; st++)
++        h = rec_mix(h, b->stage[st].valid ? rec_addr(f, b->stage[st].offset) : 0);
++    return rec_mix(h, rc->stage_program);
++}
++
++/* Which draw this is, for finding it again in the next frame: where it
++ * draws, from what textures, with what program and vertex layout, how many
++ * vertices. Not where its vertices are: much of a frame's geometry comes
++ * through D3D's ring of dynamic vertex buffers, at a new place every frame.
++ * Made once the frame is complete and its back buffer known. */
++static void rec_keys(RecFrame *f)
++{
++    int i, k;
++    for (i = 0; i < f->n; i++) {
++        Rec *r = &f->r[i];
++        uint64_t key = rec_mix(r->kind, rec_addr(f, r->ns.color_va));
++        if (r->kind == 0) {
++            key = rec_mix(key, r->flags);
++            r->key2 = key;
++        } else if (r->kind == 1) {
++            key = rec_mix(key, r->fb.count);
++            r->key2 = rec_stage_key(f, key, &r->fb, &r->rc, 0);
++            key = rec_stage_key(f, key, &r->fb, &r->rc, 1);
++        } else {
++            const uint32_t (*prog)[8] = (const uint32_t (*)[8])(f->mem + r->prog);
++            key = rec_mix(rec_mix(key, r->pb.count), r->pb.ninst);
++            for (k = 0; k < 16; k++)
++                key = rec_mix(key, r->attr[k] != (size_t)-1
++                              ? (uint64_t)r->pb.attr[k].stride << 16
++                                | r->pb.attr[k].type << 8 | r->pb.attr[k].size
++                              : 0);
++            key = rec_mix(key, prog[0][0] ^ ((uint64_t)prog[r->pb.ninst - 1][2] << 32));
++            r->key2 = rec_stage_key(f, key, &r->pb.pix, &r->rc, 0);
++            key = rec_stage_key(f, key, &r->pb.pix, &r->rc, 1);
++        }
++        r->key = key;
++    }
++}
++
++static int rec_on(void)
++{
++    return s_interp_k > 1 && !s_replay;
++}
++
++static void rec_clear(const Nv2aSurface *ns, const Nv2aRenderState *rs,
++                      uint32_t flags, uint32_t argb, uint32_t zs)
++{
++    RecFrame *f = &s_recf[s_rec_cur];
++    Rec *r = rec_new(f, 0);
++    if (!r)
++        return;
++    r->ns = *ns;
++    r->rs = *rs;
++    r->flags = flags;
++    r->argb = argb;
++    r->zs = zs;
++}
++
++static void rec_full(const Nv2aSurface *ns, const Nv2aFullBatch *b)
++{
++    RecFrame *f = &s_recf[s_rec_cur];
++    Rec *r = rec_new(f, 1);
++    if (!r)
++        return;
++    r->ns = *ns;
++    r->rs = *b->state;
++    r->rs.zpass_enable = 0;
++    if (b->rc)
++        r->rc = *b->rc;
++    r->fb = *b;
++    r->data = rec_push(f, b->vertices, (size_t)b->count * sizeof(Nv2aFullVertex));
++    if (r->data == (size_t)-1) {
++        f->n--;
++        return;
++    }
++}
++
++static void rec_prog(const Nv2aSurface *ns, const Nv2aProgramBatch *b)
++{
++    RecFrame *f = &s_recf[s_rec_cur];
++    Rec *r;
++    int order[16], na = 0, i, j;
++    uint32_t nv = b->max_index - b->min_index + 1;
++    size_t gbase[16];
++    const uint8_t *gptr[16];
++    uint32_t gstride[16], gend[16];
++    int ng = 0;
++
++    if (!b->count || !b->ninst || b->ninst > NV2A_VSH_SLOTS_VK)
++        return;
++    r = rec_new(f, 2);
++    if (!r)
++        return;
++    r->ns = *ns;
++    r->rs = *b->pix.state;
++    r->rs.zpass_enable = 0;
++    if (b->pix.rc)
++        r->rc = *b->pix.rc;
++    r->pb = *b;
++    r->data = rec_push(f, b->indices, (size_t)b->count * 4);
++    /* Constants and program: kept once while they repeat draw to draw. */
++    if (f->last_consts != (size_t)-1
++        && !memcmp(f->mem + f->last_consts, b->constants, REC_CONSTS))
++        r->consts = f->last_consts;
++    else
++        r->consts = f->last_consts = rec_push(f, b->constants, REC_CONSTS);
++    if (f->last_prog != (size_t)-1 && f->last_ninst == b->ninst
++        && !memcmp(f->mem + f->last_prog, b->program, (size_t)b->ninst * 32))
++        r->prog = f->last_prog;
++    else {
++        r->prog = f->last_prog = rec_push(f, b->program, (size_t)b->ninst * 32);
++        f->last_ninst = b->ninst;
++    }
++    /* The arrays' used range, an interleaved group of attributes once, as
++     * vk_draw_program groups them. */
++    for (i = 0; i < 16; i++) {
++        r->attr[i] = (size_t)-1;
++        if (b->attr[i].data)
++            order[na++] = i;
++    }
++    for (i = 1; i < na; i++)
++        for (j = i; j > 0 && b->attr[order[j]].data < b->attr[order[j - 1]].data; j--) {
++            int t = order[j]; order[j] = order[j - 1]; order[j - 1] = t;
++        }
++    for (i = 0; i < na; i++) {
++        const Nv2aAttrib *a = &b->attr[order[i]];
++        uint32_t end = (uint32_t)((uint64_t)(nv - 1) * a->stride + a->bytes);
++        if (ng && gstride[ng - 1] == a->stride
++            && a->data - gptr[ng - 1] < (ptrdiff_t)a->stride) {
++            uint32_t rel = (uint32_t)(a->data - gptr[ng - 1]) + end;
++            if (rel > gend[ng - 1]) gend[ng - 1] = rel;
++            continue;
++        }
++        gptr[ng] = a->data;
++        gstride[ng] = a->stride;
++        gend[ng] = end;
++        ng++;
++    }
++    for (i = 0; i < ng; i++)
++        gbase[i] = rec_push(f, gptr[i] + (size_t)b->min_index * gstride[i], gend[i]);
++    for (i = 0; i < na; i++) {
++        const Nv2aAttrib *a = &b->attr[order[i]];
++        for (j = 0; j < ng; j++)
++            if (gstride[j] == a->stride && a->data >= gptr[j]
++                && a->data - gptr[j] < (ptrdiff_t)(a->stride ? a->stride : 1))
++                break;
++        if (j < ng && gbase[j] != (size_t)-1)
++            r->attr[order[i]] = gbase[j] + (size_t)(a->data - gptr[j]);
++    }
++    if (r->data == (size_t)-1 || r->consts == (size_t)-1 || r->prog == (size_t)-1) {
++        f->n--;
++        return;
++    }
++}
++
++/* Keys made unique by their order among equal ones: the n-th draw of a kind. */
++static int rec_cmp(const void *x, const void *y)
++{
++    uint64_t a = ((const uint64_t *)x)[0], b = ((const uint64_t *)y)[0];
++    return a < b ? -1 : a > b;
++}
++
++/* (key, draw) for the draws not in `skip`, sorted; *pn how many. With
++ * loose, the key without textures. */
++static uint64_t *rec_index(const RecFrame *f, int loose, const uint8_t *skip, int *pn)
++{
++    uint64_t *ix = (uint64_t *)malloc((size_t)(f->n ? f->n : 1) * 16);
++    int i, j, n = 0;
++    if (!ix)
++        return NULL;
++    for (i = 0; i < f->n; i++) {
++        if (skip && skip[i])
++            continue;
++        ix[2 * n] = loose ? f->r[i].key2 : f->r[i].key;
++        ix[2 * n + 1] = (uint64_t)i;
++        n++;
++    }
++    *pn = n;
++    qsort(ix, (size_t)n, 16, rec_cmp);
++    /* Within a run of equal keys, frame order: make each unique. */
++    for (i = 0; i < n; ) {
++        for (j = i; j < n && ix[2 * j] == ix[2 * i]; j++) ;
++        if (j - i > 1) {
++            int a, b;
++            for (a = i + 1; a < j; a++)          /* stable by index */
++                for (b = a; b > i && ix[2 * b + 1] < ix[2 * (b - 1) + 1]; b--) {
++                    uint64_t t = ix[2 * b + 1];
++                    ix[2 * b + 1] = ix[2 * (b - 1) + 1];
++                    ix[2 * (b - 1) + 1] = t;
++                }
++            for (a = i; a < j; a++)
++                ix[2 * a] = rec_mix(ix[2 * a], (uint64_t)(a - i));
++        }
++        i = j;
++    }
++    qsort(ix, (size_t)n, 16, rec_cmp);
++    return ix;
++}
++
++/* How far a matched program draw's constants moved, 0 none, 1 everything. */
++static float rec_moved(const float *a, const float *b)
++{
++    double d = 0, m = 0;
++    int i;
++    for (i = 0; i < NV2A_VSH_CONSTANTS * 4; i++) {
++        if (a[i] != a[i] || b[i] != b[i])
++            continue;
++        d += fabs((double)b[i] - a[i]);
++        m += fabs((double)a[i]) + fabs((double)b[i]);
++    }
++    return m > 0 ? (float)(d / m) : 0.0f;
++}
++
++/* Pair A's draws with B's by key: first whole, then for what is left
++ * without the textures -- a cutscene can swap a draw's lighting texture
++ * between two copies frame by frame. */
++static void rec_match(RecFrame *A, RecFrame *B)
++{
++    uint8_t *ua = (uint8_t *)calloc((size_t)A->n + 1, 1);
++    uint8_t *ub = (uint8_t *)calloc((size_t)B->n + 1, 1);
++    int i, pass, progs = 0, matched = 0, moved_far = 0;
++
++    for (i = 0; i < A->n; i++)
++        A->r[i].partner = -1;
++    for (pass = 0; pass < 2 && ua && ub; pass++) {
++        int na = 0, nb = 0, x = 0, y = 0;
++        uint64_t *ia = rec_index(A, pass, ua, &na), *ib = rec_index(B, pass, ub, &nb);
++        while (ia && ib && x < na && y < nb) {
++            if (ia[2 * x] < ib[2 * y]) x++;
++            else if (ia[2 * x] > ib[2 * y]) y++;
++            else {
++                int a = (int)ia[2 * x + 1], b = (int)ib[2 * y + 1];
++                if (A->r[a].kind == B->r[b].kind) {
++                    A->r[a].partner = b;
++                    ua[a] = ub[b] = 1;
++                }
++                x++; y++;
++            }
++        }
++        free(ia);
++        free(ib);
++    }
++    free(ua);
++    free(ub);
++    for (i = 0; i < A->n; i++) {
++        Rec *ra = &A->r[i];
++        ra->blend = 0;
++        if (ra->kind != 2)
++            continue;
++        progs++;
++        if (ra->partner < 0)
++            continue;
++        matched++;
++        {
++            const Rec *rb = &B->r[ra->partner];
++            const float *ca = (const float *)(A->mem + ra->consts);
++            const float *cb = (const float *)(B->mem + rb->consts);
++            float mv = rec_moved(ca, cb);
++            int k, lo = -1, hi = -2;
++            for (k = 0; k < NV2A_VSH_CONSTANTS * 4; k++)
++                if (ca[k] != cb[k]) {
++                    if (lo < 0) lo = k;
++                    hi = k;
++                }
++            ra->dlo = (uint16_t)(lo < 0 ? 1 : lo);
++            ra->dhi = (uint16_t)(lo < 0 ? 0 : hi);
++            ra->blend = mv < 0.5f;
++            if (mv > 0.25f)
++                moved_far++;
++        }
++    }
++    /* A cut: most of A gone from B, or most of it moved far. */
++    A->cut = progs > 8 && (matched * 2 < progs || moved_far * 2 > matched);
++    s_is_frames++;
++    s_is_cuts += A->cut;
++    s_is_draws += (uint64_t)progs;
++    s_is_matched += (uint64_t)matched;
++    for (i = 0; i < A->n; i++)
++        s_is_blended += A->r[i].kind == 2 && A->r[i].blend && A->r[i].partner >= 0;
++    if (s_verbose && s_is_frames % 300 == 0) {
++        fprintf(stderr, "[VK] interpolation: %u frames, %u cuts; program draws %.0f%% matched,"
++                        " %.0f%% blended; %u in-between frames shown (%.1f ms each), %u skipped\n",
++                s_is_frames, s_is_cuts, s_is_draws ? 100.0 * s_is_matched / s_is_draws : 0.0,
++                s_is_draws ? 100.0 * s_is_blended / s_is_draws : 0.0, s_is_shown,
++                s_is_shown ? s_is_us / 1000.0 / s_is_shown : 0.0, s_is_skipped);
++        s_is_cuts = s_is_shown = s_is_skipped = 0;
++        s_is_draws = s_is_matched = s_is_blended = s_is_us = 0;
++    }
++}
++
++static float *s_lerp_buf;
++static size_t s_lerp_cap;
++
++static void *lerp_space(size_t bytes)
++{
++    if (bytes > s_lerp_cap) {
++        float *n = (float *)realloc(s_lerp_buf, bytes);
++        if (!n)
++            return NULL;
++        s_lerp_buf = n;
++        s_lerp_cap = bytes;
++    }
++    return s_lerp_buf;
++}
++
++/* Draw frame A again, t of the way toward B (B NULL or t 0: A as it was). */
++static void rec_replay(RecFrame *A, const RecFrame *B, float t)
++{
++    float kc[NV2A_VSH_CONSTANTS * 4];
++    int i, k;
++
++    for (i = 0; i < A->n; i++) {
++        Rec *r = &A->r[i];
++        const Rec *p = (B && t > 0.0f && !A->cut && r->partner >= 0)
++                     ? &B->r[r->partner] : NULL;
++        if (r->kind == 0) {
++            vk_clear(&r->ns, &r->rs, r->flags, r->argb, r->zs);
++        } else if (r->kind == 1) {
++            Nv2aFullBatch b = r->fb;
++            const Nv2aFullVertex *v = (const Nv2aFullVertex *)(A->mem + r->data);
++            b.state = &r->rs;
++            b.rc = &r->rc;
++            b.vertices = v;
++            if (p && p->fb.count == r->fb.count) {
++                const Nv2aFullVertex *w = (const Nv2aFullVertex *)(B->mem + p->data);
++                Nv2aFullVertex *o = (Nv2aFullVertex *)lerp_space((size_t)b.count * sizeof *o);
++                uint32_t n;
++                if (o) {
++                    memcpy(o, v, (size_t)b.count * sizeof *o);
++                    for (n = 0; n < b.count; n++)
++                        for (k = 0; k < 4; k++)
++                            o[n].pos[k] += (w[n].pos[k] - v[n].pos[k]) * t;
++                    b.vertices = o;
++                }
++            }
++            vk_draw_full(&r->ns, &b);
++        } else {
++            Nv2aProgramBatch b = r->pb;
++            const float *ca = (const float *)(A->mem + r->consts);
++            b.pix.state = &r->rs;
++            b.pix.rc = &r->rc;
++            b.indices = (const uint32_t *)(A->mem + r->data);
++            b.program = (const uint32_t (*)[8])(A->mem + r->prog);
++            b.constants = (const float (*)[4])ca;
++            if (p && r->blend && r->dlo <= r->dhi) {
++                const float *cb = (const float *)(B->mem + p->consts);
++                memcpy(kc, ca, sizeof kc);
++                for (k = r->dlo; k <= r->dhi; k++)
++                    if (ca[k] == ca[k] && cb[k] == cb[k])
++                        kc[k] = ca[k] + (cb[k] - ca[k]) * t;
++                b.constants = (const float (*)[4])kc;
++            }
++            for (k = 0; k < 16; k++)
++                if (r->attr[k] != (size_t)-1)
++                    b.attr[k].data = (const uint8_t *)((uintptr_t)(A->mem + r->attr[k])
++                                     - (uintptr_t)b.min_index * b.attr[k].stride);
++                else
++                    b.attr[k].data = NULL;
++            s_vsh_force = r->vsh;
++            vk_draw_program(&r->ns, &b);
++            s_vsh_force = 0;
++            if (!r->vsh && s_vsh_last >= 2)
++                r->vsh = s_vsh_last;
++        }
++    }
++}
++
++/* The in-between frame's surface for `va` into the window. */
++static void replay_present(uint32_t va)
++{
++    extern void xbox_FramebufferWindowPresentPixels(uint32_t, const void *, uint32_t,
++                                                    uint32_t, uint32_t, uint32_t);
++    Surf *shown = NULL;
++    uint32_t pw, ph;
++    int i;
++
++    for (i = 0; i < VK_MAX_SURFACES; i++) {
++        Surf *s = &s_surfs[i];
++        if (s->color.image && s->va == va && (!shown || s->last_use > shown->last_use))
++            shown = s;
++    }
++    if (!shown)
++        return;
++    pw = (shown->w < 640 ? shown->w : 640) * shown->sc;
++    ph = (shown->h < 480 ? shown->h : 480) * shown->sc;
++    if (!pres_reserve((VkDeviceSize)pw * ph * shown->bpp))
++        return;
++    {
++        VkBufferImageCopy r = copy_region(pw, ph, 1, 0, VK_IMAGE_ASPECT_COLOR_BIT);
++        end_rendering();
++        barrier_all();
++        vkCmdCopyImageToBuffer(cmd(), shown->color.image, VK_IMAGE_LAYOUT_GENERAL,
++                               s_pres.buf, 1, &r);
++        barrier_all();
++    }
++    flush();
++    xbox_FramebufferWindowPresentPixels(va, s_pres.map, pw, ph, pw * shown->bpp,
++                                        shown->bpp);
++}
++
++/* Draw and show an in-between frame: A toward B by t, or B as it is. */
++static void replay_frame(RecFrame *A, const RecFrame *B, float t)
++{
++    uint32_t target = s_draw_target_va, va = A->shown_va;
++
++    if (!va)
++        return;
++    end_rendering();
++    s_rt = NULL;
++    s_rt_z = NULL;
++    s_surfs = s_surfs_replay;
++    s_zetas = s_zetas_replay;
++    s_replay = 1;
++    rec_replay(A, B, t);
++    end_rendering();
++    replay_present(va);
++    end_rendering();
++    s_rt = NULL;
++    s_rt_z = NULL;
++    s_replay = 0;
++    s_surfs = s_surfs_title;
++    s_zetas = s_zetas_title;
++    s_draw_target_va = target;
++}
++
++/* Due in-between frames: the latest one that is due, the ones before it
++ * skipped (the executor was busy). */
++static void vk_tick(void)
++{
++    uint64_t now;
++    int k;
++
++    if (s_in_tick || s_replay || s_interp_k <= 1 || s_pair_a < 0)
++        return;
++    now = now_us();
++    k = (int)((now - s_pair_t0) * s_interp_k / s_period_us);
++    if (k > (int)s_interp_k)
++        k = (int)s_interp_k;
++    if (k < s_sub_done)
++        return;
++    s_is_skipped += (unsigned)(k - s_sub_done);
++    s_in_tick = 1;
++    /* B itself only when the title's next frame is late: A of the next pair
++     * is B, and its first frame would show it twice. */
++    if (k == (int)s_interp_k) {
++        replay_frame(&s_recf[s_pair_b], NULL, 0.0f);
++        s_showed_b = 1;
++    } else {
++        replay_frame(&s_recf[s_pair_a], &s_recf[s_pair_b], (float)k / (float)s_interp_k);
++    }
++    s_sub_done = k + 1;
++    s_is_shown++;
++    s_is_us += now_us() - now;
++    s_in_tick = 0;
++}
++
++/* The title's flip: the frame recorded since the last one is complete. */
++static void interp_flip(void)
++{
++    unsigned req = atomic_load(&s_interp_req);
++    uint64_t now = now_us();
++    int done, next;
++
++    if (req != s_interp_k) {
++        s_interp_k = req;
++        s_pair_a = s_pair_b = s_prev_done = -1;
++        rec_reset(&s_recf[0]);
++        rec_reset(&s_recf[1]);
++        rec_reset(&s_recf[2]);
++        s_rec_cur = 0;
++        fprintf(stderr, "[VK] %u frames shown per frame drawn\n", s_interp_k);
++        return;
++    }
++    if (s_interp_k <= 1)
++        return;
++    if (s_last_flip_us) {
++        uint64_t d = now - s_last_flip_us;
++        if (d < 16667) d = 16667;
++        if (d > 66667) d = 66667;
++        s_period_us = (s_period_us * 3 + d) / 4;
++    }
++    s_last_flip_us = now;
++    done = s_rec_cur;
++    rec_keys(&s_recf[done]);
++    if (s_prev_done >= 0 && s_recf[s_prev_done].shown_va && s_recf[done].shown_va) {
++        rec_match(&s_recf[s_prev_done], &s_recf[done]);
++        s_pair_a = s_prev_done;
++        s_pair_b = done;
++        s_pair_t0 = now;
++        s_sub_done = s_showed_b;   /* B was shown: start one frame on */
++        s_showed_b = 0;
++    }
++    s_prev_done = done;
++    for (next = 0; next < 3 && (next == s_pair_a || next == s_pair_b || next == done); next++) ;
++    if (next == 3)
++        next = (done + 1) % 3;
++    s_rec_cur = next;
++    rec_reset(&s_recf[s_rec_cur]);
++}
++
++static void vk_clear_rec(const Nv2aSurface *ns, const Nv2aRenderState *rs,
++                         uint32_t flags, uint32_t argb, uint32_t zs)
++{
++    vk_tick();
++    if (rec_on())
++        rec_clear(ns, rs, flags, argb, zs);
++    vk_clear(ns, rs, flags, argb, zs);
++}
++
++static void vk_draw_full_rec(const Nv2aSurface *ns, const Nv2aFullBatch *b)
++{
++    vk_tick();
++    if (rec_on())
++        rec_full(ns, b);
++    vk_draw_full(ns, b);
++}
++
++static void vk_draw_program_rec(const Nv2aSurface *ns, const Nv2aProgramBatch *b)
++{
++    vk_tick();
++    if (rec_on())
++        rec_prog(ns, b);
++    vk_draw_program(ns, b);
++}
++
++static void interp_shown(uint32_t va)
++{
++    if (s_interp_k > 1)
++        s_recf[s_rec_cur].shown_va = va;
++}
++
++static void vk_flip_rec(void)
++{
++    vk_flip();
++    interp_flip();
++    vk_tick();
++}
++
++/* At a new render scale the in-between frames' surfaces go too. */
++static void interp_reset_surfaces(void)
++{
++    int i;
++    for (i = 0; i < VK_MAX_SURFACES; i++) {
++        img_retire(&s_surfs_replay[i].color);
++        img_retire(&s_surfs_replay[i].lo);
++        memset(&s_surfs_replay[i], 0, sizeof s_surfs_replay[i]);
++    }
++    for (i = 0; i < VK_MAX_ZETAS; i++) {
++        zeta_views_retire(&s_zetas_replay[i]);
++        img_retire(&s_zetas_replay[i].depth);
++        img_retire(&s_zetas_replay[i].lo);
++        memset(&s_zetas_replay[i], 0, sizeof s_zetas_replay[i]);
++    }
++}
++
+ /* The executor's own draw() is never used: draw_full is set. */
+ static void vk_draw_unused(const Nv2aSurface *s, const Nv2aBatch *b)
+ {
+@@ -3794,9 +4582,9 @@ static void vk_draw_unused(const Nv2aSurface *s, const Nv2aBatch *b)
+ }
+ 
+ static Nv2aBackend s_backend = {
+-    vk_clear, vk_draw_unused, vk_flip,
+-    vk_draw_full, vk_report_clear, vk_report_mark, vk_report_value, vk_resolve,
+-    vk_draw_program,
++    vk_clear_rec, vk_draw_unused, vk_flip_rec,
++    vk_draw_full_rec, vk_report_clear, vk_report_mark, vk_report_value, vk_resolve,
++    vk_draw_program_rec, vk_tick,
+ };
+ 
+ /* ---- Set-up --------------------------------------------------------- */
+diff --git a/src/vulkan/nv2a_vk.h b/src/vulkan/nv2a_vk.h
+index 460e449..7f1c665 100644
+--- a/src/vulkan/nv2a_vk.h
++++ b/src/vulkan/nv2a_vk.h
+@@ -50,6 +50,11 @@ int nv2a_vk_install(void);
+  * and the framebuffer window is handed the frame at the larger size. Takes
+  * effect at the next flip. RECOMP_VK_SCALE sets it at start. */
+ void nv2a_vk_set_render_scale(unsigned scale);
++/* Frames shown per frame the title draws, 1 to 8 (2 at 30 fps is 60): the
++ * ones in between are the title's last two frames blended, each object moved
++ * part of the way from where it was to where it is (nv2a_vk.c, "Frame
++ * interpolation"). 1 shows the title's frames as they are. */
++void nv2a_vk_set_interpolation(unsigned factor);
+ 
+ /* Pipelines to build at start beside the list's (nv2a_vk.c): set before
+  * nv2a_vk_install; the data stays the caller's. */

@@ -38,7 +38,7 @@ copy of your saves.
 | Windows x86-64 | ✅ Tested on Windows and under Proton/Wine; released as a zip |
 | macOS | 🟡 Supported by the runtime, not yet built for this project |
 | Game | ✅ Single-player playable from a new game through the first chapters; later chapters are little tested; multiplayer and Xbox Live are not supported |
-| Graphics | ✅ Vulkan: everything is drawn on the GPU, including the game's vertex programs; render resolution 1X to 10X, 30/60/90/120 fps, widescreen |
+| Graphics | ✅ Vulkan: everything is drawn on the GPU, including the game's vertex programs; render resolution 1X to 10X, 30 to 240 fps, widescreen, MSAA, SMAA, FSR 1 |
 | Videos, sound, saves, controller | ✅ Working |
 | Languages | ✅ English, Spanish, French, German, Italian and Japanese menus and subtitles; voices stay in English |
 | Metal renderer | 🔴 Not started |
@@ -56,11 +56,10 @@ copy of your saves.
    folder is used where it is and remembered. Only the USA version, the one
    the code was recompiled from, is accepted.
 
-   Then a chalkboard page offers every Recomp Option (by pad, keyboard or
-   mouse; fitted to your screen and language to begin with), and from then
-   on a glass fills while the shaders build before the game. The first time
-   can take a few minutes, then seconds. You can change the options later
-   in the game's Options menu.
+   Then, at every start, the launcher shows the options on a chalkboard
+   (see [Launcher](#launcher)); **Start the game** goes on, and a glass
+   fills while the shaders build before the game. The first time can take a
+   few minutes, then seconds.
 3. A game folder or image can also be given as the first argument or in
    `CONKER_GAME_DIR`, which skips the window.
 
@@ -80,6 +79,24 @@ and run `conker_recomp.exe`. The first time, it asks for your copy of the
 game, as above. It needs 64-bit Windows 10 or later and a Vulkan 1.3 driver.
 Everything is kept in `%LOCALAPPDATA%\ConkerRecomp`.
 
+### Launcher
+
+Every start begins with the launcher: the options in four tabs, usable by
+controller, keyboard or mouse. LB and RB (Q/E, Page Up/Down, Tab) change
+tab, up and down choose, left and right change, A or Enter confirms, B or
+Esc goes to the buttons at the bottom, and Start starts the game. The window
+is the game's: it takes the monitor, display mode and resolution as they are
+chosen, and the game keeps it. Quit leaves without saving. The first time
+it is fitted to your screen and language; after that it shows what you chose
+last. `CONKER_SKIP_LAUNCHER=1` starts the game directly.
+
+| Tab | Settings |
+|---|---|
+| Graphics | Monitor, and the display and image settings of Recomp Options below |
+| Audio & Language | Language; Audio Device (the system's default or a chosen output); Master Volume (0-100%; music, effects and speech have their own volumes in the game's Options) |
+| Mods | Uncensor, Weapon, Swing Button, Intro Fix, Allow Skip Cutscenes; every other mod in the mods folder (`~/.local/share/conker-recomp/mods`), each on or off; Mods Folder opens it |
+| Controller | The controller of player 1 and player 2 (split-screen): Auto, a connected controller, or none (player 1 then uses the keyboard). Buttons: any Xbox button can be moved to another control of the pad, per player; A on a row and then a press on the pad sets it |
+
 ### Recomp Options
 
 In the main menu, **Options** has a third entry under Vibration and Invert
@@ -94,8 +111,14 @@ change it; B goes back. Changes apply immediately and are saved in
 | Aspect Ratio | 4:3, 16:9, 16:10, 21:9, 32:9 (Hor+: wider, not stretched; videos keep 4:3 with black bars) | 4:3 |
 | Resolution | The sizes of the chosen aspect ratio: the monitor's modes and, except in Fullscreen, the usual sizes that fit the desktop | The window's default |
 | Render Resolution | Original (1X) to 10X | 1X |
+| Upscaling | Off, FSR 1: AMD FidelityFX Super Resolution 1 scales the picture up to the window's size and sharpens it, when Render Resolution is below the window | Off |
+| MSAA | Off, 2X, 4X, 8X: smooths the edges of everything drawn | Off |
+| SMAA | Off, On: smooths the edges of the finished picture, at little cost; works with MSAA | Off |
+| Anisotropic Filtering | Off, 2X to 16X: keeps floors and roads sharp at an angle | Off |
+| Texture Detail | Normal, High, Very High: finer versions of distant textures (may shimmer) | Normal |
+| Model Detail | Normal, High, Very High, Max: characters keep their detailed models 2x, 4x farther away, or at any distance | Normal |
 | VSync | On, Off | On |
-| FPS Limit | 30, 60, 90, 120 (the game times its own frames, so it runs at the right speed above 30) | 30 |
+| Frame Rate | 30 to 240 in steps of 30: the game always runs at its own 30, and the frames in between are drawn blended between two of its frames | 30 |
 | Allow Skip Cutscenes | Yes: holding LT for a second skips any cutscene, even one not seen before (scenes the game never lets you skip, such as the intro, stay as they are) | No |
 | Swing Button | X: see below | Off |
 | Weapon | Bat, Frying Pan: see below | Bat |
@@ -262,11 +285,13 @@ Technical notes and the plan for each platform:
 This repository contains no ISO, `default.xbe`, assets or saves from the
 game; you must provide your own legally owned copy. The project is
 experimental and is not affiliated with Microsoft, Rare or Xbox. The art and
-lettering of the first-run page are drawn by its code, not taken from the
+lettering of the launcher are drawn by its code, not taken from the
 game. `data/pipeline_seed.bin` holds GPU settings only; the game's vertex
 programs are left out (`tools/make_pipeline_seed.py`).
 xboxrecomp includes code derived from xemu under the LGPL-2.1+; see
-`external/xboxrecomp/NOTICE`.
+`external/xboxrecomp/NOTICE`. The toolkit patches add SMAA (Jorge Jimenez
+et al.) and AMD FidelityFX FSR 1, both under the MIT license, with their
+license files in `src/vulkan/shaders/third_party/`.
 
 ---
 
@@ -298,7 +323,7 @@ guarda una copia de tus partidas.
 | Windows x86-64 | ✅ Probado en Windows y con Proton/Wine; se publica como zip |
 | macOS | 🟡 Soportado por el runtime, aún sin compilar para este proyecto |
 | Juego | ✅ El modo de un jugador se puede jugar desde una partida nueva durante los primeros capítulos; los siguientes están poco probados; el multijugador y Xbox Live no funcionan |
-| Gráficos | ✅ Vulkan: todo se dibuja en la GPU, también los vertex programs del juego; resolución de render de 1X a 10X, 30/60/90/120 fps, pantalla panorámica |
+| Gráficos | ✅ Vulkan: todo se dibuja en la GPU, también los vertex programs del juego; resolución de render de 1X a 10X, de 30 a 240 fps, pantalla panorámica, MSAA, SMAA, FSR 1 |
 | Vídeos, sonido, partidas, mando | ✅ Funcionan |
 | Idiomas | ✅ Menús y subtítulos en inglés, español, francés, alemán, italiano y japonés; las voces siguen en inglés |
 | Renderizador Metal | 🔴 Sin empezar |
@@ -316,11 +341,10 @@ guarda una copia de tus partidas.
    `~/.local/share/conker-recomp/game`; una carpeta se usa donde está y se
    recuerda. Solo se acepta la versión USA, la que se recompiló.
 
-   Después, una pizarra ofrece todas las Recomp Options (con mando, teclado o
-   ratón; de entrada ajustadas a tu pantalla e idioma), y desde entonces un
-   vaso se llena mientras se compilan los shaders antes del juego. La primera
-   vez puede tardar unos minutos; luego, segundos. Las opciones se pueden cambiar
-   más tarde en el menú Opciones del juego.
+   Después, en cada arranque, el lanzador muestra las opciones en una pizarra
+   (ver [Lanzador](#lanzador)); **Empezar el juego** sigue adelante, y un vaso
+   se llena mientras se compilan los shaders antes del juego. La primera vez
+   puede tardar unos minutos; luego, segundos.
 3. La carpeta o imagen del juego también se puede pasar como primer
    argumento o en `CONKER_GAME_DIR`, y entonces no aparece la ventana.
 
@@ -340,6 +364,24 @@ y abre `conker_recomp.exe`. La primera vez pide tu copia del juego, como
 arriba. Necesita Windows 10 o posterior de 64 bits y un driver Vulkan 1.3. Todo
 se guarda en `%LOCALAPPDATA%\ConkerRecomp`.
 
+### Lanzador
+
+Cada arranque empieza en el lanzador: las opciones en cuatro pestañas, que
+se usan con mando, teclado o ratón. LB y RB (Q/E, RePág/AvPág, Tab) cambian
+de pestaña, arriba y abajo eligen, izquierda y derecha cambian, A o Intro
+confirma, B o Esc lleva a los botones de abajo y Start empieza el juego. La
+ventana es la del juego: toma el monitor, el modo de pantalla y la resolución
+según se eligen, y el juego la conserva. Salir cierra sin guardar. La primera
+vez se ajusta a tu pantalla e idioma; después muestra lo último que elegiste.
+`CONKER_SKIP_LAUNCHER=1` arranca el juego directamente.
+
+| Pestaña | Ajustes |
+|---|---|
+| Gráficos | Monitor, y los ajustes de pantalla e imagen de las Recomp Options de abajo |
+| Audio e idioma | Idioma; Dispositivo de audio (el predeterminado del sistema o una salida elegida); Volumen general (0-100 %; música, efectos y voces tienen su propio volumen en las Opciones del juego) |
+| Mods | Uncensor, Weapon, Swing Button, Intro Fix, Allow Skip Cutscenes; cualquier otro mod de la carpeta de mods (`~/.local/share/conker-recomp/mods`), cada uno activado o no; Carpeta de mods la abre |
+| Mando | El mando del jugador 1 y del jugador 2 (pantalla partida): Auto, un mando conectado o ninguno (el jugador 1 usa entonces el teclado). Botones: cualquier botón de Xbox se puede pasar a otro control del mando, por jugador; A en una fila y luego pulsar en el mando lo asigna |
+
 ### Recomp Options
 
 En el menú principal, **Options** tiene una tercera entrada bajo Vibration
@@ -355,8 +397,14 @@ momento y se guardan en `~/.config/conker-recomp/settings.cfg`
 | Aspect Ratio | 4:3, 16:9, 16:10, 21:9, 32:9 (Hor+: más ancho, sin deformar; los vídeos conservan el 4:3 con barras negras) | 4:3 |
 | Resolution | Los tamaños de la relación de aspecto elegida: los modos del monitor y, salvo en Fullscreen, los tamaños habituales que caben en el escritorio | La de la ventana por defecto |
 | Render Resolution | Original (1X) a 10X | 1X |
+| Upscaling | Off, FSR 1: AMD FidelityFX Super Resolution 1 escala la imagen al tamaño de la ventana y la enfoca, cuando Render Resolution es menor que la ventana | Off |
+| MSAA | Off, 2X, 4X, 8X: suaviza los bordes de todo lo dibujado | Off |
+| SMAA | Off, On: suaviza los bordes de la imagen final con poco coste; combina con MSAA | Off |
+| Anisotropic Filtering | Off, 2X a 16X: mantiene nítidos suelos y caminos vistos en ángulo | Off |
+| Texture Detail | Normal, High, Very High: versiones más finas de las texturas lejanas (pueden parpadear) | Normal |
+| Model Detail | Normal, High, Very High, Max: los personajes conservan sus modelos detallados 2 o 4 veces más lejos, o a cualquier distancia | Normal |
 | VSync | On, Off | On |
-| FPS Limit | 30, 60, 90, 120 (el juego mide su propio tiempo por fotograma, así que por encima de 30 va a la velocidad correcta) | 30 |
+| Frame Rate | 30 a 240 de 30 en 30: el juego siempre va a sus 30, y los fotogramas intermedios se dibujan mezclando dos de los suyos | 30 |
 | Allow Skip Cutscenes | Yes: mantener LT un segundo salta cualquier escena, aunque no se haya visto antes (las que el juego nunca deja saltar, como las de la introducción, siguen igual) | No |
 | Swing Button | X: ver abajo | Off |
 | Weapon | Bat, Frying Pan: ver abajo | Bat |
@@ -524,7 +572,10 @@ Notas técnicas y el plan para cada plataforma:
 Este repositorio no incluye la ISO, `default.xbe`, assets ni partidas del
 juego; debes aportar tu propia copia legal. El proyecto es experimental y
 no está afiliado con Microsoft, Rare ni Xbox. El arte y las letras de la
-página del primer arranque los dibuja su código, no vienen del juego.
+lanzador los dibuja su código, no vienen del juego.
 `data/pipeline_seed.bin` solo contiene ajustes de la GPU; los programas de
 vértices del juego quedan fuera (`tools/make_pipeline_seed.py`). xboxrecomp incluye código
-derivado de xemu bajo LGPL-2.1+; ver `external/xboxrecomp/NOTICE`.
+derivado de xemu bajo LGPL-2.1+; ver `external/xboxrecomp/NOTICE`. Los
+parches del toolkit añaden SMAA (Jorge Jimenez y otros) y AMD FidelityFX
+FSR 1, ambos con licencia MIT, con sus licencias en
+`src/vulkan/shaders/third_party/`.

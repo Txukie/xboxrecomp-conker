@@ -1,0 +1,38 @@
+diff --git a/src/apu/apu_wav.h b/src/apu/apu_wav.h
+--- a/src/apu/apu_wav.h
++++ b/src/apu/apu_wav.h
+@@ -45,4 +45,9 @@
+ 
+ int  apu_wav_is_open(void);
+ 
++/* Optional: a project sets this to receive each period the device is given
++ * (stereo s16, `frames` sample pairs), on the APU's frame thread, as the WAV
++ * tap gets it -- to record or check the sound itself. NULL by default. */
++extern void (*g_apu_output_tap)(const int16_t *stereo, int frames);
++
+ #endif /* APU_WAV_H */
+diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
+--- a/src/apu/apu_core.c
++++ b/src/apu/apu_core.c
+@@ -504,6 +504,8 @@
+ 
+ static WaveOutState g_waveout = { 0 };
+ 
++void (*g_apu_output_tap)(const int16_t *stereo, int frames) = NULL;
++
+ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
+ {
+     (void)errp;
+@@ -911,8 +913,11 @@
+ 
+     /* A period dropped while pacing is stalled never reaches the device,
+      * so it stays out of the dump too. */
+-    if (!(xa2_is_active() && d->pace_stalled))
++    if (!(xa2_is_active() && d->pace_stalled)) {
+         apu_wav_write((const int16_t *)period, MIXER_FRAME_SAMPLES);
++        if (g_apu_output_tap)
++            g_apu_output_tap((const int16_t *)period, MIXER_FRAME_SAMPLES);
++    }
+ 
+     if (xa2_is_active()) {
+         if (!d->pace_stalled) {

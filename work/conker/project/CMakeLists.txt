@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 # The release version: the AppImage is named after it, and the executable
 # prints it.
-project(conker_recomp VERSION 0.5.0 LANGUAGES C)
+project(conker_recomp VERSION 0.6.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -102,6 +102,13 @@ if(EXISTS "${_dispatch}")
     endif()
 endif()
 option(CONKER_BUILD_GAME "Build the conker_recomp executable" ON)
+# The debug build: a readout over the picture and a log (src/conker_debug.c),
+# packaged as Conker-Recomp-<version>-debug.
+option(CONKER_DEBUG "Build the debug build (readout and log)" OFF)
+set(CONKER_PACKAGE_VERSION "${PROJECT_VERSION}")
+if(CONKER_DEBUG)
+    set(CONKER_PACKAGE_VERSION "${PROJECT_VERSION}-debug")
+endif()
 
 if(WIN32)
     set(CONKER_HOST_SOURCES src/host_win32.c)
@@ -185,6 +192,12 @@ if(CONKER_BUILD_GAME)
     endif()
     target_compile_definitions(conker_recomp PRIVATE
         CONKER_VERSION="${PROJECT_VERSION}")
+    if(CONKER_DEBUG)
+        # Only the files that read it, so switching it rebuilds those two.
+        target_sources(conker_recomp PRIVATE src/conker_debug.c src/conker_debug_audio.c)
+        set_source_files_properties(src/main.c src/conker_debug.c
+            PROPERTIES COMPILE_DEFINITIONS CONKER_DEBUG=1)
+    endif()
 
     if(WIN32)
         target_compile_definitions(conker_recomp PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -270,10 +283,10 @@ if(TARGET conker_recomp AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${CONKER_APPIMAGE_DIR}"
         COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/../packaging/appimage/build-appimage.sh"
                 "$<TARGET_FILE:conker_recomp>" "${CMAKE_BINARY_DIR}/appimage"
-                "${CONKER_APPIMAGE_DIR}" "${PROJECT_VERSION}"
+                "${CONKER_APPIMAGE_DIR}" "${CONKER_PACKAGE_VERSION}"
                 "${_setup_file}"
         DEPENDS conker_recomp ${_setup_dep}
-        COMMENT "Packing Conker-Recomp-${PROJECT_VERSION}-x86_64.AppImage"
+        COMMENT "Packing Conker-Recomp-${CONKER_PACKAGE_VERSION}-x86_64.AppImage"
         VERBATIM)
 endif()
 
@@ -286,7 +299,7 @@ if(TARGET conker_recomp AND WIN32)
         "${CMAKE_CURRENT_SOURCE_DIR}/../../../appimage" ABSOLUTE)
     set(CONKER_APPIMAGE_DIR "${_dist_default}" CACHE PATH
         "Where the windows-zip target writes the zip")
-    set(_zip_name "Conker-Recomp-${PROJECT_VERSION}-windows-x86_64")
+    set(_zip_name "Conker-Recomp-${CONKER_PACKAGE_VERSION}-windows-x86_64")
     set(_zip_stage "${CMAKE_BINARY_DIR}/windows-zip/${_zip_name}")
     # The toolkit's SDL2::SDL2 is local to its directories.
     find_package(SDL2 REQUIRED)

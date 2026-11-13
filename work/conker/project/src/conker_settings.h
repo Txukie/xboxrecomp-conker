@@ -19,6 +19,12 @@ enum {
     CONKER_OPT_ASPECT,
     CONKER_OPT_RESOLUTION,
     CONKER_OPT_RENDER_SCALE,
+    CONKER_OPT_UPSCALING,
+    CONKER_OPT_MSAA,
+    CONKER_OPT_SMAA,
+    CONKER_OPT_ANISO,
+    CONKER_OPT_TEX_DETAIL,
+    CONKER_OPT_MODEL_DETAIL,
     CONKER_OPT_VSYNC,
     CONKER_OPT_FPS,
     CONKER_OPT_SKIP_CUTSCENES,
@@ -74,6 +80,10 @@ int conker_intro_failed(void);
  * kept in the cfg; its per-frame look at the front end and its use of the
  * pad, from the input filter. */
 int  conker_settings_last_game(void);
+int  conker_settings_fps_limit(void);
+/* Model Detail (recomp_manual.c, sub_0007F1E0_enter): how much farther than
+ * the game's own distances characters keep their detailed models. */
+float conker_settings_lod_scale(void);
 void conker_settings_set_last_game(int slot);
 void conker_pub_tick(uint64_t now_ms);
 int  conker_pub_pad(int left, int right, int a, int b);
@@ -97,24 +107,47 @@ int  conker_options_row(void);
 const char *conker_options_label(int row);
 void conker_options_value(int row, char *buf, size_t size);
 
-/* ── The first-run page (conker_firstrun.c) ──────────────────────────── */
+/* ── The launcher (conker_firstrun.c) ────────────────────────────────── */
 
 /* There was no cfg file when conker_settings_load looked. */
 int conker_settings_no_cfg(void);
 
-/* While the page shows, nothing is saved: the page starts from defaults
- * fitted to the display (language -1: leave it), steps the rows' values, and
- * its end makes them this run's and writes the cfg. A window closed before
- * that asks again at the next start. */
+/* While the launcher shows, nothing is saved: it starts from the cfg, or
+ * the first time from defaults fitted to the display (language -1: leave
+ * it), steps the rows' values, and its end makes them this run's and writes
+ * the cfg. Quitting it keeps the cfg as it was. */
 void conker_first_run_begin(int desk_w, int desk_h, const int (*modes)[2], int nmodes, int language);
+/* The display the launcher is on now (it moved), its size and modes. */
+void conker_first_run_display(int desk_w, int desk_h, const int (*modes)[2], int nmodes);
+/* The window's mode and size as chosen; the resolution list again for the
+ * display, and the window request made again. */
+void conker_first_run_window(int *mode, int *w, int *h);
+void conker_first_run_refit(void);
 int  conker_first_run_language(void);
 void conker_first_run_step(int row, int dir);
+void conker_first_run_activate(int row);
 void conker_first_run_end(void);
 void conker_first_run_apply_mods(void);
 
-/* conker_firstrun.c: the page itself, from main() before the game's window
- * opens: 0 to carry on, -1 when the player closed it. */
-int conker_firstrun_show(void);
+/* The launcher's options that the in-game menu does not have, kept in the
+ * cfg: the display (SDL's index, -1 the main one), the audio device (SDL's
+ * name, "" the default), the volume in percent, and for players 1 and 2 the
+ * controller ("" auto, "none", or xbox_InputDeviceSpec's spec, with its name
+ * as last seen) and its buttons (input_map.h InputSource per Xbox control). */
+int  conker_settings_display(void);
+void conker_settings_set_display(int index);
+const char *conker_settings_audio_device(void);
+void conker_settings_set_audio_device(const char *name);
+int  conker_settings_volume(void);
+void conker_settings_set_volume(int pct);
+const char *conker_settings_pad(int player, const char **name);
+void conker_settings_set_pad(int player, const char *spec, const char *name);
+void conker_settings_pad_map(int player, unsigned char source[16]);
+void conker_settings_set_pad_map(int player, const unsigned char source[16]);
+
+/* conker_firstrun.c: the launcher, from main() at every start before the
+ * game's window opens: 0 to carry on, -1 when the player quit. */
+int conker_firstrun_show(const char *data_dir);
 /* conker_firstrun.c: from the guest thread at boot, shows the build of the
  * pipelines until it is done. */
 void conker_firstrun_wait_for_pipelines(void);

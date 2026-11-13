@@ -1,0 +1,41 @@
+diff --git a/src/video/video_player.h b/src/video/video_player.h
+--- a/src/video/video_player.h
++++ b/src/video/video_player.h
+@@ -82,6 +82,11 @@
+ /* Before xbox_HostWindowMain: use this SDL_Window, already open, for the game
+  * instead of opening one. */
+ void xbox_WindowAdopt(void *sdl_window);
++/* Called on the window's thread after each frame is drawn into the window and
++ * before it is shown (and before a RECOMP_FB_WINDOW_SHOT image is taken), with
++ * the SDL_Renderer and the frame's rectangle in it: a project draws over the
++ * picture there, a debug readout for example. NULL removes it. */
++void xbox_WindowSetOverlay(void (*draw)(void *sdl_renderer, int x, int y, int w, int h));
+ /* The display's resolutions, largest first, once the window is open (0
+  * before); and the desktop's own size. */
+ int  xbox_WindowResolutions(int (*wh)[2], int max);
+diff --git a/src/video/fb_present_sdl.c b/src/video/fb_present_sdl.c
+--- a/src/video/fb_present_sdl.c
++++ b/src/video/fb_present_sdl.c
+@@ -512,6 +512,13 @@
+     s_adopted = sdl_window;
+ }
+ 
++static void (*volatile s_overlay)(void *sdl_renderer, int x, int y, int w, int h);
++
++void xbox_WindowSetOverlay(void (*draw)(void *sdl_renderer, int x, int y, int w, int h))
++{
++    s_overlay = draw;
++}
++
+ int xbox_HostWindowMain(int (*guest_main)(void))
+ {
+     SDL_Window *win;
+@@ -745,6 +752,8 @@
+ #endif
+             if (tex)
+                 SDL_RenderCopy(ren, tex, NULL, &dst);
++            if (s_overlay)
++                s_overlay(ren, dst.x, dst.y, dst.w, dst.h);
+             window_shot(ren);
+             SDL_RenderPresent(ren);
+         }

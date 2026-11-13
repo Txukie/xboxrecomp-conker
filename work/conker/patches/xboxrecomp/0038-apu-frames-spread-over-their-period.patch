@@ -1,0 +1,120 @@
+diff --git a/src/apu/apu_state.h b/src/apu/apu_state.h
+--- a/src/apu/apu_state.h
++++ b/src/apu/apu_state.h
+@@ -501,6 +501,8 @@
+     int64_t frame_count_time_ms;
+     int64_t next_frame_time_us;
+     int pace_q_seen;            /* device queue at the last pacing decision */
++    int64_t pace_period_us;     /* host time the current EP period began */
++    bool pace_spread;           /* its frames each wait for their eighth of it */
+     int64_t pace_drain_us;      /* when that queue last fell or sat below high */
+     bool pace_stalled;          /* device stopped consuming: host-clock pacing,
+                                  * periods dropped (mcpx_apu_pace_step) */
+diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
+--- a/src/apu/apu_core.c
++++ b/src/apu/apu_core.c
+@@ -19,6 +19,7 @@
+  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#include <time.h>
+ #include "apu_state.h"
+ #include "apu.h"
+ #include "apu_xaudio2.h"
+@@ -976,14 +977,38 @@
+  * let a trap that began on a period boundary eat the queue's lead.
+  *
+  * A clock that has fallen more than a period behind (after a stall, or the
+- * first call) restarts from now instead of rendering the backlog in a burst. */
++ * first call) restarts from now instead of rendering the backlog in a burst.
++ *
++ * The eight frames of a period used to be rendered back to back and then the
++ * thread slept for the rest of it. On hardware the VP runs a frame every
++ * 667 us, and DirectSound waits on it: stopping a voice spins until the VP
++ * has seen it go idle (Conker, 0x004CB1E7, on the voice's flags), so a stop
++ * waited for the next burst, up to a whole period. A scene that stops many
++ * voices a frame lost most of its frame time there (Conker's barn: 18-40 fps,
++ * the APU interrupt waiting 5-6 ms, and the game thread in that spin). With
++ * a device queue that paces, each frame of a period now waits for its eighth
++ * of the period (pace_spread; RECOMP_APU_SPREAD=0 turns it off). */
+ int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us)
+ {
+     int64_t ahead_us = 0;
+     int mid_band = 0;
++    static int spread_on = -1;
+ 
+-    if (d->ep_frame_div % 8)
++    if (spread_on < 0) {
++        const char *e = getenv("RECOMP_APU_SPREAD");
++        spread_on = !(e && *e == '0');
++    }
++    /* Inside a period, each of its eight frames waits for its eighth. */
++    if (d->ep_frame_div % 8) {
++        if (d->pace_spread) {
++            int64_t due = d->pace_period_us +
++                          (int64_t)(d->ep_frame_div % 8) * EP_FRAME_US / 8;
++            return due > now_us ? due - now_us : 0;
++        }
+         return 0;
++    }
++    d->pace_period_us = now_us;
++    d->pace_spread = false;
+ 
+     if (xa2_is_active()) {
+         int q    = xa2_queued_samples();
+@@ -1010,6 +1035,7 @@
+                         q, PACE_STALL_US / 1000);
+         }
+ 
++        d->pace_spread = spread_on && !d->pace_stalled;
+         if (d->pace_stalled)
+             ;                              /* host clock, as without a queue */
+         else if (q >= high)
+@@ -1043,6 +1069,34 @@
+     d->next_frame_time_us += EP_FRAME_US;
+ }
+ 
++/* A sleep finer than the millisecond a timed wait rounds up to: the frames
++ * of a period are 667 us apart. Windows has it from a high-resolution
++ * waitable timer (Windows 10 1803 and later); without one, a yield. */
++static void apu_sleep_us(int64_t us)
++{
++#if defined(_WIN32)
++    static HANDLE timer;
++    static int tried;
++    LARGE_INTEGER due;
++
++    if (!tried) {
++        tried = 1;
++        timer = CreateWaitableTimerExW(NULL, NULL,
++                                       0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
++                                       TIMER_ALL_ACCESS);
++    }
++    due.QuadPart = -(LONGLONG)us * 10;
++    if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) {
++        WaitForSingleObject(timer, INFINITE);
++        return;
++    }
++    Sleep(0);
++#else
++    struct timespec ts = { (time_t)(us / 1000000), (long)(us % 1000000) * 1000 };
++    nanosleep(&ts, NULL);
++#endif
++}
++
+ static void throttle(MCPXAPUState *d)
+ {
+     int64_t start_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+@@ -1052,6 +1106,12 @@
+             d, qemu_clock_get_us(QEMU_CLOCK_REALTIME));
+         if (wait_us <= 0)
+             break;
++        if (wait_us < 2000) {
++            qemu_mutex_unlock(&d->lock);
++            apu_sleep_us(wait_us);
++            qemu_mutex_lock(&d->lock);
++            continue;
++        }
+         qemu_cond_timedwait(&d->cond, &d->lock,
+                             (int)((wait_us + 999) / 1000));
+     }

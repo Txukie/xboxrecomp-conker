@@ -1,0 +1,660 @@
+diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
+index 292129b..9d6c2a0 100644
+--- a/src/apu/apu_core.c
++++ b/src/apu/apu_core.c
+@@ -507,6 +507,32 @@ static WaveOutState g_waveout = { 0 };
+ 
+ void (*g_apu_output_tap)(const int16_t *stereo, int frames) = NULL;
+ 
++/* The output gain (xa2_set_volume), in 1/65536ths: one int, so the frame
++ * thread reads it whole. */
++static volatile int g_out_gain = 65536;
++
++void xa2_set_volume(float gain)
++{
++    g_out_gain = gain <= 0.0f ? 0 : gain >= 1.0f ? 65536 : (int)(gain * 65536.0f + 0.5f);
++}
++
++float xa2_volume(void)
++{
++    return (float)g_out_gain / 65536.0f;
++}
++
++/* The period at the output gain: itself at full volume, else a copy. */
++static const int16_t *at_volume(const int16_t *period, int16_t *scaled, int frames)
++{
++    int gain = g_out_gain, i;
++
++    if (gain >= 65536)
++        return period;
++    for (i = 0; i < frames * 2; i++)
++        scaled[i] = (int16_t)(((int32_t)period[i] * gain) >> 16);
++    return scaled;
++}
++
+ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
+ {
+     (void)errp;
+@@ -922,15 +948,20 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
+ 
+     if (xa2_is_active()) {
+         if (!d->pace_stalled) {
++            int16_t scaled[MIXER_FRAME_SAMPLES * 2];
+             int q = hs_poll();
+             hs_submit(MIXER_FRAME_SAMPLES,
+-                      xa2_submit_samples((const int16_t *)period,
++                      xa2_submit_samples(at_volume((const int16_t *)period, scaled,
++                                                   MIXER_FRAME_SAMPLES),
+                                          MIXER_FRAME_SAMPLES), q);
+         }
+         return;
+     }
+-    if (g_waveout.initialized)
+-        waveout_submit(d, (const int16_t (*)[2])period);
++    if (g_waveout.initialized) {
++        int16_t scaled[MIXER_FRAME_SAMPLES * 2];
++        waveout_submit(d, (const int16_t (*)[2])at_volume((const int16_t *)period, scaled,
++                                                          MIXER_FRAME_SAMPLES));
++    }
+ }
+ 
+ /* ============================================================
+diff --git a/src/apu/apu_sdl2.c b/src/apu/apu_sdl2.c
+index 7eca83d..940cda3 100644
+--- a/src/apu/apu_sdl2.c
++++ b/src/apu/apu_sdl2.c
+@@ -49,6 +49,13 @@ static uint64_t  g_samples_queued;  /* samples handed to the queue, ever */
+ static int       g_dry;
+ static int64_t   g_underrun_logged_ms;
+ 
++static char g_device[256];
++
++void xa2_set_device(const char *name)
++{
++    snprintf(g_device, sizeof g_device, "%s", name ? name : "");
++}
++
+ static int env_int(const char *name, int def, int lo, int hi)
+ {
+     const char *e = getenv(name);
+@@ -107,7 +114,17 @@ int xa2_init(void)
+ 
+     /* No format changes allowed: the mixer's 48 kHz s16 stereo is what the
+      * queue takes, and SDL converts for the device if it has to. */
+-    g_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
++    g_dev = 0;
++    if (g_device[0]) {
++        g_dev = SDL_OpenAudioDevice(g_device, 0, &want, &have, 0);
++        if (g_dev == 0)
++            fprintf(stderr, "[SDL2] no audio device \"%s\" (%s): the default instead\n",
++                    g_device, SDL_GetError());
++        else
++            fprintf(stderr, "[SDL2] audio device: %s\n", g_device);
++    }
++    if (g_dev == 0)
++        g_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+     if (g_dev == 0) {
+         fprintf(stderr, "[SDL2] SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
+         if (g_audio_opened) { SDL_QuitSubSystem(SDL_INIT_AUDIO); g_audio_opened = 0; }
+diff --git a/src/apu/apu_xaudio2.c b/src/apu/apu_xaudio2.c
+index e725646..cf33e54 100644
+--- a/src/apu/apu_xaudio2.c
++++ b/src/apu/apu_xaudio2.c
+@@ -19,6 +19,8 @@
+ #define COBJMACROS
+ #include <windows.h>
+ #include <xaudio2.h>
++#include <mmdeviceapi.h>
++#include <propsys.h>
+ 
+ #pragma comment(lib, "xaudio2.lib")
+ #pragma comment(lib, "ole32.lib")
+@@ -68,6 +70,66 @@ static ULONGLONG g_xa2_underrun_logged;
+ static int                     g_xa2_initialized = 0;
+ static int                     g_xa2_frames_written = 0;
+ 
++/* The chosen output device (xa2_set_device), by its friendly name. */
++static char g_xa2_device[256];
++
++void xa2_set_device(const char *name)
++{
++    snprintf(g_xa2_device, sizeof g_xa2_device, "%s", name ? name : "");
++}
++
++/* The endpoint ID of the active render device called `name`, for
++ * CreateMasteringVoice; 0 when there is none. The GUIDs are spelt out here
++ * so that nothing needs uuid.lib or INITGUID. */
++static int xa2_device_id(const char *name, WCHAR *id_out, int max)
++{
++    static const CLSID clsid_enum = { 0xbcde0395, 0xe52f, 0x467c,
++        { 0x8e, 0x3d, 0xc4, 0x57, 0x92, 0x91, 0x69, 0x2e } };
++    static const IID iid_enum = { 0xa95664d2, 0x9614, 0x4f35,
++        { 0xa7, 0x46, 0xde, 0x8d, 0xb6, 0x36, 0x17, 0xe6 } };
++    static const PROPERTYKEY key_name = { { 0xa45c254e, 0xdf1c, 0x4efd,
++        { 0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0 } }, 14 };
++    IMMDeviceEnumerator *en = NULL;
++    IMMDeviceCollection *list = NULL;
++    UINT n = 0, i;
++    int found = 0;
++    WCHAR want[256];
++
++    if (!MultiByteToWideChar(CP_UTF8, 0, name, -1, want, 256))
++        return 0;
++    if (FAILED(CoCreateInstance(&clsid_enum, NULL, CLSCTX_ALL, &iid_enum, (void **)&en)))
++        return 0;
++    if (SUCCEEDED(IMMDeviceEnumerator_EnumAudioEndpoints(en, eRender, DEVICE_STATE_ACTIVE, &list)))
++        IMMDeviceCollection_GetCount(list, &n);
++    for (i = 0; i < n && !found; i++) {
++        IMMDevice *dev = NULL;
++        IPropertyStore *props = NULL;
++        PROPVARIANT v;
++
++        if (FAILED(IMMDeviceCollection_Item(list, i, &dev)))
++            continue;
++        PropVariantInit(&v);
++        if (SUCCEEDED(IMMDevice_OpenPropertyStore(dev, STGM_READ, &props))
++                && SUCCEEDED(IPropertyStore_GetValue(props, &key_name, &v))
++                && v.vt == VT_LPWSTR && !wcscmp(v.pwszVal, want)) {
++            LPWSTR id = NULL;
++            if (SUCCEEDED(IMMDevice_GetId(dev, &id)) && id) {
++                lstrcpynW(id_out, id, max);
++                CoTaskMemFree(id);
++                found = 1;
++            }
++        }
++        PropVariantClear(&v);
++        if (props)
++            IPropertyStore_Release(props);
++        IMMDevice_Release(dev);
++    }
++    if (list)
++        IMMDeviceCollection_Release(list);
++    IMMDeviceEnumerator_Release(en);
++    return found;
++}
++
+ int xa2_init(void)
+ {
+     HRESULT hr;
+@@ -95,8 +157,21 @@ int xa2_init(void)
+         goto fail;
+     }
+ 
+-    hr = IXAudio2_CreateMasteringVoice(g_xa2, &g_xa2_master,
+-        XA2_CHANNELS, XA2_SAMPLE_RATE, 0, NULL, NULL, 0);
++    hr = E_FAIL;
++    if (g_xa2_device[0]) {
++        WCHAR id[512];
++        if (xa2_device_id(g_xa2_device, id, 512)) {
++            hr = IXAudio2_CreateMasteringVoice(g_xa2, &g_xa2_master,
++                XA2_CHANNELS, XA2_SAMPLE_RATE, 0, id, NULL, 0);
++            fprintf(stderr, "[XA2] audio device %s: %s\n", g_xa2_device,
++                    SUCCEEDED(hr) ? "open" : "failed, the default instead");
++        } else {
++            fprintf(stderr, "[XA2] no audio device %s: the default instead\n", g_xa2_device);
++        }
++    }
++    if (FAILED(hr))
++        hr = IXAudio2_CreateMasteringVoice(g_xa2, &g_xa2_master,
++            XA2_CHANNELS, XA2_SAMPLE_RATE, 0, NULL, NULL, 0);
+     if (FAILED(hr)) {
+         fprintf(stderr, "[XA2] CreateMasteringVoice failed: 0x%08lX\n", hr);
+         goto fail;
+diff --git a/src/apu/apu_xaudio2.h b/src/apu/apu_xaudio2.h
+index 583fc70..295897f 100644
+--- a/src/apu/apu_xaudio2.h
++++ b/src/apu/apu_xaudio2.h
+@@ -14,6 +14,18 @@
+ #define XA2_BACKEND_NAME "SDL2"
+ #endif
+ 
++/* The output device xa2_init opens, by the name SDL lists it under
++ * (SDL_GetAudioDeviceName; on Windows the endpoint's friendly name, which
++ * is what SDL's WASAPI driver lists). NULL or "": the system default, which
++ * is also what an absent device falls back to. Before xa2_init. */
++void xa2_set_device(const char *name);
++
++/* The gain on everything sent to the device, 0 to 1 (apu_core.c applies it
++ * before the submit, so the WAV dump and output tap stay at full level).
++ * Any thread, any time. */
++void xa2_set_volume(float gain);
++float xa2_volume(void);
++
+ /* Initialize the device backend. Returns 1 on success, 0 on failure. */
+ int xa2_init(void);
+ 
+diff --git a/src/input/xinput_device.c b/src/input/xinput_device.c
+index abf866a..a876942 100644
+--- a/src/input/xinput_device.c
++++ b/src/input/xinput_device.c
+@@ -13,6 +13,7 @@
+ #include "xinput_xbox.h"
+ #include "keyboard.h"
+ #include "mkb_input.h"
++#include "input_map.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -151,6 +152,12 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
+     return XInputSetState(dwPort, &xi_vib);
+ }
+ 
++/* XInput numbers its pads itself and they are already Xbox-shaped: no
++ * assignment or remapping here. */
++void xbox_InputSetPortDevice(DWORD dwPort, const char *spec) { (void)dwPort; (void)spec; }
++int xbox_InputDeviceSpec(int index, char *buf, int size) { (void)index; if (size > 0) buf[0] = 0; return 0; }
++void xbox_InputSetPortMap(DWORD dwPort, const unsigned char source[16]) { (void)dwPort; (void)source; }
++
+ BOOL xbox_InputIsConnected(DWORD dwPort)
+ {
+     if (dwPort >= XBOX_MAX_CONTROLLERS) return FALSE;
+@@ -206,22 +213,190 @@ int xbox_InputAnyOpen(void)
+     return 0;
+ }
+ 
+-/* Open up to XBOX_MAX_CONTROLLERS attached game controllers. */
+-static void open_controllers(void)
++/* Which controller each port wants (xbox_InputSetPortDevice): "" for the
++ * next free one, "none", or a device spec. */
++static char g_port_spec[XBOX_MAX_CONTROLLERS][48];
++
++int xbox_InputDeviceSpec(int index, char *buf, int size)
+ {
+-    int slot = 0;
+-    for (int i = 0; i < SDL_NumJoysticks() && slot < XBOX_MAX_CONTROLLERS; i++) {
++    char guid[33];
++    int i, n = 0;
++
++    if (size > 0)
++        buf[0] = 0;
++    if (index < 0 || index >= SDL_NumJoysticks() || !SDL_IsGameController(index))
++        return 0;
++    SDL_JoystickGetGUIDString(SDL_JoystickGetDeviceGUID(index), guid, sizeof guid);
++    /* The how-manieth of its model among the game controllers. */
++    for (i = 0; i < index; i++) {
++        char g[33];
+         if (!SDL_IsGameController(i))
+             continue;
+-        if (!g_pads[slot]) {
+-            g_pads[slot] = SDL_GameControllerOpen(i);
+-            g_controller_connected[slot] = (g_pads[slot] != NULL);
+-            if (g_pads[slot])
+-                fprintf(stderr, "  [INPUT] controller %d: %s\n", slot,
+-                        SDL_GameControllerName(g_pads[slot]));
++        SDL_JoystickGetGUIDString(SDL_JoystickGetDeviceGUID(i), g, sizeof g);
++        if (!strcmp(g, guid))
++            n++;
++    }
++    snprintf(buf, (size_t)size, "%s/%d", guid, n);
++    return 1;
++}
++
++/* Device index `i` is already some port's. */
++static int device_taken(int i)
++{
++    SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(i);
++
++    for (int p = 0; p < XBOX_MAX_CONTROLLERS; p++)
++        if (g_pads[p] && SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(g_pads[p])) == id)
++            return 1;
++    return 0;
++}
++
++/* Device index `i` is the one some port names. */
++static int device_named(int i)
++{
++    char spec[48];
++
++    if (!xbox_InputDeviceSpec(i, spec, sizeof spec))
++        return 0;
++    for (int p = 0; p < XBOX_MAX_CONTROLLERS; p++)
++        if (!strcmp(g_port_spec[p], spec))
++            return 1;
++    return 0;
++}
++
++static void open_port(int port, int index)
++{
++    g_pads[port] = SDL_GameControllerOpen(index);
++    g_controller_connected[port] = (g_pads[port] != NULL);
++    if (g_pads[port])
++        fprintf(stderr, "  [INPUT] controller %d: %s\n", port,
++                SDL_GameControllerName(g_pads[port]));
++}
++
++/* Each empty port takes its controller: first the ports that name one, then
++ * the rest, in port order, from those nobody names. */
++static void open_controllers(void)
++{
++    int n = SDL_NumJoysticks(), port, i;
++
++    for (port = 0; port < XBOX_MAX_CONTROLLERS; port++) {
++        const char *want = g_port_spec[port];
++        if (g_pads[port] || !want[0] || !strcmp(want, "none"))
++            continue;
++        for (i = 0; i < n; i++) {
++            char spec[48];
++            if (xbox_InputDeviceSpec(i, spec, sizeof spec) && !strcmp(spec, want)
++                    && !device_taken(i)) {
++                open_port(port, i);
++                break;
++            }
+         }
+-        slot++;
+     }
++    for (port = 0; port < XBOX_MAX_CONTROLLERS; port++) {
++        if (g_pads[port] || g_port_spec[port][0])
++            continue;
++        for (i = 0; i < n; i++)
++            if (SDL_IsGameController(i) && !device_taken(i) && !device_named(i)) {
++                open_port(port, i);
++                break;
++            }
++    }
++}
++
++void xbox_InputSetPortDevice(DWORD dwPort, const char *spec)
++{
++    char want[sizeof g_port_spec[0]];
++
++    if (dwPort >= XBOX_MAX_CONTROLLERS)
++        return;
++    snprintf(want, sizeof want, "%s", spec && strcmp(spec, "auto") ? spec : "");
++    if (!strcmp(want, g_port_spec[dwPort]))
++        return;
++    memcpy(g_port_spec[dwPort], want, sizeof want);
++    /* Everything again: a port that gave a pad up may hand it to another. */
++    if (SDL_WasInit(SDL_INIT_GAMECONTROLLER)) {
++        for (int p = 0; p < XBOX_MAX_CONTROLLERS; p++)
++            if (g_pads[p]) {
++                SDL_GameControllerClose(g_pads[p]);
++                g_pads[p] = NULL;
++                g_controller_connected[p] = FALSE;
++            }
++        open_controllers();
++    }
++}
++
++/* Remapped buttons (xbox_InputSetPortMap): built from the pad's raw
++ * controls by input_map.c. */
++static InputPadMap g_map[XBOX_MAX_CONTROLLERS];
++static volatile int g_mapped[XBOX_MAX_CONTROLLERS];
++
++void xbox_InputSetPortMap(DWORD dwPort, const unsigned char source[16])
++{
++    if (dwPort >= XBOX_MAX_CONTROLLERS)
++        return;
++    g_mapped[dwPort] = 0;
++    if (!source)
++        return;
++    xbox_InputMap_PadMapDefaults(&g_map[dwPort]);
++    memcpy(g_map[dwPort].source, source, INPUT_PAD_CONTROL_COUNT);
++    g_map[dwPort].trigger_threshold = 0;
++    {
++        InputPadMap id;
++        xbox_InputMap_PadMapDefaults(&id);
++        g_mapped[dwPort] = memcmp(id.source, source, INPUT_PAD_CONTROL_COUNT) != 0;
++    }
++}
++
++static void apply_map(DWORD port, SDL_GameController *c, XBOX_GAMEPAD *g)
++{
++    static const SDL_GameControllerButton k_buttons[] = {
++        [INPUT_SRC_SOUTH] = SDL_CONTROLLER_BUTTON_A, [INPUT_SRC_EAST] = SDL_CONTROLLER_BUTTON_B,
++        [INPUT_SRC_WEST] = SDL_CONTROLLER_BUTTON_X, [INPUT_SRC_NORTH] = SDL_CONTROLLER_BUTTON_Y,
++        [INPUT_SRC_BACK] = SDL_CONTROLLER_BUTTON_BACK, [INPUT_SRC_GUIDE] = SDL_CONTROLLER_BUTTON_GUIDE,
++        [INPUT_SRC_START] = SDL_CONTROLLER_BUTTON_START,
++        [INPUT_SRC_LEFT_STICK_CLICK] = SDL_CONTROLLER_BUTTON_LEFTSTICK,
++        [INPUT_SRC_RIGHT_STICK_CLICK] = SDL_CONTROLLER_BUTTON_RIGHTSTICK,
++        [INPUT_SRC_LEFT_SHOULDER] = SDL_CONTROLLER_BUTTON_LEFTSHOULDER,
++        [INPUT_SRC_RIGHT_SHOULDER] = SDL_CONTROLLER_BUTTON_RIGHTSHOULDER,
++        [INPUT_SRC_DPAD_UP] = SDL_CONTROLLER_BUTTON_DPAD_UP,
++        [INPUT_SRC_DPAD_DOWN] = SDL_CONTROLLER_BUTTON_DPAD_DOWN,
++        [INPUT_SRC_DPAD_LEFT] = SDL_CONTROLLER_BUTTON_DPAD_LEFT,
++        [INPUT_SRC_DPAD_RIGHT] = SDL_CONTROLLER_BUTTON_DPAD_RIGHT,
++#if SDL_VERSION_ATLEAST(2, 0, 14)
++        [INPUT_SRC_MISC1] = SDL_CONTROLLER_BUTTON_MISC1,
++        [INPUT_SRC_TOUCHPAD] = SDL_CONTROLLER_BUTTON_TOUCHPAD,
++        [INPUT_SRC_PADDLE1] = SDL_CONTROLLER_BUTTON_PADDLE1,
++        [INPUT_SRC_PADDLE2] = SDL_CONTROLLER_BUTTON_PADDLE2,
++        [INPUT_SRC_PADDLE3] = SDL_CONTROLLER_BUTTON_PADDLE3,
++        [INPUT_SRC_PADDLE4] = SDL_CONTROLLER_BUTTON_PADDLE4,
++#endif
++    };
++    InputRaw raw;
++    XBOX_GAMEPAD out;
++    int s, lx, ly, rx, ry;
++
++    memset(&raw, 0, sizeof raw);
++    for (s = INPUT_SRC_SOUTH; s <= INPUT_SRC_PADDLE4; s++)
++        if ((s <= INPUT_SRC_DPAD_RIGHT || SDL_VERSION_ATLEAST(2, 0, 14))
++                && SDL_GameControllerGetButton(c, k_buttons[s]))
++            raw.src[s] = 32767;
++    raw.src[INPUT_SRC_LEFT_TRIGGER] = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
++    raw.src[INPUT_SRC_RIGHT_TRIGGER] = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
++    lx = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTX);
++    ly = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTY);
++    rx = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTX);
++    ry = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTY);
++    raw.src[INPUT_SRC_LSTICK_UP] = (int16_t)(ly < 0 ? (ly == -32768 ? 32767 : -ly) : 0);
++    raw.src[INPUT_SRC_LSTICK_DOWN] = (int16_t)(ly > 0 ? ly : 0);
++    raw.src[INPUT_SRC_LSTICK_LEFT] = (int16_t)(lx < 0 ? (lx == -32768 ? 32767 : -lx) : 0);
++    raw.src[INPUT_SRC_LSTICK_RIGHT] = (int16_t)(lx > 0 ? lx : 0);
++    raw.src[INPUT_SRC_RSTICK_UP] = (int16_t)(ry < 0 ? (ry == -32768 ? 32767 : -ry) : 0);
++    raw.src[INPUT_SRC_RSTICK_DOWN] = (int16_t)(ry > 0 ? ry : 0);
++    raw.src[INPUT_SRC_RSTICK_LEFT] = (int16_t)(rx < 0 ? (rx == -32768 ? 32767 : -rx) : 0);
++    raw.src[INPUT_SRC_RSTICK_RIGHT] = (int16_t)(rx > 0 ? rx : 0);
++    xbox_InputMap_PadMap(&g_map[port], &raw, &out);
++    g->wButtons = out.wButtons;
++    memcpy(g->bAnalogButtons, out.bAnalogButtons, sizeof g->bAnalogButtons);
+ }
+ 
+ /* A controller came or went (SDL_CONTROLLERDEVICEADDED / REMOVED, from the
+@@ -310,6 +485,8 @@ static DWORD input_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState)
+     pState->Gamepad.sThumbRY =
+         (SHORT)(-1 - SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTY));
+ 
++    if (g_mapped[dwPort])
++        apply_map(dwPort, c, &pState->Gamepad);
+     if (dwPort == 0)
+         keyboard_merge(pState);
+     return ERROR_SUCCESS;
+diff --git a/src/input/xinput_xbox.h b/src/input/xinput_xbox.h
+index 2be89e4..f15601b 100644
+--- a/src/input/xinput_xbox.h
++++ b/src/input/xinput_xbox.h
+@@ -125,6 +125,27 @@ BOOL xbox_InputIsConnected(DWORD dwPort);
+  */
+ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps);
+ 
++/**
++ * Which host controller each port takes (SDL backend). A device is named
++ * by xbox_InputDeviceSpec: its SDL joystick GUID and which one of that GUID
++ * it is ("<guid>/<n>"), so two pads of one model stay apart. NULL or ""
++ * (auto) takes the next controller no other port has; "none" takes none,
++ * which leaves port 0 to the keyboard. A named device that is not plugged
++ * in leaves the port empty until it is. Controllers are reassigned at once.
++ */
++void xbox_InputSetPortDevice(DWORD dwPort, const char *spec);
++/* The spec of SDL device index `index` into buf; 0 if it is not a game
++ * controller. */
++int xbox_InputDeviceSpec(int index, char *buf, int size);
++
++/**
++ * A port's buttons from other physical controls: source[i] is the
++ * InputSource (input_map.h) that Xbox control i (InputControl, the first
++ * sixteen) reads. NULL restores the pad as it is shaped. The sticks are
++ * untouched.
++ */
++void xbox_InputSetPortMap(DWORD dwPort, const unsigned char source[16]);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/video/fb_present.c b/src/video/fb_present.c
+index 61ec084..138faae 100644
+--- a/src/video/fb_present.c
++++ b/src/video/fb_present.c
+@@ -670,6 +670,8 @@ void xbox_WindowSetMode(int mode, int width, int height)
+ }
+ 
+ void xbox_WindowSetVsync(int on) { (void)on; }
++void xbox_WindowSetDisplay(int index) { (void)index; }
++void xbox_WindowApplyTo(void *sdl_window) { (void)sdl_window; }
+ 
+ int xbox_WindowResolutions(int (*wh)[2], int max)
+ {
+diff --git a/src/video/fb_present_sdl.c b/src/video/fb_present_sdl.c
+index 68e1a25..a723fc1 100644
+--- a/src/video/fb_present_sdl.c
++++ b/src/video/fb_present_sdl.c
+@@ -243,6 +243,7 @@ void xbox_FramebufferWindowOutputSize(int *w, int *h)
+ /* Requested by any thread, applied by the main loop when s_req_gen moves.
+  * Mode < 0 and vsync < 0 mean "as the environment says". */
+ static volatile int s_req_mode = -1, s_req_w, s_req_h, s_req_vsync = -1;
++static volatile int s_req_display = -1;    /* -1: wherever the window is */
+ static volatile unsigned s_req_gen;
+ static int s_res[64][2];
+ static volatile int s_nres;
+@@ -269,6 +270,24 @@ void xbox_WindowSetMode(int mode, int width, int height)
+     wake_main_loop();
+ }
+ 
++void xbox_WindowSetDisplay(int index)
++{
++    s_req_display = index;
++    __atomic_add_fetch(&s_req_gen, 1, __ATOMIC_SEQ_CST);
++    wake_main_loop();
++}
++
++/* The display the window should be on: the requested one while it exists. */
++static int target_display(SDL_Window *win)
++{
++    int d = s_req_display, n = SDL_GetNumVideoDisplays();
++
++    if (d >= 0 && d < n)
++        return d;
++    d = win ? SDL_GetWindowDisplayIndex(win) : 0;
++    return d < 0 ? 0 : d;
++}
++
+ void xbox_WindowSetVsync(int on)
+ {
+     s_req_vsync = on ? 1 : 0;
+@@ -300,11 +319,9 @@ int xbox_WindowDesktopSize(int *w, int *h)
+ /* The display's modes as distinct sizes, largest first. */
+ static void list_resolutions(SDL_Window *win)
+ {
+-    int d = SDL_GetWindowDisplayIndex(win), n, i, j, k = 0;
++    int d = target_display(win), n, i, j, k = 0;
+     SDL_DisplayMode m;
+ 
+-    if (d < 0)
+-        d = 0;
+     if (SDL_GetDesktopDisplayMode(d, &m) == 0) {
+         s_desk_w = m.w;
+         s_desk_h = m.h;
+@@ -341,20 +358,30 @@ static void list_resolutions(SDL_Window *win)
+ static void apply_window_settings(SDL_Window *win, SDL_Renderer *ren, int *vsync)
+ {
+     int mode = s_req_mode, w = s_req_w, h = s_req_h, v = s_req_vsync;
++    int d = target_display(win), moved = 0;
+ 
++    /* Another display: out of fullscreen to get there, then as asked. */
++    if (SDL_GetWindowDisplayIndex(win) != d) {
++        int fs = mode < 0 ? (int)(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN_DESKTOP) : 0;
++        SDL_SetWindowFullscreen(win, 0);
++        SDL_SetWindowPosition(win, SDL_WINDOWPOS_CENTERED_DISPLAY(d), SDL_WINDOWPOS_CENTERED_DISPLAY(d));
++        if (fs)
++            SDL_SetWindowFullscreen(win, (Uint32)fs);
++        moved = 1;
++        fprintf(stderr, "  [FBWIN] display %d\n", d);
++    }
+     if (mode == 0) {
+         SDL_SetWindowFullscreen(win, 0);
+         if (w > 0 && h > 0) {
+             SDL_SetWindowSize(win, w, h);
+-            SDL_SetWindowPosition(win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
++            SDL_SetWindowPosition(win, SDL_WINDOWPOS_CENTERED_DISPLAY(d), SDL_WINDOWPOS_CENTERED_DISPLAY(d));
+         }
+     } else if (mode == 1) {
+         SDL_DisplayMode want, got;
+-        int d = SDL_GetWindowDisplayIndex(win);
+         memset(&want, 0, sizeof want);
+         want.w = w;
+         want.h = h;
+-        if (w > 0 && h > 0 && SDL_GetClosestDisplayMode(d < 0 ? 0 : d, &want, &got))
++        if (w > 0 && h > 0 && SDL_GetClosestDisplayMode(d, &want, &got))
+             SDL_SetWindowDisplayMode(win, &got);
+         else
+             SDL_SetWindowDisplayMode(win, NULL);
+@@ -362,8 +389,10 @@ static void apply_window_settings(SDL_Window *win, SDL_Renderer *ren, int *vsync
+     } else if (mode == 2) {
+         SDL_SetWindowFullscreen(win, SDL_WINDOW_FULLSCREEN_DESKTOP);
+     }
++    if (moved)
++        list_resolutions(win);
+ #if SDL_VERSION_ATLEAST(2, 0, 18)
+-    if (v >= 0 && v != *vsync && SDL_RenderSetVSync(ren, v) == 0) {
++    if (ren && v >= 0 && v != *vsync && SDL_RenderSetVSync(ren, v) == 0) {
+         *vsync = v;
+         fprintf(stderr, "  [FBWIN] vsync %s\n", v ? "on" : "off");
+     }
+@@ -372,6 +401,21 @@ static void apply_window_settings(SDL_Window *win, SDL_Renderer *ren, int *vsync
+ #endif
+ }
+ 
++/* A window before the game has it (the page before the game, which hands
++ * it over with xbox_WindowAdopt): the requested display and mode now, on
++ * the calling thread, which must be the one that made it. The display's
++ * sizes are listed again for xbox_WindowResolutions. */
++void xbox_WindowApplyTo(void *sdl_window)
++{
++    SDL_Window *win = sdl_window;
++    int vsync = -1;
++
++    if (!win)
++        return;
++    apply_window_settings(win, NULL, &vsync);
++    list_resolutions(win);
++}
++
+ /* Title bar: "<XBE title> | FPS: n | draws: n", as the GDI window shows it.
+  * Written by the loader and the flip, read once a second by the main
+  * thread; a torn read shows one stale value for a second. */
+@@ -578,12 +622,16 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+             s_adopted = NULL;
+             SDL_SetWindowTitle(win, s_title);
+             if (s_req_mode <= 0) {
++                int d = target_display(win);
+                 SDL_SetWindowFullscreen(win, 0);
+                 SDL_SetWindowSize(win, w, h);
+-                SDL_SetWindowPosition(win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
++                SDL_SetWindowPosition(win, SDL_WINDOWPOS_CENTERED_DISPLAY(d),
++                                      SDL_WINDOWPOS_CENTERED_DISPLAY(d));
+             }
+         } else {
+-            win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
++            int d = target_display(NULL);
++            win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_CENTERED_DISPLAY(d),
++                                   SDL_WINDOWPOS_CENTERED_DISPLAY(d),
+                                    w, h, SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+         }
+     }
+diff --git a/src/video/video_player.h b/src/video/video_player.h
+index 3596813..29d244d 100644
+--- a/src/video/video_player.h
++++ b/src/video/video_player.h
+@@ -85,6 +85,12 @@ void xbox_FramebufferWindowOutputSize(int *w, int *h);
+  * nearest width x height, 2 borderless fullscreen at the desktop's size. */
+ void xbox_WindowSetMode(int mode, int width, int height);
+ void xbox_WindowSetVsync(int on);
++/* The display (SDL's index) the window goes to, centred, in its mode; -1 or
++ * one that is not there: wherever it is. */
++void xbox_WindowSetDisplay(int index);
++/* The requested display and mode applied now to this SDL_Window, on the
++ * thread that made it, before the game has it (xbox_WindowAdopt). */
++void xbox_WindowApplyTo(void *sdl_window);
+ /* Before xbox_HostWindowMain: use this SDL_Window, already open, for the game
+  * instead of opening one. */
+ void xbox_WindowAdopt(void *sdl_window);

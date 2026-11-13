@@ -315,6 +315,70 @@ void sub_0003D200_enter(void)
     }
 }
 
+/* ── Model Detail: characters' level of detail (sub_0007F1E0) ────────────
+ *
+ * Each frame a character (index arg 1, in the array at [0x84A5F8], 0x6D0
+ * apiece) picks its model: 0, the full one, while its distance from the
+ * camera -- scaled for the field of view -- is within the first of two
+ * thresholds, 1 within the second, else 2, kept at +0x3A8. The pair comes
+ * from [char+0x514] when the character has one, else from the defaults:
+ * 1000 and 5300 with byte 0x7819D5 set or in level 0x48, 500 and 730
+ * otherwise.
+ * Byte 0x76F0E0 = 1 (BarnArena) keeps everyone on the full model, and a
+ * character whose full model the level did not load (Conker in the Windmill)
+ * gets 1 within 200 units and 2 beyond, thresholds or not.
+ *
+ * Model Detail scales the pair: [char+0x514] is pointed at a scaled copy of
+ * the character's own (a slot per index in guest memory of ours), and put
+ * back when the scale is 1 again or the game sets a pair of its own. */
+#define CHAR_ARRAY      0x84A5F8u
+#define CHAR_SIZE       0x6D0u
+#define CHAR_LOD_PAIR   0x514u
+#define LOD_SLOTS       256u
+void sub_0007F1E0_enter(void)
+{
+    extern uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
+    static uint32_t pool;                /* LOD_SLOTS pairs of floats */
+    static uint32_t orig[LOD_SLOTS];
+    const float k = conker_settings_lod_scale();
+    const uint32_t idx = MEM32(g_esp + 4), base = MEM32(CHAR_ARRAY);
+    uint32_t ch, cur, mine;
+    float near_, far_;
+
+    if (idx >= LOD_SLOTS || !base)
+        return;
+    if (!pool) {
+        if (k == 1.0f)
+            return;
+        pool = xbox_ContiguousAlloc(LOD_SLOTS * 8u, 16u);
+        if (!pool)
+            return;
+    }
+    ch = base + idx * CHAR_SIZE;
+    cur = MEM32(ch + CHAR_LOD_PAIR);
+    mine = pool + idx * 8u;
+    if (cur != mine)
+        orig[idx] = cur;                 /* the game's (0: the defaults) */
+    if (k == 1.0f) {
+        if (cur == mine)
+            MEM32(ch + CHAR_LOD_PAIR) = orig[idx];
+        return;
+    }
+    if (orig[idx]) {
+        near_ = MEMF(orig[idx]);
+        far_ = MEMF(orig[idx] + 4);
+    } else if (MEM8(0x7819D5) || MEM32(0x7FA1F8) == 0x48u) {
+        near_ = 1000.0f;
+        far_ = 5300.0f;
+    } else {
+        near_ = 500.0f;
+        far_ = 730.0f;
+    }
+    MEMF(mine) = near_ * k;
+    MEMF(mine + 4) = far_ * k;
+    MEM32(ch + CHAR_LOD_PAIR) = mine;
+}
+
 /* A level load starts here (conker_menu.c). */
 void sub_002AB0C0_enter(void)
 {
@@ -422,6 +486,33 @@ void conker_trace_point(uint32_t xbox_va)
  * The shape is Recomp Options' Aspect Ratio (conker_settings.c; CONKER_ASPECT
  * picks one at start), and changes while the game runs: the camera takes the
  * new angle at its next update. 4:3 is the original picture. */
+
+/* ── A cutscene that starts part way through (sub_00056050) ───────────────
+ *
+ * A cutscene can start at a frame of its own, the mark at 0x7655F4 (Birdy's
+ * in TrainingLevel, at 180). Its events up to there are meant to fire at once:
+ * once a frame sub_00050200 moves the previous frame to the current one, counts
+ * the current one on from real time at 60 a second, and when the previous one
+ * is the mark and the current one is past it, sets the previous one to -1. It
+ * asks that only until the first pass of this dispatcher, which sets the byte
+ * at 0x76F0D8 whatever it fired. At 30 fps a frame always moves the count; a
+ * frame under 1/60 s can leave it on the mark, the byte gets set, and the
+ * events never fire, Birdy's speech (ad_mpeg_Start) among them. So a first pass
+ * that finds the count on the mark gets what a slower frame would have given. */
+void sub_00056050_enter(void)
+{
+    uint32_t first = MEM32(g_esp + 4), cut = MEM32(g_esp + 8);
+    uint32_t mark = MEM16(0x7655F4);
+
+    if (first == 0 && cut < 2 && mark != 0 && MEM8(cut + 0x76F0D8) == 0
+        && MEM32(cut * 4 + 0x76F0F0) == mark && MEM32(cut * 4 + 0x76F0F8) == mark
+        && MEM8(0x7655FD) != 2
+        && (MEM8(0x76EC82) == 1 || MEM8(cut + 0x76F0E0) == 1)
+        && MEM32(0x847138) != 0 && MEM16(0x76E860) != 0) {
+        MEM32(cut * 4 + 0x76F0F0) = 0xFFFFFFFFu;
+        MEM32(cut * 4 + 0x76F0F8) = mark + 1;
+    }
+}
 
 /* sub_000645C0(player edx, horizontal angle xmm1, vertical angle xmm0). */
 void sub_000645C0_enter(void)

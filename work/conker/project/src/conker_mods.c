@@ -136,6 +136,66 @@ static int active_mods(char names[][256], int max)
     return n;
 }
 
+void conker_mods_set_dirs(const char *data_dir, const char *save_dir)
+{
+    snprintf(s_mods, sizeof s_mods, "%s/" MODS_DIR, data_dir);
+    snprintf(s_cache, sizeof s_cache, "%s/Cache", save_dir);
+    make_dir(data_dir);
+    make_dir(s_mods);
+}
+
+/* Every mod but Uncensor, which has its own row: name order, each with
+ * whether it is on. */
+int conker_mods_list(char names[][64], int *on, int max)
+{
+    DIR *d = opendir(s_mods);
+    struct dirent *e;
+    int n = 0, i;
+
+    if (!d)
+        return 0;
+    while (n < max && (e = readdir(d)) != NULL) {
+        char p[4200];
+        if (e->d_name[0] == '.' || strlen(e->d_name) >= 64 || !strcmp(e->d_name, UNCENSOR))
+            continue;
+        snprintf(p, sizeof p, "%s/%s", s_mods, e->d_name);
+        if (!is_dir(p))
+            continue;
+        snprintf(names[n], 64, "%s", e->d_name);
+        n++;
+    }
+    closedir(d);
+    qsort(names, (size_t)n, sizeof names[0], cmp_names);
+    for (i = 0; i < n; i++) {
+        char p[4200];
+        snprintf(p, sizeof p, "%s/%s/" DISABLED_MARK, s_mods, names[i]);
+        on[i] = !is_file(p);
+    }
+    return n;
+}
+
+void conker_mods_set_on(const char *name, int on)
+{
+    char p[4200];
+
+    if (!name[0] || strchr(name, '/') || strchr(name, '\\') || name[0] == '.')
+        return;
+    snprintf(p, sizeof p, "%s/%s/" DISABLED_MARK, s_mods, name);
+    if (on)
+        remove(p);
+    else
+        write_text(p, "Delete this file to turn the mod on again.\n");
+    fprintf(stderr, "[MODS] %s: %s\n", name, on ? "on" : "off");
+}
+
+/* Before the game: a change made now is laid over this start. */
+static int s_prelaunch;
+
+void conker_mods_prelaunch(int on)
+{
+    s_prelaunch = on;
+}
+
 void conker_mods_init(const char *data_dir, const char *save_dir)
 {
     static char paths[MAX_MODS][2304];
@@ -143,10 +203,7 @@ void conker_mods_init(const char *data_dir, const char *save_dir)
     char names[MAX_MODS][256], applied_path[2304], applied[4096], now[4096];
     int n, i;
 
-    snprintf(s_mods, sizeof s_mods, "%s/" MODS_DIR, data_dir);
-    snprintf(s_cache, sizeof s_cache, "%s/Cache", save_dir);
-    make_dir(data_dir);
-    make_dir(s_mods);
+    conker_mods_set_dirs(data_dir, save_dir);
 
     /* The active set, with each mod's version: a changed set or an updated
      * mod empties the cache. */
@@ -225,6 +282,16 @@ static void set_status(const char *fmt, ...)
     va_end(ap);
     pthread_mutex_unlock(&s_status_lock);
     fprintf(stderr, "[MODS] uncensor: %s\n", s_status);
+}
+
+/* What a change says once it is made: before the game it is this start's,
+ * and the row shows the choice. */
+static void restart_status(void)
+{
+    if (s_prelaunch)
+        set_status("%s", "");
+    else
+        set_status("Restart to apply");
 }
 
 void conker_mods_uncensor_clear_status(void)
@@ -667,7 +734,10 @@ static void *uncensor_thread(void *arg)
     if (uncensor_installed() && !strncmp(have, r.id, strlen(r.id)) && have[strlen(r.id)] == ' ') {
         if (job.enable_after)
             set_enabled(1);
-        set_status(job.enable_after ? "Restart to apply" : "Up to date");
+        if (job.enable_after)
+            restart_status();
+        else
+            set_status("Up to date");
         goto out;
     }
 
@@ -766,7 +836,7 @@ static void *uncensor_thread(void *arg)
     }
     remove_tree(old);
     fprintf(stderr, "[MODS] %s %s\n", have[0] ? "updated to" : "installed", r.version);
-    set_status("Restart to apply");
+    restart_status();
 
 out:
     free(json);
@@ -804,7 +874,7 @@ void conker_mods_uncensor_apply(int choice)
     case CONKER_UNCENSOR_ENABLE:
         if (uncensor_installed()) {
             set_enabled(1);
-            set_status("Restart to apply");
+            restart_status();
         } else {
             start_job(1);
         }
@@ -812,7 +882,7 @@ void conker_mods_uncensor_apply(int choice)
     case CONKER_UNCENSOR_DISABLE:
         if (uncensor_installed()) {
             set_enabled(0);
-            set_status("Restart to apply");
+            restart_status();
         } else {
             set_status("");
         }

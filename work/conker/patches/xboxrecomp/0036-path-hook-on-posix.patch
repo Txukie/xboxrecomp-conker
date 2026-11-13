@@ -1,0 +1,12 @@
+diff --git a/src/kernel/kernel_path.c b/src/kernel/kernel_path.c
+--- a/src/kernel/kernel_path.c
++++ b/src/kernel/kernel_path.c
+@@ -961,6 +961,8 @@
+     return TRUE;
+ 
+ translate:
++    if (g_xbox_path_hook)
++        g_xbox_path_hook(xbox_path);
+     {
+         char remainder_posix[MAX_PATH];
+         snprintf(remainder_posix, sizeof(remainder_posix), "%s", remainder);

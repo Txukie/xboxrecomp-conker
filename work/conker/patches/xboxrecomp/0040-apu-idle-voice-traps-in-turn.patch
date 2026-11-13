@@ -1,0 +1,88 @@
+diff --git a/src/apu/apu_state.h b/src/apu/apu_state.h
+index 88a7f6c..fc0da9c 100644
+--- a/src/apu/apu_state.h
++++ b/src/apu/apu_state.h
+@@ -431,6 +431,9 @@ typedef struct MCPXAPUVPState {
+     float sample_buf[NUM_SAMPLES_PER_FRAME][2];
+     volatile uint8_t voice_locked[MCPX_HW_MAX_VOICES];
+     volatile LONG voice_spin[MCPX_HW_MAX_VOICES];   /* see voice_spin_lock */
++    /* Idle voices already reported to the front end this round (see
++     * mcpx_apu_vp_frame's SE2FE_IDLE_VOICE). */
++    uint8_t idle_reported[MCPX_HW_MAX_VOICES];
+ 
+     struct {
+         int current_entry;
+diff --git a/src/apu/apu_vp.c b/src/apu/apu_vp.c
+index 918c656..01abd80 100644
+--- a/src/apu/apu_vp.c
++++ b/src/apu/apu_vp.c
+@@ -1692,6 +1692,10 @@ static void vp_trace_positions(MCPXAPUState *d)
+ void mcpx_apu_vp_frame(MCPXAPUState *d,
+                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
+ {
++    /* An idle voice to report this frame: the first one not yet reported,
++     * or, when every idle voice has been, the first of them again. */
++    int idle_trapped = 0, idle_again = -1;
++
+     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
+ 
+     for (int list = 0; list < 3; list++) {
+@@ -1717,11 +1721,30 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
+                 /* One trap at a time: once the front end is trapped, a second
+                  * idle voice in the same frame would overwrite FEDECPARAM
+                  * before the ISR has read the first. The rest trap on later
+-                 * frames, after the ISR has resumed the front end. */
+-                if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
+-                        != NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
+-                    fe_method(d, SE2FE_IDLE_VOICE, v);
++                 * frames, after the ISR has resumed the front end.
++                 *
++                 * And each idle voice in turn. DirectSound does not take a
++                 * multichannel stream's first voice off the list until its
++                 * linked partner is idle too, so the first voice stayed idle
++                 * in front of the partner and was reported again every frame,
++                 * and the partner never was: DirectSound gave up on it after
++                 * some 20 s. Conker's 4-channel ambiences are such pairs, and
++                 * every level whose ambience had to be unloaded (leaving
++                 * TrainingLevel for the pub, the windmill for the throne room)
++                 * waited out that time on its loading screen. */
++                if (!d->vp.idle_reported[v]) {
++                    if (!idle_trapped &&
++                        (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
++                            != NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
++                        fe_method(d, SE2FE_IDLE_VOICE, v);
++                        d->vp.idle_reported[v] = 1;
++                        idle_trapped = 1;
++                    }
++                } else if (idle_again < 0) {
++                    idle_again = v;
++                }
+             } else {
++                d->vp.idle_reported[v] = 0;
+                 /* Process voice directly (single-threaded) */
+                 voice_spin_lock(d, v);
+                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
+@@ -1731,6 +1754,15 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
+         }
+     }
+ 
++    /* Every idle voice has had its turn: a new round, from the first. */
++    if (!idle_trapped && idle_again >= 0 &&
++        (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
++            != NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
++        memset(d->vp.idle_reported, 0, sizeof(d->vp.idle_reported));
++        fe_method(d, SE2FE_IDLE_VOICE, (uint16_t)idle_again);
++        d->vp.idle_reported[idle_again] = 1;
++    }
++
+     vp_trace_positions(d);
+     vp_stat_report();
+     if (s_ring_on > 0 && ++s_ring_frames % 1500 == 0)
+@@ -1795,6 +1827,7 @@ void mcpx_apu_vp_reset(MCPXAPUState *d)
+     memset(d->vp.hrtf_submix, 0, sizeof(d->vp.hrtf_submix));
+     memset(d->vp.submix_headroom, 0, sizeof(d->vp.submix_headroom));
+     memset((void *)d->vp.voice_locked, 0, sizeof(d->vp.voice_locked));
++    memset(d->vp.idle_reported, 0, sizeof(d->vp.idle_reported));
+     for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
+         hrtf_filter_init(&d->vp.filters[v].hrtf);
+     }

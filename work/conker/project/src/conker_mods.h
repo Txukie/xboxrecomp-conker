@@ -26,6 +26,19 @@
  * game directory. */
 void conker_mods_init(const char *data_dir, const char *save_dir);
 
+/* The folders alone, for the launcher before conker_mods_init (which sets
+ * them too). */
+void conker_mods_set_dirs(const char *data_dir, const char *save_dir);
+
+/* The launcher's Mods tab: the mods besides Uncensor, in name order, with
+ * whether each is on; and turning one on or off (its .disabled file). */
+int  conker_mods_list(char names[][64], int *on, int max);
+void conker_mods_set_on(const char *name, int on);
+
+/* While the launcher shows (1), a change is this start's: no "Restart to
+ * apply". */
+void conker_mods_prelaunch(int on);
+
 /* The Uncensor option. */
 enum {
     CONKER_UNCENSOR_DISABLE,

@@ -1,0 +1,55 @@
+diff --git a/src/vulkan/nv2a_vk.c b/src/vulkan/nv2a_vk.c
+index 5beb339..5e0ce2e 100644
+--- a/src/vulkan/nv2a_vk.c
++++ b/src/vulkan/nv2a_vk.c
+@@ -1500,7 +1500,11 @@ static Img *tex_from_surface(Tex *t, const Nv2aStage *st, Surf *s)
+ 
+ /* A title that samples its depth buffer reads the zeta surface's memory as
+  * a colour texture: Conker's glow, every frame from the front end on, reads
+- * the 640x480 Z24S8 surface as LIN_R8G8B8A8. Read back for that, each frame
++ * the 640x480 Z24S8 surface as LIN_R8G8B8A8, and its cutscenes' depth of
++ * field as LIN_A8B8G8R8. That one used to be read back instead, which lands
++ * in guest memory only at the next flush: the blur followed the depth of an
++ * earlier pass, out of focus where the subject was and with a hard edge
++ * where the old depth met the new. Read back for that, each frame
+  * waited for the GPU to finish the scene so far, converted 300 000 depths
+  * on the CPU, hashed them, decoded them again a texel at a time and uploaded
+  * the result -- most of the frame on a slower CPU, and a stall of whatever
+@@ -1893,7 +1897,7 @@ static Zeta *zeta_source(const Nv2aStage *st)
+ {
+     int i;
+     if (!s_zsample || st->normalized || st->cube || st->levels > 1
+-        || (st->color != 0x41 && st->color != 0x12))
++        || (st->color != 0x41 && st->color != 0x12 && st->color != 0x3F))
+         return NULL;
+     for (i = 0; i < VK_MAX_ZETAS; i++) {
+         Zeta *z = &s_zetas[i];
+@@ -1908,7 +1912,7 @@ static Zeta *zeta_source(const Nv2aStage *st)
+ static Img *tex_from_zeta(Tex *t, const Nv2aStage *st, Zeta *z)
+ {
+     uint32_t w = st->width * z->sc, h = st->height * z->sc;
+-    int mode = st->color == 0x41 ? 0 : 1;
++    int mode = st->color == 0x41 ? 0 : st->color == 0x12 ? 1 : 2;
+     VkDescriptorImageInfo ii[2];
+     int k;
+ 
+diff --git a/src/vulkan/shaders/zeta_pack.frag b/src/vulkan/shaders/zeta_pack.frag
+index f876fe5..f4857f9 100644
+--- a/src/vulkan/shaders/zeta_pack.frag
++++ b/src/vulkan/shaders/zeta_pack.frag
+@@ -6,6 +6,7 @@
+  *
+  *   mode 0, LIN_R8G8B8A8: A = stencil, R G B = depth from the top byte down
+  *   mode 1, LIN_A8R8G8B8: A R G = depth from the top byte down, B = stencil
++ *   mode 2, LIN_A8B8G8R8: A B G = depth from the top byte down, R = stencil
+  *
+  * The target is B8G8R8A8_UNORM, so each byte is written as itself / 255. */
+ 
+@@ -24,5 +25,6 @@ void main()
+     vec4 b = vec4(float(d24 >> 16), float((d24 >> 8) & 0xFFu), float(d24 & 0xFFu),
+                   float(s)) / 255.0;
+     o_color = pc.mode == 0 ? vec4(b.x, b.y, b.z, b.w)     /* R G B A */
+-                           : vec4(b.y, b.z, b.w, b.x);    /* R G B A */
++            : pc.mode == 1 ? vec4(b.y, b.z, b.w, b.x)
++                           : vec4(b.w, b.z, b.y, b.x);
+ }

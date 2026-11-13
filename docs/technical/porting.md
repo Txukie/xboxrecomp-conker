@@ -260,13 +260,22 @@ monologue's volume command found it gone and played it again from the top.
 `conker_music_commands_wait` (`src/recomp_manual.c`, hook in
 `recomp/gen/recomp_0001.c`) holds the queue until the ambience is in.
 
-## First run and the pipeline seed
+## The launcher and the pipeline seed
 
-With no cfg file, `src/conker_firstrun.c` shows every Recomp Option before the
-game's window opens. It uses the submenu's own rows and is drawn by CPU into an
-SDL texture (wood and chalk from noise, a 5x8 font drawn for this port), so one
-page serves Linux, the Deck and Windows, by pad, keys or mouse. Japanese runs
-in English there, since its letters are Latin only.
+At every start, `src/conker_firstrun.c` shows the options in tabs before the
+game: most rows are the in-game submenu's, plus the monitor, audio device,
+volume, each player's controller and buttons, and the mods folder's mods. It
+is drawn by CPU into an SDL texture (wood and chalk from noise, a 5x8 font
+drawn for this port), as wide as the window's shape, so one page serves
+Linux, the Deck and Windows, by pad, keys or mouse. Its window is the game's
+(`xbox_WindowAdopt`): the display rows reach it at once through
+`xbox_WindowApplyTo`. Japanese runs in English there, since its letters are
+Latin only. Nothing is saved until Start; `CONKER_SKIP_LAUNCHER=1` (the test
+rig's) skips it. The toolkit side is patch 0043: `xbox_InputSetPortDevice` /
+`xbox_InputSetPortMap` (which pad a port takes, by SDL GUID and ordinal, and
+its buttons through `input_map.c`), `xa2_set_device` / `xa2_set_volume`
+(SDL's device by name; on Windows the endpoint of that friendly name for
+XAudio2), and `xbox_WindowSetDisplay`.
 
 `data/pipeline_seed.bin` goes in the executable and is built at every start on
 top of the player's `pipelines.bin` (toolkit patch 0032). A player's list holds

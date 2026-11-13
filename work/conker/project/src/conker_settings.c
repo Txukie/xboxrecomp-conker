@@ -25,9 +25,14 @@
 #include "video_player.h"
 #include "display_aspect.h"
 #include "nv2a_backend.h"
+#include "input_map.h"
 #ifdef CONKER_HAVE_VULKAN
 #include "nv2a_vk.h"
 #endif
+
+/* src/apu (apu_xaudio2.h): the output device and its gain. */
+void xa2_set_device(const char *name);
+void xa2_set_volume(float gain);
 
 /* ── The values ───────────────────────────────────────────────────────── */
 
@@ -46,8 +51,25 @@ static const struct { const char *name; int w, h; } k_aspects[] = {
     { "21:9", 21, 9 }, { "32:9", 32, 9 },
 };
 #define N_ASPECTS ((int)(sizeof k_aspects / sizeof k_aspects[0]))
-static const int k_fps[] = { 30, 60, 90, 120 };
+static const int k_fps[] = { 30, 60, 90, 120, 150, 180, 210, 240 };
 #define N_FPS ((int)(sizeof k_fps / sizeof k_fps[0]))
+/* Image quality (nv2a_vk.h). Texture Detail is a level-of-detail bias. */
+static const int k_msaa[] = { 1, 2, 4, 8 };
+#define N_MSAA ((int)(sizeof k_msaa / sizeof k_msaa[0]))
+static const int k_aniso[] = { 1, 2, 4, 8, 16 };
+#define N_ANISO ((int)(sizeof k_aniso / sizeof k_aniso[0]))
+static const struct { const char *name, *key; float bias; } k_detail[] = {
+    { "Normal", "normal", 0.0f }, { "High", "high", -0.5f }, { "Very High", "very_high", -1.0f },
+};
+#define N_DETAIL ((int)(sizeof k_detail / sizeof k_detail[0]))
+/* Model Detail: the characters' level-of-detail distances, scaled; Max keeps
+ * the full model at any distance. */
+static const struct { const char *name, *key; float scale; } k_models[] = {
+    { "Normal", "normal", 1.0f }, { "High", "high", 2.0f }, { "Very High", "very_high", 4.0f },
+    { "Max", "max", 1000.0f },
+};
+#define N_MODELS ((int)(sizeof k_models / sizeof k_models[0]))
+#define FSR_SHARPNESS 0.25f             /* RCAS, stops below the sharpest */
 #define MAX_SCALE 10
 
 static volatile int s_language;          /* the choice; takes effect at the next launch */
@@ -58,18 +80,33 @@ static volatile int s_res_w, s_res_h;    /* 0: the window's default size */
 static volatile int s_scale = 1;
 static volatile int s_vsync = 1;
 static volatile int s_fps = 30;
+static volatile int s_fsr;               /* Upscaling: 1 FSR 1 */
+static volatile int s_msaa = 1;          /* samples */
+static volatile int s_smaa;
+static volatile int s_aniso = 1;
+static volatile int s_detail;            /* index into k_detail */
+static volatile int s_model;             /* index into k_models */
 static volatile int s_skip_cutscenes;    /* LT skips every cutscene, seen or not */
 static volatile int s_swing_button;      /* X swings the weapon (conker_swing.c) */
 static volatile int s_weapon;            /* 1: the frying pan (conker_weapon.c) */
 static volatile int s_intro_fix;         /* 1: the glass of milk (conker_intro.c) */
 static volatile int s_last_game;         /* 0..2: the pub starts on Game 1..3 (conker_pub.c) */
 static volatile float s_hor_plus;
+/* The launcher's own (conker_firstrun.c): not in the in-game menu. */
+static int s_display = -1;               /* SDL display index; -1 the main one */
+static char s_audio_device[256];         /* "" the system's default */
+static volatile int s_volume = 100;      /* percent */
+static char s_pad[2][48];                /* players 1, 2: "" auto, "none", or a device spec */
+static char s_pad_name[2][96];           /* the named device's name, as last seen */
+static unsigned char s_pad_map[2][INPUT_PAD_CONTROL_COUNT];
 static int s_no_cfg;                     /* no cfg file at the start of this run */
 static int s_first_run;                  /* the first-run page is choosing (conker_firstrun.c) */
 
 static const char *const k_labels[CONKER_OPT_COUNT] = {
     "Language", "Display Mode", "Aspect Ratio", "Resolution",
-    "Render Resolution", "VSync", "FPS Limit", "Allow Skip Cutscenes", "Swing Button", "Weapon", "Intro Fix",
+    "Render Resolution", "Upscaling", "MSAA", "SMAA", "Anisotropic Filtering", "Texture Detail",
+    "Model Detail",
+    "VSync", "Frame Rate", "Allow Skip Cutscenes", "Swing Button", "Weapon", "Intro Fix",
     "Uncensor",
 };
 /* Uncensor: left and right pick, A carries it out (conker_mods.c). */
@@ -131,6 +168,12 @@ static void save(void)
     else
         fprintf(f, "resolution=default\n");
     fprintf(f, "render_scale=%d\n", s_scale);
+    fprintf(f, "upscaling=%s\n", s_fsr ? "fsr1" : "off");
+    fprintf(f, "msaa=%d\n", s_msaa);
+    fprintf(f, "smaa=%s\n", s_smaa ? "on" : "off");
+    fprintf(f, "anisotropic_filtering=%d\n", s_aniso);
+    fprintf(f, "texture_detail=%s\n", k_detail[s_detail].key);
+    fprintf(f, "model_detail=%s\n", k_models[s_model].key);
     fprintf(f, "vsync=%s\n", s_vsync ? "on" : "off");
     fprintf(f, "fps_limit=%d\n", s_fps);
     fprintf(f, "skip_cutscenes=%s\n", s_skip_cutscenes ? "yes" : "no");
@@ -138,6 +181,23 @@ static void save(void)
     fprintf(f, "weapon=%s\n", s_weapon ? "pan" : "bat");
     fprintf(f, "intro_fix=%s\n", s_intro_fix ? "yes" : "no");
     fprintf(f, "last_game=%d\n", s_last_game + 1);
+    fprintf(f, "monitor=%d\n", s_display + 1);
+    fprintf(f, "audio_device=%s\n", s_audio_device);
+    fprintf(f, "volume=%d\n", s_volume);
+    for (int p = 0; p < 2; p++) {
+        InputPadMap id;
+        xbox_InputMap_PadMapDefaults(&id);
+        fprintf(f, "player%d_controller=%s\n", p + 1, s_pad[p][0] ? s_pad[p] : "auto");
+        fprintf(f, "player%d_controller_name=%s\n", p + 1, s_pad_name[p]);
+        if (!memcmp(id.source, s_pad_map[p], sizeof id.source)) {
+            fprintf(f, "player%d_buttons=default\n", p + 1);
+        } else {
+            fprintf(f, "player%d_buttons=", p + 1);
+            for (int c = 0; c < INPUT_PAD_CONTROL_COUNT; c++)
+                fprintf(f, "%s%s", c ? "," : "", xbox_InputMap_SourceName(s_pad_map[p][c]));
+            fprintf(f, "\n");
+        }
+    }
     fclose(f);
 }
 
@@ -178,6 +238,28 @@ static void parse_line(char *line)
             s_scale = i;
     } else if (!strcmp(key, "vsync")) {
         s_vsync = strcmp(val, "off") != 0;
+    } else if (!strcmp(key, "upscaling")) {
+        s_fsr = !strcmp(val, "fsr1");
+    } else if (!strcmp(key, "msaa")) {
+        i = atoi(val);
+        for (int k = 0; k < N_MSAA; k++)
+            if (k_msaa[k] == i)
+                s_msaa = i;
+    } else if (!strcmp(key, "smaa")) {
+        s_smaa = !strcmp(val, "on");
+    } else if (!strcmp(key, "anisotropic_filtering")) {
+        i = atoi(val);
+        for (int k = 0; k < N_ANISO; k++)
+            if (k_aniso[k] == i)
+                s_aniso = i;
+    } else if (!strcmp(key, "texture_detail")) {
+        for (i = 0; i < N_DETAIL; i++)
+            if (!strcmp(val, k_detail[i].key))
+                s_detail = i;
+    } else if (!strcmp(key, "model_detail")) {
+        for (i = 0; i < N_MODELS; i++)
+            if (!strcmp(val, k_models[i].key))
+                s_model = i;
     } else if (!strcmp(key, "swing_button")) {
         s_swing_button = !strcmp(val, "x");
     } else if (!strcmp(key, "weapon")) {
@@ -190,6 +272,38 @@ static void parse_line(char *line)
             s_last_game = i - 1;
     } else if (!strcmp(key, "skip_cutscenes")) {
         s_skip_cutscenes = !strcmp(val, "yes");
+    } else if (!strcmp(key, "monitor")) {
+        i = atoi(val);
+        s_display = i >= 1 && i <= 16 ? i - 1 : -1;
+    } else if (!strcmp(key, "audio_device")) {
+        snprintf(s_audio_device, sizeof s_audio_device, "%s", val);
+    } else if (!strcmp(key, "volume")) {
+        i = atoi(val);
+        if (i >= 0 && i <= 100)
+            s_volume = i;
+    } else if (!strncmp(key, "player", 6) && (key[6] == '1' || key[6] == '2')) {
+        int p = key[6] - '1';
+        if (!strcmp(key + 7, "_controller"))
+            snprintf(s_pad[p], sizeof s_pad[p], "%s", strcmp(val, "auto") ? val : "");
+        else if (!strcmp(key + 7, "_controller_name"))
+            snprintf(s_pad_name[p], sizeof s_pad_name[p], "%s", val);
+        else if (!strcmp(key + 7, "_buttons") && strcmp(val, "default")) {
+            unsigned char m[INPUT_PAD_CONTROL_COUNT];
+            char *tok = val, *comma;
+            int c = 0;
+            for (; c < INPUT_PAD_CONTROL_COUNT && tok; c++, tok = comma ? comma + 1 : NULL) {
+                int src;
+                comma = strchr(tok, ',');
+                if (comma)
+                    *comma = 0;
+                src = xbox_InputMap_SourceFromName(tok);
+                if (src < 0)
+                    break;
+                m[c] = (unsigned char)src;
+            }
+            if (c == INPUT_PAD_CONTROL_COUNT)
+                memcpy(s_pad_map[p], m, sizeof m);
+        }
     } else if (!strcmp(key, "fps_limit")) {
         i = atoi(val);
         for (int k = 0; k < N_FPS; k++)
@@ -223,10 +337,50 @@ static void apply_scale(void)
 #endif
 }
 
+/* Upscaling, MSAA, SMAA, anisotropic filtering, texture detail: the Vulkan
+ * back end's (nv2a_vk.h); the CPU rasteriser has none of them. */
+static void apply_quality(void)
+{
+#ifdef CONKER_HAVE_VULKAN
+    nv2a_vk_set_fsr(s_fsr, FSR_SHARPNESS);
+    nv2a_vk_set_msaa((unsigned)s_msaa);
+    nv2a_vk_set_smaa(s_smaa);
+    nv2a_vk_set_anisotropy((unsigned)s_aniso);
+    nv2a_vk_set_lod_bias(k_detail[s_detail].bias);
+#endif
+}
+
+/* The game always runs at its own 30 frames a second, on the console's
+ * vblank clock: everything in it (jumps, animation, fades, the menus) was
+ * made for that pace, and at any other one some part of it went at the wrong
+ * speed. A higher setting draws that many frames a second by drawing the
+ * frames in between too, each blended between two of the game's
+ * (nv2a_vk_set_interpolation): a multiple of 30, so each game frame is shown
+ * for the same number of them. */
 static void apply_fps(void)
 {
-    /* 30 is the console's: the title's own interval on the vblank clock. */
-    nv2a_pb_exec_set_frame_limit(s_fps == 30 ? 0u : (unsigned)s_fps);
+    nv2a_pb_exec_set_frame_limit(0u);
+#ifdef CONKER_HAVE_VULKAN
+    nv2a_vk_set_interpolation((unsigned)(s_fps / 30));
+#endif
+}
+
+/* The display, the audio device and gain, and which pad each player has:
+ * from the cfg at load, and again as the launcher leaves. */
+static void apply_launcher(void)
+{
+    InputPadMap id;
+    int p;
+
+    xbox_WindowSetDisplay(s_display);
+    xa2_set_device(s_audio_device);
+    xa2_set_volume((float)(s_volume * s_volume) / 10000.0f);
+    xbox_InputMap_PadMapDefaults(&id);
+    for (p = 0; p < 2; p++) {
+        xbox_InputSetPortDevice((DWORD)p, s_pad[p]);
+        xbox_InputSetPortMap((DWORD)p, memcmp(id.source, s_pad_map[p], sizeof id.source)
+                                       ? s_pad_map[p] : NULL);
+    }
 }
 
 void conker_settings_load(void)
@@ -235,6 +389,12 @@ void conker_settings_load(void)
     char line[256];
     const char *e;
 
+    {
+        InputPadMap id;
+        xbox_InputMap_PadMapDefaults(&id);
+        memcpy(s_pad_map[0], id.source, sizeof id.source);
+        memcpy(s_pad_map[1], id.source, sizeof id.source);
+    }
     conker_host_config_path(s_cfg_path, sizeof s_cfg_path);
     f = s_cfg_path[0] ? fopen(s_cfg_path, "r") : NULL;
     if (f) {
@@ -282,6 +442,8 @@ void conker_settings_load(void)
         apply_scale();
     if (s_fps != 30)
         apply_fps();
+    apply_quality();
+    apply_launcher();
 }
 
 int conker_weapon_choice(void)
@@ -292,6 +454,16 @@ int conker_weapon_choice(void)
 int conker_intro_choice(void)
 {
     return s_intro_fix;
+}
+
+int conker_settings_fps_limit(void)
+{
+    return s_fps;
+}
+
+float conker_settings_lod_scale(void)
+{
+    return k_models[s_model].scale;
 }
 
 int conker_settings_last_game(void)
@@ -469,6 +641,30 @@ void conker_options_value(int row, char *buf, size_t size)
         else
             snprintf(buf, size, "%dX", s_scale);
         break;
+    case CONKER_OPT_UPSCALING:
+        snprintf(buf, size, "%s", s_fsr ? "FSR 1" : conker_tr("Off"));
+        break;
+    case CONKER_OPT_MSAA:
+        if (s_msaa > 1)
+            snprintf(buf, size, "%dX", s_msaa);
+        else
+            snprintf(buf, size, "%s", conker_tr("Off"));
+        break;
+    case CONKER_OPT_SMAA:
+        snprintf(buf, size, "%s", conker_tr(s_smaa ? "On" : "Off"));
+        break;
+    case CONKER_OPT_ANISO:
+        if (s_aniso > 1)
+            snprintf(buf, size, "%dX", s_aniso);
+        else
+            snprintf(buf, size, "%s", conker_tr("Off"));
+        break;
+    case CONKER_OPT_TEX_DETAIL:
+        snprintf(buf, size, "%s", conker_tr(k_detail[s_detail].name));
+        break;
+    case CONKER_OPT_MODEL_DETAIL:
+        snprintf(buf, size, "%s", conker_tr(k_models[s_model].name));
+        break;
     case CONKER_OPT_VSYNC:
         snprintf(buf, size, "%s", conker_tr(s_vsync ? "On" : "Off"));
         break;
@@ -554,6 +750,33 @@ static void change(int row, int dir)
         s_scale = wrap(s_scale - 1 + dir, MAX_SCALE) + 1;
         apply_scale();
         break;
+    case CONKER_OPT_UPSCALING:
+        s_fsr = !s_fsr;
+        apply_quality();
+        break;
+    case CONKER_OPT_MSAA:
+        for (i = 0; i < N_MSAA && k_msaa[i] != s_msaa; i++)
+            ;
+        s_msaa = k_msaa[wrap((i < N_MSAA ? i : 0) + dir, N_MSAA)];
+        apply_quality();
+        break;
+    case CONKER_OPT_SMAA:
+        s_smaa = !s_smaa;
+        apply_quality();
+        break;
+    case CONKER_OPT_ANISO:
+        for (i = 0; i < N_ANISO && k_aniso[i] != s_aniso; i++)
+            ;
+        s_aniso = k_aniso[wrap((i < N_ANISO ? i : 0) + dir, N_ANISO)];
+        apply_quality();
+        break;
+    case CONKER_OPT_TEX_DETAIL:
+        s_detail = wrap(s_detail + dir, N_DETAIL);
+        apply_quality();
+        break;
+    case CONKER_OPT_MODEL_DETAIL:
+        s_model = wrap(s_model + dir, N_MODELS);
+        break;
     case CONKER_OPT_VSYNC:
         s_vsync = !s_vsync;
         xbox_WindowSetVsync(s_vsync);
@@ -579,9 +802,7 @@ static void change(int row, int dir)
     case CONKER_OPT_UNCENSOR:
         if (s_uncensor < 0)
             s_uncensor = conker_mods_uncensor_choice();
-        /* Nothing is installed yet to update on the first-run page. */
-        s_uncensor = wrap(s_uncensor + dir, s_first_run ? CONKER_UNCENSOR_UPDATE
-                                                        : CONKER_UNCENSOR_CHOICES);
+        s_uncensor = wrap(s_uncensor + dir, CONKER_UNCENSOR_CHOICES);
         conker_mods_uncensor_clear_status();
         return;                         /* nothing to save: A carries it out */
     default:
@@ -605,14 +826,15 @@ void conker_first_run_begin(int desk_w, int desk_h, const int (*modes)[2], int n
     double best_d = 1e9;
 
     s_first_run = 1;
-    s_page_desk_w = desk_w;
-    s_page_desk_h = desk_h;
-    s_page_nmodes = nmodes > 64 ? 64 : nmodes;
-    if (s_page_nmodes)
-        memcpy(s_page_modes, modes, (size_t)s_page_nmodes * sizeof modes[0]);
+    conker_first_run_display(desk_w, desk_h, modes, nmodes);
+    s_uncensor = -1;
+    /* With a cfg, what it says; the first time, defaults fitted to here. */
+    if (!s_no_cfg) {
+        refit_resolution();
+        return;
+    }
     if (language >= 0 && language < CONKER_LANG_COUNT)
         s_language = language;
-    s_uncensor = CONKER_UNCENSOR_DISABLE;
     if (desk_w > 0 && desk_h > 0) {
         for (i = 0; i < N_ASPECTS; i++) {
             double d = (double)k_aspects[i].w / k_aspects[i].h - (double)desk_w / desk_h;
@@ -635,6 +857,32 @@ void conker_first_run_begin(int desk_w, int desk_h, const int (*modes)[2], int n
     refit_resolution();
 }
 
+/* The display the launcher is on now, and its sizes. */
+void conker_first_run_display(int desk_w, int desk_h, const int (*modes)[2], int nmodes)
+{
+    s_page_desk_w = desk_w;
+    s_page_desk_h = desk_h;
+    s_page_nmodes = nmodes > 64 ? 64 : nmodes;
+    if (s_page_nmodes)
+        memcpy(s_page_modes, modes, (size_t)s_page_nmodes * sizeof modes[0]);
+}
+
+/* The size the window gets in its mode, for the launcher to fit itself. */
+void conker_first_run_window(int *mode, int *w, int *h)
+{
+    *mode = s_mode;
+    *w = s_res_w;
+    *h = s_res_h;
+    if (*w <= 0 || *h <= 0)
+        default_window_size(w, h);
+}
+
+void conker_first_run_refit(void)
+{
+    refit_resolution();
+    apply_window();
+}
+
 int conker_first_run_language(void)
 {
     return s_language;
@@ -653,15 +901,88 @@ void conker_first_run_end(void)
     s_language_now = s_language;
     conker_lang_set(s_language_now);
     xbox_SetLanguage(k_languages[s_language_now].xbox);
+    apply_launcher();
     save();
 }
 
-/* Once the mods are up: the Uncensor choice, carried out as A would. */
+/* Before the mods are laid over the game: an Uncensor choice left showing
+ * without A is carried out too, On or Off (an Update waits for A). */
 void conker_first_run_apply_mods(void)
 {
-    if (s_uncensor == CONKER_UNCENSOR_ENABLE)
+    if (s_uncensor >= 0 && s_uncensor != CONKER_UNCENSOR_UPDATE
+            && s_uncensor != conker_mods_uncensor_choice())
         conker_mods_uncensor_apply(s_uncensor);
     s_uncensor = -1;
+}
+
+static void activate(int row);
+
+/* A on a row (the launcher): what it does in the in-game menu. */
+void conker_first_run_activate(int row)
+{
+    activate(row);
+}
+
+/* ── The launcher's own values ───────────────────────────────────────── */
+
+int conker_settings_display(void)
+{
+    return s_display;
+}
+
+void conker_settings_set_display(int index)
+{
+    s_display = index;
+    xbox_WindowSetDisplay(index);
+    save();
+}
+
+const char *conker_settings_audio_device(void)
+{
+    return s_audio_device;
+}
+
+void conker_settings_set_audio_device(const char *name)
+{
+    snprintf(s_audio_device, sizeof s_audio_device, "%s", name ? name : "");
+    save();
+}
+
+int conker_settings_volume(void)
+{
+    return s_volume;
+}
+
+void conker_settings_set_volume(int pct)
+{
+    s_volume = pct < 0 ? 0 : pct > 100 ? 100 : pct;
+    xa2_set_volume((float)(s_volume * s_volume) / 10000.0f);
+    save();
+}
+
+const char *conker_settings_pad(int player, const char **name)
+{
+    if (name)
+        *name = s_pad_name[player & 1];
+    return s_pad[player & 1];
+}
+
+void conker_settings_set_pad(int player, const char *spec, const char *name)
+{
+    snprintf(s_pad[player & 1], sizeof s_pad[0], "%s", spec ? spec : "");
+    snprintf(s_pad_name[player & 1], sizeof s_pad_name[0], "%s", name ? name : "");
+    save();
+}
+
+void conker_settings_pad_map(int player, unsigned char source[16])
+{
+    memcpy(source, s_pad_map[player & 1], INPUT_PAD_CONTROL_COUNT);
+}
+
+void conker_settings_set_pad_map(int player, const unsigned char source[16])
+{
+    memcpy(s_pad_map[player & 1], source, INPUT_PAD_CONTROL_COUNT);
+    save();
 }
 
 /* A on a row: what right does, except where A has its own meaning. */
