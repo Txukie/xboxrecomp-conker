@@ -1,0 +1,987 @@
+diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
+index c96663a..84f45a6 100644
+--- a/src/kernel/nv2a_backend.h
++++ b/src/kernel/nv2a_backend.h
+@@ -195,6 +195,9 @@ typedef struct {
+      * c[0..191]. */
+     const uint32_t   (*program)[8];
+     uint32_t           ninst;
++    /* Changes whenever the program does (nv2a_vsh_program_gen), never back
++     * to an earlier value: the same number is the same program. */
++    uint64_t           prog_gen;
+     const float      (*constants)[4];
+     /* What the executor does to oPos after the program: x, y times the
+      * anti-aliasing scale; the near plane is screen z = near_z (the
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index 35a9616..1aac87a 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -3460,7 +3460,18 @@ static void backend_program_batch(void)
+         near_z = !(e && e[0] == '0');
+     }
+     memset(&pb, 0, sizeof pb);
+-    pb.ninst = (uint32_t)nv2a_vsh_export(prog);
++    /* Exported again only when it changed: it is the same for most draws. */
++    {
++        static uint64_t gen;
++        static uint32_t ninst;
++        uint64_t g = nv2a_vsh_program_gen();
++        if (g != gen) {
++            ninst = (uint32_t)nv2a_vsh_export(prog);
++            gen = g;
++        }
++        pb.ninst = ninst;
++        pb.prog_gen = gen;
++    }
+     if (!pb.ninst)
+         return;                                        /* no program loaded */
+     pb.count = program_triangles(n);
+@@ -3936,7 +3947,10 @@ static void draw_primitive(void)
+         }
+     }
+ 
+-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
++    static int verbose = -1;        /* every draw: read once */
++    if (verbose < 0)
++        verbose = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
++    if (verbose) {
+         static int shown;
+         if (shown++ < 6) {
+             fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
+@@ -4432,6 +4446,34 @@ static void reports_drain(void)
+     s_nreports = 0;
+ }
+ 
++/* A run of n words to one method that only gathers a draw's data -- the
++ * indices of ARRAY_ELEMENT16, the vertices of INLINE_ARRAY: the same as n
++ * calls of nv2a_pb_exec_method, in one (they are most of the pushbuffer's
++ * words, and the walk handed them over one call each). 0 for anything else,
++ * or outside BEGIN/END, which goes word by word as before. */
++int nv2a_pb_exec_run(uint32_t subch, uint32_t method, const uint32_t *p, uint32_t n)
++{
++    uint32_t i;
++
++    if (subch != 0 || !n || !s_gpu.prim
++        || (method != NV097_ARRAY_ELEMENT16 && method != NV097_INLINE_ARRAY))
++        return 0;
++    s_reg[method / 4] = p[n - 1];
++    if (method == NV097_INLINE_ARRAY) {
++        uint32_t room = NV_MAX_INLINE - s_gpu.inline_count;
++        if (n < room)
++            room = n;
++        memcpy(&s_gpu.inline_buf[s_gpu.inline_count], p, (size_t)room * 4);
++        s_gpu.inline_count += room;
++    } else {
++        for (i = 0; i < n && s_gpu.idx_count + 2 <= NV_MAX_INDICES; i++) {
++            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(p[i] & 0xFFFF);
++            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(p[i] >> 16);
++        }
++    }
++    return 1;
++}
++
+ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+ {
+     static int inited;
+diff --git a/src/kernel/nv2a_pb_scan.c b/src/kernel/nv2a_pb_scan.c
+index 4471ff5..e985bfc 100644
+--- a/src/kernel/nv2a_pb_scan.c
++++ b/src/kernel/nv2a_pb_scan.c
+@@ -44,6 +44,7 @@ static uint32_t s_tot_calls;
+  * the executor writes to guest memory. */
+ extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
+ extern void nv2a_pb_exec_report(void);
++extern int nv2a_pb_exec_run(uint32_t subch, uint32_t method, const uint32_t *p, uint32_t n);
+ static int s_exec_enabled = -1;
+ static int s_scan_enabled = -1;
+ 
+@@ -282,7 +283,8 @@ static void pb_consume(const uint8_t *mem, uint32_t put, uint32_t *words)
+         uint32_t m = s_pend_noninc ? s_pend_method : s_pend_method + s_pend_i * 4;
+         uint32_t param = *(const uint32_t *)(mem + (0x80000000u | s_get));
+ 
+-        note(s_pend_subch, m);
++        if (s_scan_enabled > 0)
++            note(s_pend_subch, m);
+         /* Same walk, two consumers: the survey counts, the executor
+          * acts. Keeping them on one decode means they can never
+          * disagree about what the stream said. */
+@@ -514,9 +516,22 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
+             uint32_t method =  w & 0x1FFCu;
+             int noninc = (w & 0xE0000000u) == 0x40000000u;
+ 
++            /* A draw's indices or vertices, all in the segment: at once. */
++            if (s_exec_enabled && noninc && count > 1 && end_va - va >= count * 4
++                && nv2a_pb_exec_run(subch, method, (const uint32_t *)(mem + va), count)) {
++                if (s_scan_enabled > 0)
++                    for (uint32_t i = 0; i < count; i++)
++                        note(subch, method);
++                va += count * 4;
++                words += count;
++                continue;
++            }
+             for (uint32_t i = 0; i < count && va < end_va; i++) {
+                 uint32_t m = noninc ? method : method + i * 4;
+-                note(subch, m);
++                /* The survey's inventory, for RECOMP_PB_SCAN's report
++                 * only: a table look-up per word otherwise wasted. */
++                if (s_scan_enabled > 0)
++                    note(subch, m);
+                 if (s_exec_enabled)
+                     nv2a_pb_exec_method(subch, m,
+                                         *(const uint32_t *)(mem + va));
+diff --git a/src/kernel/nv2a_vsh_interp.c b/src/kernel/nv2a_vsh_interp.c
+index 6e7971e..6645505 100644
+--- a/src/kernel/nv2a_vsh_interp.c
++++ b/src/kernel/nv2a_vsh_interp.c
+@@ -62,10 +62,14 @@ void nv2a_vsh_set_load_slot(uint32_t slot)
+ }
+ 
+ static int s_decoded_stale = 1;
++static uint64_t s_prog_gen = 1;            /* nv2a_vsh_program_gen */
++
++uint64_t nv2a_vsh_program_gen(void) { return s_prog_gen; }
+ 
+ void nv2a_vsh_program_word(uint32_t word)
+ {
+     s_decoded_stale = 1;
++    s_prog_gen++;
+     if (s_load_slot < NV2A_VSH_SLOTS)
+         s_program[s_load_slot][s_load_word] = word;
+     if (++s_load_word == 4) {
+@@ -74,7 +78,12 @@ void nv2a_vsh_program_word(uint32_t word)
+     }
+ }
+ 
+-void nv2a_vsh_set_start_slot(uint32_t slot) { s_start_slot = slot; s_decoded_stale = 1; }
++void nv2a_vsh_set_start_slot(uint32_t slot)
++{
++    s_start_slot = slot;
++    s_decoded_stale = 1;
++    s_prog_gen++;
++}
+ void nv2a_vsh_set_cxt_write(uint32_t enable) { s_cxt_write = enable; }
+ int nv2a_vsh_cxt_write(void) { return s_cxt_write != 0; }
+ 
+@@ -119,6 +128,7 @@ void nv2a_vsh_set_constant(uint32_t index, const float v[4])
+ void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4])
+ {
+     s_decoded_stale = 1;
++    s_prog_gen++;
+     if (slot < NV2A_VSH_SLOTS)
+         memcpy(s_program[slot], words, sizeof s_program[slot]);
+ }
+@@ -229,6 +239,11 @@ typedef struct {
+ 
+ static VshIns s_decoded[NV2A_VSH_SLOTS];
+ static int s_ndecoded;                     /* 0: no FINAL, nothing to run */
++/* The instructions oFog depends on, in program order (nv2a_vsh_carry_update
++ * runs only these), and how many; s_fog_slice_n 0 when the program never
++ * writes oFog. */
++static uint8_t s_fog_slice[NV2A_VSH_SLOTS];
++static int s_fog_slice_n;
+ 
+ static void decode_src(VshSrc *d, const uint32_t *ins, int which)
+ {
+@@ -264,6 +279,52 @@ static void decode_src(VshSrc *d, const uint32_t *ins, int which)
+     }
+ }
+ 
++/* Which instructions oFog depends on: from the last back, one is kept if
++ * it writes oFog or a register a kept one after it reads (temps, oPos as
++ * R12, a0 for c[a0+i]); then what it reads is needed too. Writes never
++ * clear a register from the needed set -- a masked write leaves the other
++ * components -- so the set is a little larger than it has to be, never
++ * smaller: the slice leaves oFog exactly as the whole program does. */
++static void fog_slice(void)
++{
++    uint32_t live = 0;                     /* bits 0..11 temps, 12 oPos, 13 a0 */
++    int keep[NV2A_VSH_SLOTS], i, k, n = 0, fog = 0;
++
++    for (i = s_ndecoded - 1; i >= 0; i--) {
++        const VshIns *d = &s_decoded[i];
++        uint32_t writes = 0;
++        int writes_fog = d->omask && d->out_to_o && d->oaddr == 5;
++
++        if (d->mac_dst >= 0)
++            writes |= 1u << d->mac_dst;
++        if (d->mac == 13)
++            writes |= 1u << 13;
++        if (d->ilu_dst >= 0)
++            writes |= 1u << d->ilu_dst;
++        if (d->omask && d->out_to_o && d->oaddr == 0)
++            writes |= 1u << 12;
++        keep[i] = writes_fog || (writes & live);
++        if (!keep[i])
++            continue;
++        fog |= writes_fog;
++        for (k = 0; k < 3; k++) {
++            const VshSrc *r = &d->src[k];
++            if ((k == 0 && !d->need_a) || (k == 1 && !d->need_b) || (k == 2 && !d->need_c))
++                continue;
++            if (r->kind == SRC_TEMP)
++                live |= 1u << r->idx;
++            else if (r->kind == SRC_OPOS)
++                live |= 1u << 12;
++            else if (r->kind == SRC_CONST_REL)
++                live |= 1u << 13;
++        }
++    }
++    for (i = 0; i < s_ndecoded && fog; i++)
++        if (keep[i])
++            s_fog_slice[n++] = (uint8_t)i;
++    s_fog_slice_n = n;
++}
++
+ void nv2a_vsh_prepare(void)
+ {
+     uint32_t s;
+@@ -298,9 +359,11 @@ void nv2a_vsh_prepare(void)
+             decode_src(&d->src[k], ins, k);
+         if (field(ins, 3, 0, 1)) {
+             s_ndecoded = n;
++            fog_slice();
+             return;
+         }
+     }
++    s_fog_slice_n = 0;
+ }
+ 
+ int nv2a_vsh_export(uint32_t out[NV2A_VSH_SLOTS][8])
+@@ -468,12 +531,68 @@ const float *nv2a_vsh_carry_fog(void)
+     return s_carry_fog;
+ }
+ 
++/* One instruction: both units read their sources before either writes. */
++static inline void run_ins(const VshIns *d, const float in[NV2A_VSH_INPUTS][4], vec4 *temp,
++                           vec4 *opos, int *a0, float outregs[13][4])
++{
++    vec4 a, b, c;
++    vec4 mres = {{0, 0, 0, 0}}, ires = {{0, 0, 0, 0}};
++
++    a = b = c = mres;
++    if (d->need_a) fetch_src(&d->src[0], in, temp, opos, *a0, &a);
++    if (d->need_b) fetch_src(&d->src[1], in, temp, opos, *a0, &b);
++    if (d->need_c) fetch_src(&d->src[2], in, temp, opos, *a0, &c);
++
++    if (d->mac)
++        run_mac(d->mac, &a, &b, &c, a0, &mres);
++    if (d->ilu)
++        run_ilu(d->ilu, &c, &ires);
++
++    if (d->mac_dst >= 0)
++        write_masked(d->mac_dst == 12 ? opos->v : temp[d->mac_dst].v,
++                     &mres, d->mac_mask);
++    /* Paired with any MAC op, the ILU can only write R1 -- even when
++     * the MAC half writes no temp at all. The D3D epilogue is exactly
++     * that: `mul o[0].xyz` beside `rcc R1.x`, then `mad` with R1.x.
++     * Sending the rcc to the temp field (R7 there) left R1.x at 0 and
++     * put every vertex of every 3D batch at c[59]. */
++    if (d->ilu_dst >= 0)
++        write_masked(d->ilu_dst == 12 ? opos->v : temp[d->ilu_dst].v,
++                     &ires, d->ilu_mask);
++    if (d->omask) {
++        const vec4 *src = d->out_ilu ? &ires : &mres;
++        if (!d->out_to_o) {                           /* to c[] */
++            if (s_cxt_write && d->oaddr < NV2A_VSH_CONSTANTS)
++                write_masked(s_const[d->oaddr], src, d->omask);
++        } else if (d->oaddr == 0) {
++            write_masked(opos->v, src, d->omask);
++        } else if (d->oaddr < 13) {
++            write_masked(outregs[d->oaddr], src, d->omask);
++        }
++    }
++}
++
++/* Only the instructions oFog depends on (fog_slice), from the same start:
++ * running the whole program once per batch for this was a twentieth of the
++ * executor's time. A program that never writes oFog leaves it as it was. */
+ void nv2a_vsh_carry_update(const float in[NV2A_VSH_INPUTS][4])
+ {
+-    Nv2aVshOutput o;
++    vec4 temp[12], opos;
++    float outregs[13][4];
++    int a0 = 0, i;
+ 
+-    if (nv2a_vsh_run(in, &o))
+-        memcpy(s_carry_fog, o.fog, sizeof s_carry_fog);
++    nv2a_vsh_prepare();
++    if (!s_ndecoded)
++        return;
++    if (!s_fog_slice_n)
++        return;
++    memset(temp, 0, sizeof temp);
++    memset(&opos, 0, sizeof opos);
++    memset(outregs, 0, sizeof outregs);
++    memcpy(outregs[5], s_carry_fog, sizeof outregs[5]);
++    for (i = 0; i < s_fog_slice_n; i++)
++        run_ins(&s_decoded[s_fog_slice[i]], in, temp, &opos, &a0, outregs);
++    memcpy(s_carry_fog, outregs[5], sizeof s_carry_fog);
+ }
+ 
+ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+@@ -518,45 +637,8 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+     outregs[9][3] = outregs[10][3] = outregs[11][3] = outregs[12][3] = 1.0f;
+ 
+     nv2a_vsh_prepare();
+-    for (s = 0; s < (uint32_t)s_ndecoded; s++) {
+-        const VshIns *d = &s_decoded[s];
+-        vec4 a, b, c;
+-        vec4 mres = {{0, 0, 0, 0}}, ires = {{0, 0, 0, 0}};
+-
+-        /* Both units read their sources before either writes. */
+-        a = b = c = mres;
+-        if (d->need_a) fetch_src(&d->src[0], in, temp, &opos, a0, &a);
+-        if (d->need_b) fetch_src(&d->src[1], in, temp, &opos, a0, &b);
+-        if (d->need_c) fetch_src(&d->src[2], in, temp, &opos, a0, &c);
+-
+-        if (d->mac)
+-            run_mac(d->mac, &a, &b, &c, &a0, &mres);
+-        if (d->ilu)
+-            run_ilu(d->ilu, &c, &ires);
+-
+-        if (d->mac_dst >= 0)
+-            write_masked(d->mac_dst == 12 ? opos.v : temp[d->mac_dst].v,
+-                         &mres, d->mac_mask);
+-        /* Paired with any MAC op, the ILU can only write R1 -- even when
+-         * the MAC half writes no temp at all. The D3D epilogue is exactly
+-         * that: `mul o[0].xyz` beside `rcc R1.x`, then `mad` with R1.x.
+-         * Sending the rcc to the temp field (R7 there) left R1.x at 0 and
+-         * put every vertex of every 3D batch at c[59]. */
+-        if (d->ilu_dst >= 0)
+-            write_masked(d->ilu_dst == 12 ? opos.v : temp[d->ilu_dst].v,
+-                         &ires, d->ilu_mask);
+-        if (d->omask) {
+-            const vec4 *src = d->out_ilu ? &ires : &mres;
+-            if (!d->out_to_o) {                           /* to c[] */
+-                if (s_cxt_write && d->oaddr < NV2A_VSH_CONSTANTS)
+-                    write_masked(s_const[d->oaddr], src, d->omask);
+-            } else if (d->oaddr == 0) {
+-                write_masked(opos.v, src, d->omask);
+-            } else if (d->oaddr < 13) {
+-                write_masked(outregs[d->oaddr], src, d->omask);
+-            }
+-        }
+-    }
++    for (s = 0; s < (uint32_t)s_ndecoded; s++)
++        run_ins(&s_decoded[s], in, temp, &opos, &a0, outregs);
+     if (s_ndecoded) {
+         memcpy(out->pos, opos.v, sizeof out->pos);
+         /* The NV2A clamps the colour outputs to 0..1 before they are
+diff --git a/src/kernel/nv2a_vsh_interp.h b/src/kernel/nv2a_vsh_interp.h
+index e4b77bf..16c9f1c 100644
+--- a/src/kernel/nv2a_vsh_interp.h
++++ b/src/kernel/nv2a_vsh_interp.h
+@@ -75,6 +75,10 @@ void nv2a_vsh_carry_update(const float in[NV2A_VSH_INPUTS][4]);
+  *       3 constant, 4 constant + a0.x
+  * and nv2a_vsh_constants() is c[0..NV2A_VSH_CONSTANTS). */
+ int nv2a_vsh_export(uint32_t out[NV2A_VSH_SLOTS][8]);
++/* A number that changes whenever the program does (a program word, an
++ * instruction or the start slot), and never comes back: the same number,
++ * the same program. */
++uint64_t nv2a_vsh_program_gen(void);
+ const float (*nv2a_vsh_constants(void))[4];
+ 
+ /* Direct access, for the self-test. */
+diff --git a/src/vulkan/nv2a_vk.c b/src/vulkan/nv2a_vk.c
+index c3a075b..bfc7444 100644
+--- a/src/vulkan/nv2a_vk.c
++++ b/src/vulkan/nv2a_vk.c
+@@ -198,6 +198,7 @@ static int s_cur;
+ static VkDeviceSize s_kc_off = UINT64_MAX, s_kp_off = UINT64_MAX;
+ static float s_kc_last[192][4];
+ static uint32_t s_kp_last[NV2A_VSH_SLOTS_VK][8], s_kp_n;
++static uint64_t s_kp_gen;        /* Nv2aProgramBatch.prog_gen of s_kp_last */
+ 
+ /* Where a slow frame's time went, since the last flip (RECOMP_VK_VERBOSE
+  * reports frames over 50 ms): on the recording thread, compiling pipelines
+@@ -444,7 +445,20 @@ static void img_destroy_now(Img *im)
+     memset(im, 0, sizeof *im);
+ }
+ 
+-static void flush(void);
++/* Every full flush (submit and wait for the GPU) is counted by its caller,
++ * for RECOMP_VK_VERBOSE's report of where frames wait. */
++static void flush_from(const char *who);
++#define flush() flush_from(__func__)
++/* Full flushes by caller since the last report: count and wait time; and
++ * the time soft flushes waited for the other slot. */
++static struct { const char *who; uint32_t n; uint64_t us; } s_fl_by[24];
++static uint64_t s_soft_wait_us;
++/* Surfaces written back to guest memory since the last report, by flush
++ * caller: the guest address, size and how many times. */
++static struct { const char *who; uint32_t va, w, h, bpp, n; } s_rb_by[32];
++/* Time in the flip's resolve, in writing surfaces back and in hashing
++ * textures, since the last report. */
++static uint64_t s_t_resolve, s_t_wb, s_t_texhash, s_texhash_bytes, s_texhash_n;
+ static void soft_flush(void);
+ 
+ static void img_retire(Img *im)
+@@ -499,6 +513,105 @@ static uint64_t hash_bytes(uint64_t h, const uint8_t *p, size_t n)
+     return h * K;
+ }
+ 
++#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
++#include <immintrin.h>
++/* Textures are hashed every frame they are used, to notice what the CPU
++ * wrote into them: about 6 MB a frame in Conker's pub, at 14 GB/s with
++ * hash_bytes -- its multiplies, not memory, were the limit. With AVX2,
++ * 64 bytes a step in eight 64-bit lanes (two vectors). Each lane adds
++ * the 32x32->64 product of its keyed data's halves and its neighbour's raw
++ * data -- XXH3's accumulator -- the lanes are scrambled every 1 KB, mixed
++ * at the end with the length, and the tail goes through hash_bytes. */
++__attribute__((target("avx2"))) static uint64_t tex_hash_avx2(const uint8_t *p, size_t n)
++{
++    const __m256i key0 = _mm256_set_epi64x(0x1F67B3B7A4A44072ll, (long long)0xDB979083E96DD4DEull,
++                                           0x1CAD21F72C81017Cll, (long long)0xBE4BA423396CFEB8ull);
++    const __m256i key1 = _mm256_set_epi64x(0x4C263A81E69035E0ll, (long long)0x8E2443F7744608B8ull,
++                                           0x2172FFCC7DD05A82ll, 0x78E5C0CC4EE679CBll);
++    const __m256i prime = _mm256_set1_epi32((int)0x9E3779B1u);
++    __m256i a0 = _mm256_set_epi64x(0x165667B19E3779F9ll, (long long)0xC2B2AE3D27D4EB4Full,
++                                   (long long)0x9E3779B185EBCA87ull, (long long)0xC2B2AE3D27D4EB4Full);
++    __m256i a1 = _mm256_set_epi64x((long long)0xFF51AFD7ED558CCDull, (long long)0x9E3779B97F4A7C15ull,
++                                   0x27D4EB2F165667C5ll, (long long)0x85EBCA77C2B2AE63ull);
++    size_t len = n, stripe = 0;
++    uint64_t acc[8], h;
++    int k;
++
++    for (; n >= 64; n -= 64, p += 64) {
++        __m256i d0 = _mm256_loadu_si256((const __m256i *)p);
++        __m256i d1 = _mm256_loadu_si256((const __m256i *)(p + 32));
++        __m256i k0 = _mm256_xor_si256(d0, key0), k1 = _mm256_xor_si256(d1, key1);
++        __m256i m0 = _mm256_mul_epu32(k0, _mm256_srli_epi64(k0, 32));
++        __m256i m1 = _mm256_mul_epu32(k1, _mm256_srli_epi64(k1, 32));
++        a0 = _mm256_add_epi64(a0, _mm256_add_epi64(m0, _mm256_shuffle_epi32(d0, 0x4E)));
++        a1 = _mm256_add_epi64(a1, _mm256_add_epi64(m1, _mm256_shuffle_epi32(d1, 0x4E)));
++        if (++stripe == 16) {
++            __m256i x0, x1, lo, hi;
++            stripe = 0;
++            x0 = _mm256_xor_si256(_mm256_xor_si256(a0, _mm256_srli_epi64(a0, 47)), key0);
++            x1 = _mm256_xor_si256(_mm256_xor_si256(a1, _mm256_srli_epi64(a1, 47)), key1);
++            lo = _mm256_mul_epu32(x0, prime);
++            hi = _mm256_mul_epu32(_mm256_srli_epi64(x0, 32), prime);
++            a0 = _mm256_add_epi64(lo, _mm256_slli_epi64(hi, 32));
++            lo = _mm256_mul_epu32(x1, prime);
++            hi = _mm256_mul_epu32(_mm256_srli_epi64(x1, 32), prime);
++            a1 = _mm256_add_epi64(lo, _mm256_slli_epi64(hi, 32));
++        }
++    }
++    _mm256_storeu_si256((__m256i *)acc, a0);
++    _mm256_storeu_si256((__m256i *)(acc + 4), a1);
++    h = len * 0x9E3779B185EBCA87ull;
++    for (k = 0; k < 8; k++) {
++        uint64_t a = acc[k];
++        a ^= a >> 33; a *= 0xFF51AFD7ED558CCDull; a ^= a >> 33;
++        h = (h ^ a) * 0xC4CEB9FE1A85EC53ull + 0x165667B19E3779F9ull;
++    }
++    return n ? hash_bytes(h, p, n) : h ^ (h >> 31);
++}
++
++#endif
++
++/* A texture's bytes: the AVX2 hash where the CPU has it (about 4x as fast:
++ * 66 GB/s from cache on the desktop; no 1-3 byte change in a million left
++ * it unchanged), else hash_bytes. Never compared across machines or runs. */
++static uint64_t tex_hash(const uint8_t *p, size_t n)
++{
++#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
++    static int avx2 = -1;
++    if (avx2 < 0)
++        avx2 = __builtin_cpu_supports("avx2") != 0;
++    if (avx2)
++        return tex_hash_avx2(p, n);
++#endif
++    return hash_bytes(0, p, n);
++}
++
++/* hash_bytes(h, src, n), copying src to dst as it goes: one pass over the
++ * bytes instead of a copy and a hash of what was written. */
++static uint64_t hash_copy(uint64_t h, uint8_t *dst, const uint8_t *p, size_t n)
++{
++    uint64_t a = h ^ 0x9E3779B97F4A7C15ull, b = h + 0xC2B2AE3D27D4EB4Full;
++    uint64_t c = h ^ 0x165667B19E3779F9ull, d = h + 0x27D4EB2F165667C5ull;
++    const uint64_t K = 0xFF51AFD7ED558CCDull;
++
++    for (; n >= 32; n -= 32, p += 32, dst += 32) {
++        uint64_t w[4];
++        memcpy(w, p, 32);
++        memcpy(dst, w, 32);
++        a = (a ^ w[0]) * K; a ^= a >> 29;
++        b = (b ^ w[1]) * K; b ^= b >> 29;
++        c = (c ^ w[2]) * K; c ^= c >> 29;
++        d = (d ^ w[3]) * K; d ^= d >> 29;
++    }
++    for (; n; n--, p++, dst++) {
++        *dst = *p;
++        a = (a ^ *p) * K;
++    }
++    h = a ^ (b * 3) ^ (c * 5) ^ (d * 7);
++    h ^= h >> 31;
++    return h * K;
++}
++
+ /* ---- Surfaces ------------------------------------------------------- */
+ 
+ typedef struct {
+@@ -727,12 +840,49 @@ static void surf_upload(Surf *s)
+     s_fr_ups++;
+ }
+ 
++/* RECOMP_VK_VERBOSE: a surface written back, by flush caller. */
++static void rb_note(const Surf *s, const char *who)
++{
++    int i;
++    for (i = 0; i < 32 && s_rb_by[i].who; i++)
++        if (s_rb_by[i].who == who && s_rb_by[i].va == s->va && s_rb_by[i].w == s->w)
++            break;
++    if (i == 32)
++        return;
++    s_rb_by[i].who = who;
++    s_rb_by[i].va = s->va;
++    s_rb_by[i].w = s->w;
++    s_rb_by[i].h = s->h;
++    s_rb_by[i].bpp = s->bpp;
++    s_rb_by[i].n++;
++}
++
++/* The surface at its guest size into buf at off (recorded). */
++static int surf_copy_out(Surf *s, VkBuffer buf, VkDeviceSize off)
++{
++    VkBufferImageCopy r;
++
++    end_rendering();
++    barrier_all();
++    r = copy_region(s->w, s->h, 1, off, VK_IMAGE_ASPECT_COLOR_BIT);
++    if (s->sc > 1) {
++        if (!lo_get(&s->lo, s->w, s->h, s->color.fmt))
++            return 0;
++        blit(s->color.image, s->lo.image, s->color.w, s->color.h, s->w, s->h,
++             VK_IMAGE_ASPECT_COLOR_BIT, VK_FILTER_LINEAR);
++        vkCmdCopyImageToBuffer(cmd(), s->lo.image, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &r);
++    } else {
++        vkCmdCopyImageToBuffer(cmd(), s->color.image, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &r);
++    }
++    barrier_all();
++    return 1;
++}
++
+ /* The image into guest memory, at the next flush. */
+ static void surf_queue_readback(Surf *s)
+ {
+     size_t bytes = (size_t)s->w * s->h * s->bpp;
+     VkDeviceSize off;
+-    VkBufferImageCopy r;
+     int i;
+ 
+     if (s_replay)                 /* an in-between frame is not the title's */
+@@ -747,21 +897,8 @@ static void surf_queue_readback(Surf *s)
+         if (off == UINT64_MAX)
+             return;
+     }
+-    end_rendering();
+-    barrier_all();
+-    r = copy_region(s->w, s->h, 1, off, VK_IMAGE_ASPECT_COLOR_BIT);
+-    if (s->sc > 1) {
+-        if (!lo_get(&s->lo, s->w, s->h, s->color.fmt))
+-            return;
+-        blit(s->color.image, s->lo.image, s->color.w, s->color.h, s->w, s->h,
+-             VK_IMAGE_ASPECT_COLOR_BIT, VK_FILTER_LINEAR);
+-        vkCmdCopyImageToBuffer(cmd(), s->lo.image, VK_IMAGE_LAYOUT_GENERAL,
+-                               s_rrd.buf, 1, &r);
+-    } else {
+-        vkCmdCopyImageToBuffer(cmd(), s->color.image, VK_IMAGE_LAYOUT_GENERAL,
+-                               s_rrd.buf, 1, &r);
+-    }
+-    barrier_all();
++    if (!surf_copy_out(s, s_rrd.buf, off))
++        return;
+     s_reads[s_nreads].s = s;
+     s_reads[s_nreads].off = off;
+     s_nreads++;
+@@ -778,13 +915,19 @@ static void surf_write_guest(Surf *s, const uint8_t *src)
+         s->force_upload = 1;
+         return;
+     }
+-    if (s->swz_w)
++    if (s->swz_w) {
+         xbox_swizzle_rect(guest(s->va), src, s->w, s->h, s->bpp);
+-    else
++        s->guest_hash = surf_hash_guest(s);
++    } else if (s->pitch == surf_row_bytes(s)) {
++        /* As surf_hash_guest hashes it: one span. */
++        s->guest_hash = hash_copy(0, guest(s->va), src, surf_span(s));
++    } else {
++        uint64_t h = 0;
+         for (y = 0; y < s->h; y++)
+-            memcpy(guest(s->va + y * s->pitch), src + (size_t)y * surf_row_bytes(s),
+-                   surf_row_bytes(s));
+-    s->guest_hash = surf_hash_guest(s);
++            h = hash_copy(h, guest(s->va + y * s->pitch), src + (size_t)y * surf_row_bytes(s),
++                          surf_row_bytes(s));
++        s->guest_hash = h;
++    }
+     s->checked_frame = s_frame;
+     s->gpu_dirty = 0;
+ }
+@@ -2044,9 +2187,17 @@ static Img *tex_get(const Nv2aStage *st)
+         s_tex_rt++;
+     if (!t->img.image)
+         s_tex_new++;
+-    h = hash_bytes(0, guest(st->offset), bytes);
+-    if (st->palette && nv2a_backend_guest_span_ok(st->palette, 1024))
+-        h = hash_bytes(h, guest(st->palette), 1024);
++    {
++        uint64_t th = s_verbose ? now_us() : 0;
++        h = tex_hash(guest(st->offset), bytes);
++        if (st->palette && nv2a_backend_guest_span_ok(st->palette, 1024))
++            h = hash_bytes(h, guest(st->palette), 1024);
++        if (s_verbose) {
++            s_t_texhash += now_us() - th;
++            s_texhash_bytes += bytes;
++            s_texhash_n++;
++        }
++    }
+     t->hashed_frame = s_frame;
+     t->hashed_gen = s_resolve_gen;
+     if (t->img.image && h == t->hash) {
+@@ -2844,16 +2995,26 @@ static void job_push_optimise(const PipeKey *k)
+     mtx_unlock(&s_job_mtx);
+ }
+ 
+-/* The PipeKey vsh for a program batch's program. */
+-static uint32_t vprog_for(const uint32_t (*prog)[8], uint32_t n)
++/* The PipeKey vsh for a program batch's program. gen (prog_gen, 0 for
++ * unknown): the same as the last one's, the same slot, without hashing and
++ * comparing the program again. */
++static uint32_t vprog_for(const uint32_t (*prog)[8], uint32_t n, uint64_t gen)
+ {
+-    int added, slot;
++    static uint64_t last_gen;
++    static int last_slot = -1;
++    int added = 0, slot;
+ 
+     if (!atomic_load(&s_vprog_on) || s_jobs_up < 0)
+         return 1;
+-    mtx_lock(&s_pipe_mtx);
+-    slot = vprog_slot_locked(prog, n, &added);
+-    mtx_unlock(&s_pipe_mtx);
++    if (gen && gen == last_gen && last_slot >= 0) {
++        slot = last_slot;
++    } else {
++        mtx_lock(&s_pipe_mtx);
++        slot = vprog_slot_locked(prog, n, &added);
++        mtx_unlock(&s_pipe_mtx);
++        last_gen = gen;
++        last_slot = slot;
++    }
+     if (slot < 0)
+         return 1;
+     if (added)
+@@ -3179,7 +3340,9 @@ static void soft_flush(void)
+     s_cur ^= 1;
+     n = &s_slot[s_cur];
+     if (n->busy) {
++        uint64_t t0 = now_us();
+         wait_fence(&n->fence);
++        s_soft_wait_us += now_us() - t0;
+         vkResetFences(s_dev, 1, &n->fence);
+         vkResetCommandPool(s_dev, n->pool, 0);
+         n->busy = 0;
+@@ -3191,13 +3354,15 @@ static void soft_flush(void)
+     s_soft_flushes++;
+ }
+ 
+-static void flush(void)
++static void flush_from(const char *who)
+ {
+     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
++    uint64_t t0;
+     int i;
+ 
+     if (!s_recording)
+         return;
++    t0 = now_us();
+     end_rendering();
+     s_rt = NULL;
+     s_rt_z = NULL;
+@@ -3224,6 +3389,16 @@ static void flush(void)
+             o->busy = 0;
+         }
+     }
++    if (s_verbose) {
++        uint64_t us = now_us() - t0;
++        for (i = 0; i < 24 && s_fl_by[i].who && s_fl_by[i].who != who; i++)
++            ;
++        if (i < 24) {
++            s_fl_by[i].who = who;
++            s_fl_by[i].n++;
++            s_fl_by[i].us += us;
++        }
++    }
+ 
+     {
+         static uint64_t res[VK_MAX_QUERIES + 1];  /* prefix sums: res[k] = q[0..k) */
+@@ -3255,8 +3430,16 @@ static void flush(void)
+         vkResetQueryPool(s_dev, s_qpool, 0, s_q_used);
+     s_q_used = 0;
+ 
+-    for (i = 0; i < s_nreads; i++)
+-        surf_write_guest(s_reads[i].s, s_rrd.map + s_reads[i].off);
++    {
++        uint64_t tw = s_verbose ? now_us() : 0;
++        for (i = 0; i < s_nreads; i++) {
++            if (s_verbose)
++                rb_note(s_reads[i].s, who);
++            surf_write_guest(s_reads[i].s, s_rrd.map + s_reads[i].off);
++        }
++        if (s_verbose)
++            s_t_wb += now_us() - tw;
++    }
+     for (i = 0; i < s_nzreads; i++)
+         zeta_write_guest(&s_zreads[i]);
+     if (s_nreads || s_nzreads)
+@@ -3821,11 +4004,12 @@ static void vk_draw_program(const Nv2aSurface *ns, const Nv2aProgramBatch *b)
+             }
+         }
+         if (s_kp_off == UINT64_MAX || s_kp_n != b->ninst
+-            || memcmp(s_kp_last, b->program, b->ninst * 32)) {
++            || (b->prog_gen != s_kp_gen && memcmp(s_kp_last, b->program, b->ninst * 32))) {
+             s_kp_off = ring_take(&s_ru, sizeof s_kp_last, s_ubo_align);
+             if (s_kp_off != UINT64_MAX) {
+                 memcpy(s_kp_last, b->program, b->ninst * 32);
+                 s_kp_n = b->ninst;
++                s_kp_gen = b->prog_gen;
+                 memcpy(s_ru.map + s_kp_off, s_kp_last, sizeof s_kp_last);
+             }
+         }
+@@ -3892,7 +4076,7 @@ static void vk_draw_program(const Nv2aSurface *ns, const Nv2aProgramBatch *b)
+     for (k = 0; k < b->count; k++)
+         ix[k] = b->indices[k] - b->min_index;
+ 
+-    s_vsh_last = s_vsh_force ? s_vsh_force : vprog_for(b->program, b->ninst);
++    s_vsh_last = s_vsh_force ? s_vsh_force : vprog_for(b->program, b->ninst, b->prog_gen);
+     pipe_key(&pk, s, z, rs, (int)s_vsh_last, pix, (const VkDraw *)(s_ru.map + uoff));
+     pipe = pipe_get(&pk);
+     if (!pipe)
+@@ -4238,24 +4422,165 @@ static int window_frame(const Surf *shown, uint32_t pw, uint32_t ph)
+     return 1;
+ }
+ 
++/* ---- The flip's readbacks, a flip late ----------------------------- *
++ *
++ * At every flip each surface drawn since guest memory last had it is read
++ * back, for the title's CPU to find there (Conker's exposure reads the
++ * front end's 256x256 luminance target). That used to wait for the GPU at
++ * every flip: the frame's last draws, then the readbacks, before the
++ * executor went on. With the window shown through Vulkan (nothing reads the
++ * frame from guest memory any more) they are recorded into a buffer of
++ * their own, submitted without waiting, and written into guest memory at
++ * the next flip, long done by then: the CPU sees each frame's surfaces a
++ * frame later. A surface drawn again since still gets the frame it was
++ * queued with (one drawn every frame would otherwise never land) and stays
++ * dirty; one is dropped if it is another surface now, or guest memory was
++ * brought up to date with it since in any other way (an upload of what the
++ * CPU wrote, a readback a texture needed: its guest hash moved), and the
++ * usual check that guest memory still holds what it last held
++ * (surf_write_guest) stands. RECOMP_VK_RESOLVE=now waits at the flip as
++ * before. */
++typedef struct {
++    Surf *s;
++    VkDeviceSize off;
++    uint32_t version, va, w, h, bpp, pitch;
++    uint64_t guest_hash;
++} FlipRead;
++static struct {
++    Ring ring;
++    FlipRead e[VK_MAX_SURFACES];
++    int n, pending;
++    VkFence fence;
++} s_frb;
++
++/* The last flip's readbacks into guest memory. */
++static void flip_land(void)
++{
++    int i, any = 0;
++    uint64_t tw;
++
++    if (!s_frb.pending)
++        return;
++    tw = s_verbose ? now_us() : 0;
++    if (vkGetFenceStatus(s_dev, s_frb.fence) != VK_SUCCESS)
++        wait_fence(&s_frb.fence);
++    vkResetFences(s_dev, 1, &s_frb.fence);
++    for (i = 0; i < s_frb.n; i++) {
++        FlipRead *e = &s_frb.e[i];
++        Surf *s = e->s;
++        if (s->color.image && s->gpu_dirty && s->guest_hash == e->guest_hash
++            && s->va == e->va && s->w == e->w && s->h == e->h && s->bpp == e->bpp
++            && s->pitch == e->pitch) {
++            if (s_verbose)
++                rb_note(s, "flip");
++            surf_write_guest(s, s_frb.ring.map + e->off);
++            if (s->version != e->version && !s->force_upload)
++                s->gpu_dirty = 1;       /* drawn since: not all there yet */
++            any = 1;
++        }
++    }
++    if (any)
++        s_resolve_gen++;
++    s_frb.n = 0;
++    s_frb.ring.used = 0;
++    s_frb.pending = 0;
++    if (s_verbose)
++        s_t_wb += now_us() - tw;
++}
++
++/* s's readback into this flip's batch; 0 when there is no room (it then
++ * goes the immediate way). */
++static int flip_queue(Surf *s)
++{
++    VkDeviceSize bytes = (VkDeviceSize)s->w * s->h * s->bpp, off;
++
++    if (s_replay || s_frb.n == VK_MAX_SURFACES)
++        return 0;
++    if (!s_frb.fence) {
++        VkFenceCreateInfo fi = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
++        if (vkCreateFence(s_dev, &fi, NULL, &s_frb.fence) != VK_SUCCESS)
++            return 0;
++    }
++    if (s_frb.ring.size < bytes + s_frb.ring.used && !s_frb.n) {
++        /* Larger, while nothing in it is wanted: the last batch landed. */
++        VkDeviceSize size = s_frb.ring.size ? s_frb.ring.size : 8u << 20;
++        while (size < bytes)
++            size *= 2;
++        if (s_frb.ring.buf) {
++            vkUnmapMemory(s_dev, s_frb.ring.mem);
++            vkDestroyBuffer(s_dev, s_frb.ring.buf, NULL);
++            vkFreeMemory(s_dev, s_frb.ring.mem, NULL);
++            memset(&s_frb.ring, 0, sizeof s_frb.ring);
++        }
++        if (!ring_create(&s_frb.ring, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
++            memset(&s_frb.ring, 0, sizeof s_frb.ring);
++            return 0;
++        }
++    }
++    if (!s_frb.ring.buf)
++        return 0;
++    off = ring_take(&s_frb.ring, bytes, 16);
++    if (off == UINT64_MAX || !surf_copy_out(s, s_frb.ring.buf, off))
++        return 0;
++    s_frb.e[s_frb.n].s = s;
++    s_frb.e[s_frb.n].off = off;
++    s_frb.e[s_frb.n].version = s->version;
++    s_frb.e[s_frb.n].va = s->va;
++    s_frb.e[s_frb.n].w = s->w;
++    s_frb.e[s_frb.n].h = s->h;
++    s_frb.e[s_frb.n].bpp = s->bpp;
++    s_frb.e[s_frb.n].pitch = s->pitch;
++    s_frb.e[s_frb.n].guest_hash = s->guest_hash;
++    s_frb.n++;
++    return 1;
++}
++
++/* The batch is submitted: its fence follows everything before it. */
++static void flip_submitted(void)
++{
++    if (!s_frb.n)
++        return;
++    queue_lock(1);
++    vkQueueSubmit(s_queue, 0, NULL, s_frb.fence);
++    queue_lock(0);
++    s_frb.pending = 1;
++}
++
++static void flip_resolve(uint32_t va);
++/* The back end's resolve, timed for RECOMP_VK_VERBOSE. */
+ static void vk_resolve(uint32_t va)
++{
++    uint64_t t = s_verbose ? now_us() : 0;
++    flip_resolve(va);
++    if (s_verbose)
++        s_t_resolve += now_us() - t;
++}
++
++static void flip_resolve(uint32_t va)
+ {
+     extern void xbox_FramebufferWindowPresentPixels(uint32_t, const void *, uint32_t,
+                                                     uint32_t, uint32_t, uint32_t);
+-    static int shown_only = -1;
++    static int shown_only = -1, now = -1;
+     Surf *shown = NULL;
+     uint32_t pw = 0, ph = 0, bpp = 0;
+-    int i, any = 0, to_window = 0;
++    int i, any = 0, to_window = 0, late;
+ 
+     if (shown_only < 0) {
+         const char *e = getenv("RECOMP_VK_RESOLVE");
+         shown_only = e && !strcmp(e, "shown");
++        now = e && !strcmp(e, "now");
+     }
++    /* A flip late only when the window does not read the frame from guest
++     * memory (it shows it through Vulkan). */
++    late = vkw_active() && !now;
++    flip_land();
+     for (i = 0; i < VK_MAX_SURFACES; i++) {
+         Surf *s = &s_surfs[i];
+         if (s->color.image && s->gpu_dirty && (s->va == va || !shown_only)) {
+-            surf_queue_readback(s);
+-            any = 1;
++            if (!late || !flip_queue(s)) {
++                surf_queue_readback(s);
++                any = 1;
++            }
+         }
+         if (s->color.image && s->va == va
+             && (s->sc > 1 || s_smaa_req || s_fsr_req || vkw_active())
+@@ -4290,8 +4615,9 @@ static void vk_resolve(uint32_t va)
+      * commands submitted ahead of the window's. */
+     if (any)
+         flush();
+-    else if (to_window)
++    else if (to_window || s_frb.n)
+         soft_flush();
++    flip_submitted();
+     if (to_window)
+         vkw_publish();
+     if (shown)
+@@ -4403,6 +4729,41 @@ static void vk_flip(void)
+             s_tex_ix_ok = 0;
+             i--;
+         }
++    if (s_verbose && s_frame % 300 == 0) {
++        static uint64_t t_last;
++        uint64_t t = now_us();
++        char line[1024];
++        size_t o = 0;
++        int k;
++        for (k = 0; k < 24 && s_fl_by[k].who; k++) {
++            o += (size_t)snprintf(line + o, sizeof line - o, " %s %.2f/%.2f ms", s_fl_by[k].who,
++                                  s_fl_by[k].n / 300.0, s_fl_by[k].us / 300000.0);
++            if (o >= sizeof line)
++                break;
++        }
++        if (t_last)
++            fprintf(stderr, "[VK] per frame, last 300: %.2f ms; resolve %.2f ms (writing back"
++                    " %.2f ms); texture hashing %.2f ms (%.0f textures, %.2f MB); soft-flush"
++                    " waits %.2f ms; full flushes (count/wait):%s\n", (t - t_last) / 300000.0,
++                    s_t_resolve / 300000.0, s_t_wb / 300000.0, s_t_texhash / 300000.0,
++                    s_texhash_n / 300.0, s_texhash_bytes / 300.0 / 1048576.0,
++                    s_soft_wait_us / 300000.0, o ? line : " none");
++        s_t_resolve = s_t_wb = s_t_texhash = s_texhash_bytes = s_texhash_n = 0;
++        for (k = 0, o = 0; k < 32 && s_rb_by[k].who; k++) {
++            o += (size_t)snprintf(line + o, sizeof line - o, " %s:%08X %ux%ux%u %.2f",
++                                  s_rb_by[k].who, s_rb_by[k].va, s_rb_by[k].w, s_rb_by[k].h,
++                                  s_rb_by[k].bpp, s_rb_by[k].n / 300.0);
++            if (o >= sizeof line)
++                break;
++        }
++        if (t_last && o)
++            fprintf(stderr, "[VK] per frame, written back (flush caller:address size count):%s\n",
++                    line);
++        t_last = t;
++        s_soft_wait_us = 0;
++        memset(s_fl_by, 0, sizeof s_fl_by);
++        memset(s_rb_by, 0, sizeof s_rb_by);
++    }
+     if (s_verbose && s_frame % 300 == 0)
+         fprintf(stderr, "[VK] flip %u: %u draws, %u tris, %u flushes (+%u soft), %d textures"
+                         " (%u uploads, %u new, %u read back, %u copied, %u from depth, %u hits), %u program draws, %u alias syncs (+%u on the GPU),"

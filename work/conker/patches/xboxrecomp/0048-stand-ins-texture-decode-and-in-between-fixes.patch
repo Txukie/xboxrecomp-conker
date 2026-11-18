@@ -1,0 +1,3129 @@
+diff --git a/src/d3d/d3d8_swizzle.h b/src/d3d/d3d8_swizzle.h
+index 281b4d2..1d89a10 100644
+--- a/src/d3d/d3d8_swizzle.h
++++ b/src/d3d/d3d8_swizzle.h
+@@ -415,6 +415,76 @@ static inline int d3d8_dxt_decode_texel(const uint8_t *base, uint32_t fmt,
+     return 1;
+ }
+ 
++/* All sixteen texels of one DXT1/DXT3/DXT5 block (b, block_bytes long) into
++ * px, row by row: the same texels d3d8_dxt_decode_texel gives one at a time,
++ * with the palette and the alpha table worked out once. A texture upload
++ * decodes whole images, where texel by texel cost sixteen block decodes per
++ * block (a large texture took 17 to 50 ms on the Steam Deck). */
++static inline int d3d8_dxt_decode_block(const uint8_t *b, uint32_t fmt, uint32_t px[16])
++{
++    uint32_t block_bytes = d3d8_format_dxt_block_bytes(fmt);
++    uint32_t c[4] = {0, 0, 0, 0}, alpha[16], idx, c0, c1, i;
++
++    if (!block_bytes)
++        return 0;
++    for (i = 0; i < 16; i++)
++        alpha[i] = 255u;
++    if (block_bytes == 16) {
++        if (fmt == 0x0E) {
++            for (i = 0; i < 16; i++) {
++                uint32_t nib = b[i >> 1];
++                alpha[i] = d3d8_expand_channel((i & 1u) ? (nib >> 4) : (nib & 0x0Fu), 4);
++            }
++        } else {
++            uint32_t a0 = b[0], a1 = b[1], a[8];
++            uint64_t bits = 0;
++            for (i = 0; i < 6; i++)
++                bits |= (uint64_t)b[2 + i] << (8 * i);
++            a[0] = a0; a[1] = a1;
++            if (a0 > a1)
++                for (i = 1; i < 7; i++)
++                    a[i + 1] = ((7 - i) * a0 + i * a1) / 7;
++            else {
++                for (i = 1; i < 5; i++)
++                    a[i + 1] = ((5 - i) * a0 + i * a1) / 5;
++                a[6] = 0; a[7] = 255;
++            }
++            for (i = 0; i < 16; i++)
++                alpha[i] = a[(bits >> (3 * i)) & 7u];
++        }
++        b += 8;
++    }
++    c0 = (uint32_t)b[0] | ((uint32_t)b[1] << 8);
++    c1 = (uint32_t)b[2] | ((uint32_t)b[3] << 8);
++    for (i = 0; i < 2; i++) {
++        uint32_t rgb = i ? c1 : c0;
++        c[i] = (d3d8_expand_channel((rgb >> 11) & 0x1Fu, 5) << 16)
++             | (d3d8_expand_channel((rgb >>  5) & 0x3Fu, 6) <<  8)
++             |  d3d8_expand_channel( rgb        & 0x1Fu, 5);
++    }
++    if (c0 > c1 || block_bytes == 16) {
++        for (i = 0; i < 3; i++) {
++            uint32_t sh = i * 8, m0 = (c[0] >> sh) & 0xFFu, m1 = (c[1] >> sh) & 0xFFu;
++            c[2] = (c[2] & ~(0xFFu << sh)) | (((2 * m0 + m1) / 3) << sh);
++            c[3] = (c[3] & ~(0xFFu << sh)) | (((m0 + 2 * m1) / 3) << sh);
++        }
++    } else {
++        for (i = 0; i < 3; i++) {
++            uint32_t sh = i * 8, m0 = (c[0] >> sh) & 0xFFu, m1 = (c[1] >> sh) & 0xFFu;
++            c[2] = (c[2] & ~(0xFFu << sh)) | (((m0 + m1) / 2) << sh);
++        }
++        c[3] = 0;
++    }
++    idx = (uint32_t)b[4] | ((uint32_t)b[5] << 8) | ((uint32_t)b[6] << 16) | ((uint32_t)b[7] << 24);
++    for (i = 0; i < 16; i++) {
++        uint32_t k = (idx >> (2 * i)) & 3u, al = alpha[i];
++        if (block_bytes == 8 && c0 <= c1 && k == 3)
++            al = 0;
++        px[i] = (al << 24) | (c[k] & 0x00FFFFFFu);
++    }
++    return 1;
++}
++
+ static inline int d3d8_format_is_swizzled(uint32_t fmt)
+ {
+     /* Linear formats (0x10-0x41 range excludes the non-LIN 0x19-0x3C range) */
+diff --git a/src/kernel/kernel_hal.c b/src/kernel/kernel_hal.c
+index 45d548c..14dedfe 100644
+--- a/src/kernel/kernel_hal.c
++++ b/src/kernel/kernel_hal.c
+@@ -258,10 +258,23 @@ static int gate_try(void)
+     return 1;
+ }
+ 
++/* How long this thread has waited at the gate, all along: the renderer's
++ * slow-frame lines read the executor's own (nv2a_pb_scan.c). */
++static XBOX_THREAD_LOCAL uint64_t t_gate_wait_ns;
++
++uint64_t xbox_DispatchGateWaitNs(void)
++{
++    return t_gate_wait_ns;
++}
++
+ static void gate_enter(void)
+ {
+     dispatch_gate_once();
+-    EnterCriticalSection(&s_dispatch_gate);
++    if (!TryEnterCriticalSection(&s_dispatch_gate)) {
++        uint64_t t0 = xbox_HostNowNs();
++        EnterCriticalSection(&s_dispatch_gate);
++        t_gate_wait_ns += xbox_HostNowNs() - t0;
++    }
+     gate_entered();
+ }
+ 
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index 1aac87a..bd32d3a 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -1221,74 +1221,12 @@ static uint32_t linear_twin(uint32_t fmt)
+     }
+ }
+ 
+-/* Sample texel (u, v) of stage texture `t`; `face` offsets a cube map. */
+-static int sample_tex(const Texture *t, uint32_t face_offset,
+-                      uint32_t u, uint32_t v, uint32_t *argb)
++/* Texel u of a row at p, in a linear format (sample_tex turns a swizzled
++ * one into its linear twin and u into the texel's index), as A8R8G8B8.
++ * palette: the I8 formats' table, a guest offset. */
++static int texel_decode(uint32_t fmt, const uint8_t *p, uint32_t u,
++                        const uint8_t *mem, uint32_t palette, uint32_t *argb)
+ {
+-    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+-    const uint8_t *p;
+-    uint32_t fmt, base = t->offset + face_offset;
+-
+-    if (!t->valid)
+-        return 0;
+-    /* BORDER (4) with FORMAT's border source set to "colour": texels outside
+-     * the image read SET_TEXTURE_BORDER_COLOR. Projected shadow maps rely on
+-     * it -- clamped instead, everything outside the projection takes the
+-     * edge texel and the shadow's frustum is drawn as a dark wedge.
+-     * (Coordinates are signed in unsigned: a negative one is >= the size.) */
+-    if (t->border_color
+-        && ((t->addr_u == 4 && u >= t->width) || (t->addr_v == 4 && v >= t->height))) {
+-        *argb = t->border;
+-        return 1;
+-    }
+-    u = wrap_coord(u, t->width,  t->addr_u);
+-    v = wrap_coord(v, t->height, t->addr_v);
+-
+-    fmt = t->color;
+-    if (d3d8_format_dxt_block_bytes(fmt)) {
+-        /* Decoded blocks, direct-mapped by address. Every texel of a DXT
+-         * texture decodes its whole 4x4 block, and bilinear reads four
+-         * neighbours that nearly always share one -- this was a tenth of
+-         * the executor's time. Keyed on the block's bytes as well as its
+-         * address, so a texture rewritten in place (a render target reused,
+-         * a streamed mip) never returns stale texels.
+-         * ponytail: single-threaded executor, so a plain static table. */
+-        static NV_TLS struct { uintptr_t key; uint32_t fmt; uint64_t raw[2];
+-                        uint32_t px[16]; } cache[4096];
+-        uint32_t bb = d3d8_format_dxt_block_bytes(fmt);
+-        uint32_t bx = u >> 2, by = v >> 2, bw = (t->width + 3) >> 2;
+-        const uint8_t *blk = mem + base + ((size_t)by * bw + bx) * bb;
+-        uintptr_t key = (uintptr_t)blk;
+-        size_t slot = ((key / bb) ^ (key >> 16)) & 4095;
+-        uint64_t raw[2] = {0, 0};
+-        memcpy(raw, blk, bb);
+-        if (cache[slot].key != key || cache[slot].fmt != fmt
+-            || cache[slot].raw[0] != raw[0] || cache[slot].raw[1] != raw[1]) {
+-            uint32_t i;
+-            for (i = 0; i < 16; i++)
+-                d3d8_dxt_decode_texel(mem + base, fmt, bx * 4 + (i & 3),
+-                                      by * 4 + (i >> 2), t->width,
+-                                      &cache[slot].px[i]);
+-            cache[slot].key = key;
+-            cache[slot].fmt = fmt;
+-            cache[slot].raw[0] = raw[0];
+-            cache[slot].raw[1] = raw[1];
+-        }
+-        *argb = cache[slot].px[(v & 3) * 4 + (u & 3)];
+-        return 1;
+-    }
+-    if (d3d8_format_is_swizzled(fmt)) {
+-        /* Morton order: a texel's index is interleaved from x and y instead of
+-         * v*pitch + u, so index from the base of the image. The switch below
+-         * casts to each format's own width, which makes that index a texel
+-         * index for every one of them. */
+-        fmt = linear_twin(fmt);
+-        p = mem + base;
+-        u = swizzle_offset(u, v, t->width, t->height);
+-    } else {
+-        p = mem + base + (size_t)v * t->pitch;
+-    }
+-
+     switch (fmt) {
+ 
+     /* 32-bit, alpha-red-green-blue in the dword. */
+@@ -1303,9 +1241,9 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+      * header art this way; without a case every such quad came out as the
+      * unsupported-format fill, a white box where the logo should be. */
+     case 0x0B:                                      /* SZ_I8_A8R8G8B8 */
+-        if (!t->palette)
++        if (!palette)
+             return 0;
+-        *argb = ((const uint32_t *)(mem + t->palette))[p[u]];
++        *argb = ((const uint32_t *)(mem + palette))[p[u]];
+         return 1;
+ 
+     /* 32-bit, other channel orders. The name gives the byte order from the
+@@ -1434,6 +1372,73 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+     }
+ }
+ 
++/* Sample texel (u, v) of stage texture `t`; `face` offsets a cube map. */
++static int sample_tex(const Texture *t, uint32_t face_offset,
++                      uint32_t u, uint32_t v, uint32_t *argb)
++{
++    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
++    const uint8_t *p;
++    uint32_t fmt, base = t->offset + face_offset;
++
++    if (!t->valid)
++        return 0;
++    /* BORDER (4) with FORMAT's border source set to "colour": texels outside
++     * the image read SET_TEXTURE_BORDER_COLOR. Projected shadow maps rely on
++     * it -- clamped instead, everything outside the projection takes the
++     * edge texel and the shadow's frustum is drawn as a dark wedge.
++     * (Coordinates are signed in unsigned: a negative one is >= the size.) */
++    if (t->border_color
++        && ((t->addr_u == 4 && u >= t->width) || (t->addr_v == 4 && v >= t->height))) {
++        *argb = t->border;
++        return 1;
++    }
++    u = wrap_coord(u, t->width,  t->addr_u);
++    v = wrap_coord(v, t->height, t->addr_v);
++
++    fmt = t->color;
++    if (d3d8_format_dxt_block_bytes(fmt)) {
++        /* Decoded blocks, direct-mapped by address. Every texel of a DXT
++         * texture decodes its whole 4x4 block, and bilinear reads four
++         * neighbours that nearly always share one -- this was a tenth of
++         * the executor's time. Keyed on the block's bytes as well as its
++         * address, so a texture rewritten in place (a render target reused,
++         * a streamed mip) never returns stale texels.
++         * ponytail: single-threaded executor, so a plain static table. */
++        static NV_TLS struct { uintptr_t key; uint32_t fmt; uint64_t raw[2];
++                        uint32_t px[16]; } cache[4096];
++        uint32_t bb = d3d8_format_dxt_block_bytes(fmt);
++        uint32_t bx = u >> 2, by = v >> 2, bw = (t->width + 3) >> 2;
++        const uint8_t *blk = mem + base + ((size_t)by * bw + bx) * bb;
++        uintptr_t key = (uintptr_t)blk;
++        size_t slot = ((key / bb) ^ (key >> 16)) & 4095;
++        uint64_t raw[2] = {0, 0};
++        memcpy(raw, blk, bb);
++        if (cache[slot].key != key || cache[slot].fmt != fmt
++            || cache[slot].raw[0] != raw[0] || cache[slot].raw[1] != raw[1]) {
++            d3d8_dxt_decode_block(blk, fmt, cache[slot].px);
++            cache[slot].key = key;
++            cache[slot].fmt = fmt;
++            cache[slot].raw[0] = raw[0];
++            cache[slot].raw[1] = raw[1];
++        }
++        *argb = cache[slot].px[(v & 3) * 4 + (u & 3)];
++        return 1;
++    }
++    if (d3d8_format_is_swizzled(fmt)) {
++        /* Morton order: a texel's index is interleaved from x and y instead of
++         * v*pitch + u, so index from the base of the image. The switch below
++         * casts to each format's own width, which makes that index a texel
++         * index for every one of them. */
++        fmt = linear_twin(fmt);
++        p = mem + base;
++        u = swizzle_offset(u, v, t->width, t->height);
++    } else {
++        p = mem + base + (size_t)v * t->pitch;
++    }
++
++    return texel_decode(fmt, p, u, mem, t->palette, argb);
++}
++
+ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
+ {
+     return sample_tex(&s_gpu.texs[0], 0, u, v, argb);
+@@ -2527,11 +2532,19 @@ void nv2a_backend_decode_stage_level(const Nv2aStage *st, uint32_t face,
+                                                                   : st->pitch * h);
+         if (t.valid && guest_span_ok(t.offset, bytes)) {
+             if (block) {
+-                for (v = 0; v < h; v++)
+-                    for (u = 0; u < w; u++)
+-                        if (!d3d8_dxt_decode_texel(mem, st->color, u, v, w,
+-                                                   &argb_out[(size_t)v * w + u]))
+-                            argb_out[(size_t)v * w + u] = 0xFFFFFFFFu;
++                uint32_t bw = (w + 3) / 4, bx, by, px[16], i;
++                for (by = 0; by < (h + 3) / 4; by++)
++                    for (bx = 0; bx < bw; bx++) {
++                        if (!d3d8_dxt_decode_block(mem + ((size_t)by * bw + bx) * block,
++                                                   st->color, px))
++                            for (i = 0; i < 16; i++) px[i] = 0xFFFFFFFFu;
++                        for (i = 0; i < 16; i++) {
++                            u = bx * 4 + (i & 3);
++                            v = by * 4 + (i >> 2);
++                            if (u < w && v < h)
++                                argb_out[(size_t)v * w + u] = px[i];
++                        }
++                    }
+                 return;
+             }
+             if ((st->color == 0x06 || st->color == 0x07) && w * h > 1) {
+@@ -2548,6 +2561,31 @@ void nv2a_backend_decode_stage_level(const Nv2aStage *st, uint32_t face,
+                 }
+                 return;
+             }
++            /* Every other swizzled format: the image unswizzled in one pass,
++             * then texel by texel through the same conversion sample_tex
++             * uses. Through sample_tex, each texel's Morton index was worked
++             * out bit by bit: a 512x512 L8 texture with its mips took 11 to
++             * 17 ms on the Steam Deck, and the training level loads one
++             * every few frames. */
++            if (d3d8_format_is_swizzled(st->color) && w * h > 1) {
++                static NV_TLS uint8_t *raw;
++                static NV_TLS size_t cap;
++                uint32_t bpp = tex_texel_bytes(st->color), lin = linear_twin(st->color), i;
++                size_t n = (size_t)w * h * bpp;
++                if (n > cap) {
++                    free(raw);
++                    raw = (uint8_t *)malloc(n);
++                    cap = raw ? n : 0;
++                }
++                if (raw) {
++                    const uint8_t *base = (const uint8_t *)xbox_GetMemoryOffset();
++                    xbox_unswizzle_rect(raw, mem, w, h, bpp);
++                    for (i = 0; i < w * h; i++)
++                        if (!texel_decode(lin, raw, i, base, st->palette, &argb_out[i]))
++                            argb_out[i] = 0xFFFFFFFFu;
++                    return;
++                }
++            }
+         }
+     }
+     for (v = 0; v < h; v++)
+diff --git a/src/kernel/nv2a_pb_scan.c b/src/kernel/nv2a_pb_scan.c
+index e985bfc..e58d33d 100644
+--- a/src/kernel/nv2a_pb_scan.c
++++ b/src/kernel/nv2a_pb_scan.c
+@@ -25,6 +25,10 @@
+ #include <stddef.h>   /* ptrdiff_t */
+ #include <stdlib.h>
+ #include <string.h>
++#include "platform/host_time.h"
++#ifndef _WIN32
++#include <time.h>
++#endif
+ 
+ extern ptrdiff_t xbox_GetMemoryOffset(void);
+ 
+@@ -547,9 +551,33 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
+ 
+ /* Returns the guest VA the JUMP ending the segment pointed to, or 0 when the
+  * segment ran to end_va without one. */
++/* Time spent walking (and so executing) the title's pushbuffer, for the
++ * renderer's slow-frame lines: busy there, or waiting for the title. */
++uint64_t nv2a_pb_busy_ns;
++/* The executor thread's own CPU time over the same walks: far below the
++ * wall time, it was held up (another thread, a lock, the scheduler), not
++ * working. 0 where the host has no per-thread clock. */
++uint64_t nv2a_pb_cpu_ns;
++/* And the part of it spent waiting at the one-CPU gate (kernel_hal.c), to
++ * hand the title an interrupt while one of its threads held DISPATCH. */
++uint64_t nv2a_pb_gate_ns;
++extern uint64_t xbox_DispatchGateWaitNs(void);
++
++static uint64_t thread_cpu_ns(void)
++{
++#if !defined(_WIN32) && defined(CLOCK_THREAD_CPUTIME_ID)
++    struct timespec ts;
++    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
++    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
++#else
++    return 0;
++#endif
++}
++
+ uint32_t nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
+ {
+     uint32_t words, jumps = 0, unknown = 0;
++    uint64_t t0;
+ 
+     s_seg_jump = 0;
+     if (!pb_walk_enabled() || end_va <= start_va)
+@@ -561,7 +589,14 @@ uint32_t nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
+         extern void nv2a_pb_exec_walk_begin(void);
+         nv2a_pb_exec_walk_begin();      /* the flip hold's vblank */
+     }
+-    words = pb_walk_segment(start_va, end_va, 0, &jumps, &unknown);
++    {
++        uint64_t c0 = thread_cpu_ns(), g0 = xbox_DispatchGateWaitNs();
++        t0 = xbox_HostNowNs();
++        words = pb_walk_segment(start_va, end_va, 0, &jumps, &unknown);
++        nv2a_pb_busy_ns += xbox_HostNowNs() - t0;
++        nv2a_pb_cpu_ns += thread_cpu_ns() - c0;
++        nv2a_pb_gate_ns += xbox_DispatchGateWaitNs() - g0;
++    }
+ 
+     s_tot_words += words;
+     s_tot_unknown += unknown;
+diff --git a/src/vulkan/CMakeLists.txt b/src/vulkan/CMakeLists.txt
+index 17e949c..c71885e 100644
+--- a/src/vulkan/CMakeLists.txt
++++ b/src/vulkan/CMakeLists.txt
+@@ -16,7 +16,7 @@ file(GLOB_RECURSE _vk_includes
+      "${CMAKE_CURRENT_SOURCE_DIR}/shaders/*.glsl"
+      "${CMAKE_CURRENT_SOURCE_DIR}/shaders/third_party/*.h"
+      "${CMAKE_CURRENT_SOURCE_DIR}/shaders/third_party/*.hlsl")
+-foreach(_shader nv2a.vert nv2a.frag nv2a_vsh.vert zeta_pack.vert zeta_pack.frag surf_alias.frag
++foreach(_shader nv2a.vert nv2a.frag nv2a_vsh.vert zeta_pack.vert zeta_pack.frag surf_alias.frag hole_fill.frag
+                 post_copy.frag smaa_edges.frag smaa_weights.frag smaa_blend.frag
+                 fsr_easu.frag fsr_rcas.frag present.vert present.frag)
+     add_custom_command(
+@@ -31,6 +31,19 @@ foreach(_shader nv2a.vert nv2a.frag nv2a_vsh.vert zeta_pack.vert zeta_pack.frag
+     list(APPEND _vk_spv "${_vk_gen}/${_shader}.inc")
+ endforeach()
+ 
++# The fragment shader's stand-in: the combiner program from the uniform
++# block instead of specialisation constants (nv2a.frag NV2A_DYN).
++add_custom_command(
++    OUTPUT "${_vk_gen}/nv2a_dyn.frag.inc"
++    COMMAND "${CMAKE_COMMAND}" -E make_directory "${_vk_gen}"
++    COMMAND "${XBOXRECOMP_GLSLC}" -O --target-env=vulkan1.3 -mfmt=c -DNV2A_DYN
++            -o "${_vk_gen}/nv2a_dyn.frag.inc"
++            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nv2a.frag"
++    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nv2a.frag"
++    COMMENT "glslc nv2a.frag (stand-in)"
++    VERBATIM)
++list(APPEND _vk_spv "${_vk_gen}/nv2a_dyn.frag.inc")
++
+ # SMAA's area and search textures (third_party/smaa), as C arrays.
+ foreach(_tex area search)
+     add_custom_command(
+diff --git a/src/vulkan/nv2a_vk.c b/src/vulkan/nv2a_vk.c
+index 05e3f4c..683d111 100644
+--- a/src/vulkan/nv2a_vk.c
++++ b/src/vulkan/nv2a_vk.c
+@@ -49,6 +49,7 @@
+ #include <vulkan/vulkan.h>
+ 
+ #include "../kernel/nv2a_backend.h"
++#include "../kernel/nv2a_vsh_interp.h"
+ #include "../d3d/d3d8_swizzle.h"
+ 
+ extern ptrdiff_t xbox_GetMemoryOffset(void);
+@@ -60,9 +61,15 @@ static const uint32_t k_vert_spv[] =
+ static const uint32_t k_frag_spv[] =
+ #include "nv2a.frag.inc"
+ ;
++static const uint32_t k_frag_dyn_spv[] =
++#include "nv2a_dyn.frag.inc"
++;
+ static const uint32_t k_vsh_spv[] =
+ #include "nv2a_vsh.vert.inc"
+ ;
++static const uint32_t k_hole_frag_spv[] =
++#include "hole_fill.frag.inc"
++;
+ static const uint32_t k_zpack_vert_spv[] =
+ #include "zeta_pack.vert.inc"
+ ;
+@@ -160,7 +167,7 @@ static PFN_vkCmdPushDescriptorSetKHR s_push_desc;
+ 
+ static VkDescriptorSetLayout s_dsl;
+ static VkPipelineLayout      s_layout;
+-static VkShaderModule        s_vs, s_fs, s_vsh;
++static VkShaderModule        s_vs, s_fs, s_fs_dyn, s_vsh;
+ static VkQueryPool           s_qpool;
+ 
+ typedef struct {
+@@ -204,14 +211,28 @@ static uint64_t s_kp_gen;        /* Nv2aProgramBatch.prog_gen of s_kp_last */
+  * reports frames over 50 ms): on the recording thread, compiling pipelines
+  * and their parts, uploading textures and surfaces, waiting for the GPU. */
+ static uint64_t s_fr_pipe_us, s_fr_lib_us, s_fr_up_us, s_fr_wait_us, s_fr_t0;
+-static uint32_t s_fr_pipes, s_fr_libs[4], s_fr_ups;
++static uint32_t s_fr_pipes, s_fr_libs[4], s_fr_ups, s_fr_standins;
++static uint64_t s_fr_qwait_us;   /* waiting for the queue (the window presents) */
+ static _Thread_local int s_compile_thread;   /* set on the compile threads */
+ 
++/* The monotonic clock: the wall clock steps when the system sets it (the
++ * Deck's network time), and a frame read as 18446744073709 seconds long,
++ * the in-between frames' pacing with it. */
+ static uint64_t now_us(void)
+ {
++#if defined(_WIN32)
++    static LARGE_INTEGER freq;
++    LARGE_INTEGER t;
++    if (!freq.QuadPart)
++        QueryPerformanceFrequency(&freq);
++    QueryPerformanceCounter(&t);
++    return (uint64_t)(t.QuadPart / freq.QuadPart) * 1000000u
++           + (uint64_t)(t.QuadPart % freq.QuadPart) * 1000000u / (uint64_t)freq.QuadPart;
++#else
+     struct timespec t;
+-    timespec_get(&t, TIME_UTC);
++    clock_gettime(CLOCK_MONOTONIC, &t);
+     return (uint64_t)t.tv_sec * 1000000u + (uint64_t)t.tv_nsec / 1000u;
++#endif
+ }
+ 
+ static void wait_fence(VkFence *f)
+@@ -666,9 +687,16 @@ typedef struct {
+  * the first set. */
+ static Surf s_surfs_title[VK_MAX_SURFACES], s_surfs_replay[VK_MAX_SURFACES];
+ static Zeta s_zetas_title[VK_MAX_ZETAS], s_zetas_replay[VK_MAX_ZETAS];
++/* The depth the shown frame's geometry was drawn with, kept at its flip
++ * (interp_shown): by the time an in-between frame needs it (rec_underlay)
++ * the title is drawing its next frame into the same buffer. */
++static Img s_zsnap, s_zcur;              /* s_zcur: rec_holefill's copy */
++static VkImageView s_zsnap_dv, s_zcur_dv;
++static uint32_t s_zsnap_gen;
+ static Surf *s_surfs = s_surfs_title;
+ static Zeta *s_zetas = s_zetas_title;
+ static int s_replay;            /* drawing an in-between frame */
++static uint32_t s_replay_w0;    /* s_writes when it began (drawn_source) */
+ static uint64_t s_pub_due;      /* its frame is shown then (now_us), 0 at once (vk_tick) */
+ /* The vertex program a program draw used (vk_draw_program), and one to use
+  * instead of looking it up: an in-between frame knows it from before. */
+@@ -1527,10 +1555,16 @@ static int tex_upload_now(Tex *t, const Nv2aStage *st)
+ 
+ static int tex_upload(Tex *t, const Nv2aStage *st)
+ {
+-    uint64_t t0 = now_us();
++    uint64_t t0 = now_us(), q0 = s_fr_qwait_us, w0 = s_soft_wait_us, dt;
+     int ok = tex_upload_now(t, st);
+-    s_fr_up_us += now_us() - t0;
++    dt = now_us() - t0;
++    s_fr_up_us += dt;
+     s_fr_ups++;
++    if (s_verbose && dt > 8000)
++        fprintf(stderr, "[VK] slow upload: %ux%u format 0x%02X%s, %u levels: %.1f ms"
++                " (queue wait %.1f, GPU wait %.1f)\n", st->width, st->height, st->color,
++                st->cube ? " cube" : "", stage_mips(st), dt / 1000.0,
++                (s_fr_qwait_us - q0) / 1000.0, (s_soft_wait_us - w0) / 1000.0);
+     return ok;
+ }
+ 
+@@ -1542,8 +1576,8 @@ static int tex_upload(Tex *t, const Nv2aStage *st)
+  * a hash and a decode on the CPU. Anything less exact takes that path. */
+ static Surf *drawn_source(const Nv2aStage *st)
+ {
+-    Surf *best = NULL;
+-    int i, swz = !st->pitch || st->normalized, bpp;
++    Surf *best = NULL, *set = s_surfs;
++    int i, swz = !st->pitch || st->normalized, bpp, pass;
+ 
+     switch (st->color) {
+     case 0x06: case 0x07: case 0x12: case 0x1E: bpp = 4; break;  /* (X|A)8R8G8B8 */
+@@ -1552,8 +1586,19 @@ static Surf *drawn_source(const Nv2aStage *st)
+     }
+     if (st->cube || (st->normalized != 0) != (st->color < 0x10))
+         return NULL;
++    /* An in-between frame: its own surface only when it drew it itself,
++     * else the title's, as the title's draw read it. A surface the title
++     * drew in an earlier frame (Conker keeps several 32x32 light maps and
++     * draws one a frame) was found among the in-between frame's own as an
++     * older in-between frame had left it: the light through Berri's window
++     * was another frame's, a yellow glare on the Deck. */
++    for (pass = 0; pass < (s_replay ? 2 : 1) && !best; pass++) {
++    if (pass)
++        set = s_surfs_title;
+     for (i = 0; i < VK_MAX_SURFACES; i++) {
+-        Surf *s = &s_surfs[i];
++        Surf *s = &set[i];
++        if (s_replay && !pass && s->version <= s_replay_w0)
++            continue;
+         if (!s->color.image || s->va != st->offset || (int)s->bpp != bpp
+             || (bpp == 2 && s->color.fmt != VK_FORMAT_R5G6B5_UNORM_PACK16)
+             || (s->swz_w != 0) != (swz && st->normalized)
+@@ -1566,6 +1611,7 @@ static Surf *drawn_source(const Nv2aStage *st)
+         if (!best || s->last_use > best->last_use)
+             best = s;
+     }
++    }
+     return best;
+ }
+ 
+@@ -2283,6 +2329,9 @@ enum {
+     VK_SPEC_RC, VK_SPEC_ATEST, VK_SPEC_AFUNC, VK_SPEC_CLIPMODE, VK_SPEC_CUBE,
+     VK_SPEC_BORDER, VK_SPEC_STAGEIN, VK_SPEC_COUNT
+ };
++/* spec[VK_SPEC_RC] of a stand-in's key (pipe_get): the fragment stage is
++ * nv2a.frag's NV2A_DYN variant, the rest of spec zero. */
++#define VK_SPEC_DYN 0xFFFFFFFFu
+ 
+ typedef struct {
+     uint32_t fmt, depth, blend, src, dst, eq, mask;
+@@ -2297,7 +2346,7 @@ typedef struct {
+  * to it too, so it is under s_pipe_mtx, as are the vertex programs and the
+  * pipeline libraries. */
+ #define VK_PIPE_SLOTS 4096
+-static struct { PipeKey k; VkPipeline p; int used; } s_pipes[VK_PIPE_SLOTS];
++static struct { PipeKey k; VkPipeline p; int used, standin; } s_pipes[VK_PIPE_SLOTS];
+ static int s_npipes;
+ static mtx_t s_pipe_mtx;
+ /* Pipelines an optimised one replaced. A command buffer may still hold
+@@ -2337,11 +2386,15 @@ static uint32_t pipe_hash(const PipeKey *k)
+  * them all there. */
+ #define VK_MAX_VPROGS 2048
+ enum { VPROG_QUEUED, VPROG_COMPILING, VPROG_READY, VPROG_FAILED };
++/* The in-between variant of a program (nv2a_vsh.vert VSH_BLEND), compiled
++ * when an in-between frame first draws it: bstate VPROG_* + 1, 0 not asked
++ * for. PipeKey vsh 2 + slot with VSH_BLEND_BIT. */
++#define VSH_BLEND_BIT 0x10000u
+ static struct {
+     uint32_t hash, n;
+     uint32_t (*words)[8];
+-    VkShaderModule mod;
+-    atomic_int state;
++    VkShaderModule mod, bmod;
++    atomic_int state, bstate;
+ } s_vprogs[VK_MAX_VPROGS];
+ static uint32_t s_nvprogs;
+ static atomic_uint s_vprog_done, s_vprog_failed, s_vprog_us;
+@@ -2367,11 +2420,40 @@ static int vprog_slot_locked(const uint32_t (*prog)[8], uint32_t n, int *added)
+     s_vprogs[slot].hash = h;
+     s_vprogs[slot].n = n;
+     atomic_store(&s_vprogs[slot].state, VPROG_QUEUED);
++    atomic_store(&s_vprogs[slot].bstate, 0);
+     s_nvprogs++;
+     *added = 1;
+     return (int)slot;
+ }
+ 
++/* Compile a slot's in-between variant (VSH_BLEND_BIT in slot), once. */
++static void vprog_compile_blend(uint32_t slot)
++{
++    VkShaderModuleCreateInfo sm = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
++    int want = VPROG_QUEUED + 1;
++    uint32_t *spv;
++    size_t words = 0;
++
++    if (!atomic_compare_exchange_strong(&s_vprogs[slot].bstate, &want, VPROG_COMPILING + 1))
++        return;
++    spv = nv2a_vk_vprog_compile((const uint32_t (*)[8])s_vprogs[slot].words,
++                                (int)s_vprogs[slot].n, 1, &words);
++    if (spv) {
++        sm.codeSize = words * 4;
++        sm.pCode = spv;
++        if (vkCreateShaderModule(s_dev, &sm, NULL, &s_vprogs[slot].bmod) != VK_SUCCESS)
++            s_vprogs[slot].bmod = VK_NULL_HANDLE;
++        free(spv);
++    }
++    if (s_vprogs[slot].bmod && s_gpl) {
++        PipeKey k;
++        memset(&k, 0, sizeof k);
++        k.vsh = (2 + slot) | VSH_BLEND_BIT;
++        lib_get(&k, LIB_PRE);
++    }
++    atomic_store(&s_vprogs[slot].bstate, (s_vprogs[slot].bmod ? VPROG_READY : VPROG_FAILED) + 1);
++}
++
+ /* Compile a slot's program, unless another thread already took it. */
+ static void vprog_compile(uint32_t slot)
+ {
+@@ -2381,11 +2463,15 @@ static void vprog_compile(uint32_t slot)
+     uint32_t *spv;
+     size_t words = 0;
+ 
++    if (slot & VSH_BLEND_BIT) {
++        vprog_compile_blend(slot & ~VSH_BLEND_BIT);
++        return;
++    }
+     if (!atomic_compare_exchange_strong(&s_vprogs[slot].state, &want, VPROG_COMPILING))
+         return;
+     timespec_get(&t0, TIME_UTC);
+     spv = nv2a_vk_vprog_compile((const uint32_t (*)[8])s_vprogs[slot].words,
+-                                (int)s_vprogs[slot].n, &words);
++                                (int)s_vprogs[slot].n, 0, &words);
+     if (spv) {
+         sm.codeSize = words * 4;
+         sm.pCode = spv;
+@@ -2558,12 +2644,13 @@ static void pipe_states(const PipeKey *k, PipeStates *ps)
+     ps->cb.pAttachments = &ps->cba;
+     ps->st[0].sType = ps->st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+     ps->st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+-    ps->st[0].module = k->vsh >= 2 ? s_vprogs[k->vsh - 2].mod : k->vsh ? s_vsh : s_vs;
++    ps->st[0].module = (k->vsh & VSH_BLEND_BIT) ? s_vprogs[(k->vsh & ~VSH_BLEND_BIT) - 2].bmod
++                     : k->vsh >= 2 ? s_vprogs[k->vsh - 2].mod : k->vsh ? s_vsh : s_vs;
+     ps->st[0].pName = "main";
+     ps->st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+-    ps->st[1].module = s_fs;
++    ps->st[1].module = k->spec[VK_SPEC_RC] == VK_SPEC_DYN ? s_fs_dyn : s_fs;
+     ps->st[1].pName = "main";
+-    ps->st[1].pSpecializationInfo = &ps->spi;
++    ps->st[1].pSpecializationInfo = k->spec[VK_SPEC_RC] == VK_SPEC_DYN ? NULL : &ps->spi;
+     ps->cfmt = (VkFormat)k->fmt;
+     ps->pr.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+     ps->pr.colorAttachmentCount = 1;
+@@ -2826,6 +2913,8 @@ static int s_jobs_up;            /* 1 running, -1 could not start */
+ static uint32_t s_jv[VK_JOB_RING], s_jv_head, s_jv_tail;
+ static PipeKey s_jl[VK_JOB_RING];
+ static uint32_t s_jl_head, s_jl_tail;
++static PipeKey s_jm[VK_JOB_RING];       /* pipelines a stand-in draws for */
++static uint32_t s_jm_head, s_jm_tail;
+ 
+ /* The pipeline list: every pipeline the title has asked for, kept across
+  * runs (RECOMP_VK_PIPELINE_LIST names the file) and built again at start,
+@@ -2847,7 +2936,7 @@ static void pipe_optimise(const PipeKey *k)
+         return;
+     mtx_lock(&s_pipe_mtx);
+     slot = pipe_find_locked(k, &found);
+-    if (found && s_npipe_dead < VK_PIPE_SLOTS) {
++    if (found && !s_pipes[slot].standin && s_npipe_dead < VK_PIPE_SLOTS) {
+         old = s_pipes[slot].p;
+         s_pipes[slot].p = p;
+         s_pipe_dead[s_npipe_dead++] = old;
+@@ -2858,6 +2947,27 @@ static void pipe_optimise(const PipeKey *k)
+         vkDestroyPipeline(s_dev, p, NULL);
+ }
+ 
++/* The pipeline a stand-in drew for (pipe_get), built whole and optimised,
++ * in its place. The stand-in is shared and stays. */
++static void pipe_replace_standin(const PipeKey *k)
++{
++    VkPipeline p = pipe_build(k, 1);
++    int found, slot;
++
++    if (!p)
++        return;          /* the stand-in keeps drawing */
++    mtx_lock(&s_pipe_mtx);
++    slot = pipe_find_locked(k, &found);
++    if (found && s_pipes[slot].standin) {
++        s_pipes[slot].p = p;
++        s_pipes[slot].standin = 0;
++        p = VK_NULL_HANDLE;
++    }
++    mtx_unlock(&s_pipe_mtx);
++    if (p)
++        vkDestroyPipeline(s_dev, p, NULL);
++}
++
+ static void precompile(const PipeRec *r)
+ {
+     PipeKey k = r->k;
+@@ -2899,8 +3009,20 @@ static void precompile(const PipeRec *r)
+ 
+ static int compile_thread(void *arg)
+ {
++    static atomic_int warm;
++    int w;
++
+     (void)arg;
+     s_compile_thread = 1;
++    /* The stand-in's fragment stage, with and without depth, before a draw
++     * waits for one. */
++    if (s_gpl && (w = atomic_fetch_add(&warm, 1)) < 2) {
++        PipeKey d;
++        memset(&d, 0, sizeof d);
++        d.spec[VK_SPEC_RC] = VK_SPEC_DYN;
++        d.depth = (uint32_t)w | ms_key_bits();
++        lib_get(&d, LIB_FS);
++    }
+     for (;;) {
+         int kind;
+         uint32_t slot = 0;
+@@ -2914,6 +3036,11 @@ static int compile_thread(void *arg)
+                 slot = s_jv[s_jv_head++ % VK_JOB_RING];
+                 break;
+             }
++            if (s_jm_head != s_jm_tail) {
++                kind = 3;
++                k = s_jm[s_jm_head++ % VK_JOB_RING];
++                break;
++            }
+             if (s_jl_head != s_jl_tail) {
+                 kind = 1;
+                 k = s_jl[s_jl_head++ % VK_JOB_RING];
+@@ -2931,6 +3058,8 @@ static int compile_thread(void *arg)
+             vprog_compile(slot);
+         else if (kind == 1)
+             pipe_optimise(&k);
++        else if (kind == 3)
++            pipe_replace_standin(&k);
+         else
+             precompile(r);
+     }
+@@ -2994,6 +3123,16 @@ static void job_push_vprog(uint32_t slot)
+     mtx_unlock(&s_job_mtx);
+ }
+ 
++static void job_push_standin(const PipeKey *k)
++{
++    mtx_lock(&s_job_mtx);
++    if (s_jm_tail - s_jm_head < VK_JOB_RING) {
++        s_jm[s_jm_tail++ % VK_JOB_RING] = *k;
++        cnd_signal(&s_job_cnd);
++    }
++    mtx_unlock(&s_job_mtx);
++}
++
+ static void job_push_optimise(const PipeKey *k)
+ {
+     mtx_lock(&s_job_mtx);
+@@ -3093,7 +3232,8 @@ static void pl_record(const PipeKey *key)
+     const uint32_t (*w)[8] = NULL;
+     uint32_t n = 0;
+ 
+-    if (!s_pl_file || k.vsh == 1)      /* the interpreter stands in: skip */
++    if (!s_pl_file || k.vsh == 1       /* the interpreter stands in: skip */
++        || (k.vsh & VSH_BLEND_BIT))    /* an in-between variant: when asked for */
+         return;
+     k.depth &= 1;                      /* listed without the sample count */
+     if (k.vsh >= 2) {
+@@ -3240,8 +3380,56 @@ static void pl_load(const char *path)
+ 
+ /* ---- Pipelines ------------------------------------------------------ */
+ 
++/* Stand-ins by key (VK_SPEC_DYN), apart from s_pipes so that nothing
++ * optimises or replaces them: entries in s_pipes hold them meanwhile. */
++static struct { PipeKey k; VkPipeline p; int used; } s_dyn[VK_PIPE_SLOTS];
++static int s_ndyn;
++
++static VkPipeline standin_get(const PipeKey *k)
++{
++    PipeKey d = *k;
++    VkPipeline p;
++    uint32_t slot;
++
++    memset(d.spec, 0, sizeof d.spec);
++    d.spec[VK_SPEC_RC] = VK_SPEC_DYN;
++    mtx_lock(&s_pipe_mtx);
++    for (slot = pipe_hash(&d) % VK_PIPE_SLOTS; s_dyn[slot].used;
++         slot = (slot + 1) % VK_PIPE_SLOTS)
++        if (!memcmp(&s_dyn[slot].k, &d, sizeof d)) {
++            p = s_dyn[slot].p;
++            mtx_unlock(&s_pipe_mtx);
++            return p;
++        }
++    mtx_unlock(&s_pipe_mtx);
++    if (s_ndyn >= VK_PIPE_SLOTS - 1 || !(p = pipe_build(&d, 0)))
++        return VK_NULL_HANDLE;
++    mtx_lock(&s_pipe_mtx);              /* only the recording thread adds */
++    s_dyn[slot].k = d;
++    s_dyn[slot].p = p;
++    s_dyn[slot].used = 1;
++    s_ndyn++;
++    mtx_unlock(&s_pipe_mtx);
++    return p;
++}
++
++/* Whether k's fragment stage is compiled already. */
++static int lib_fs_have(const PipeKey *k)
++{
++    PipeKey m;
++    uint32_t slot;
++    int have;
++
++    lib_key(&m, k, LIB_FS);
++    mtx_lock(&s_pipe_mtx);
++    have = lib_find_locked(&m, LIB_FS, &slot);
++    mtx_unlock(&s_pipe_mtx);
++    return have;
++}
++
+ static VkPipeline pipe_get(const PipeKey *k)
+ {
++    static int standin_on = -1;
+     VkPipeline p;
+     int found, slot, added;
+ 
+@@ -3251,6 +3439,46 @@ static VkPipeline pipe_get(const PipeKey *k)
+     mtx_unlock(&s_pipe_mtx);
+     if (found)
+         return p;
++    if (standin_on < 0) {
++        const char *e = getenv("RECOMP_VK_STANDIN");
++        standin_on = !e ? 1 : e[0] == '0' ? 0 : e[0] == '2' ? 2 : 1;
++    }
++    /* A fragment stage not compiled yet: on the Steam Deck one took 0.4 to
++     * 0.8 s, the game stopped meanwhile (an explosion, a cut in a
++     * cutscene). The stand-in draws the same pixels, slower, from the
++     * uniform block, and a compile thread builds the draw's own. */
++    if (standin_on && s_gpl && s_jobs_up > 0 && (standin_on == 2 || !lib_fs_have(k))) {
++        uint64_t t0 = now_us();
++        VkPipeline d = standin_get(k);
++
++        s_fr_pipe_us += now_us() - t0;
++        if (d) {
++            mtx_lock(&s_pipe_mtx);
++            slot = pipe_find_locked(k, &found);
++            if (!found && slot >= 0) {
++                s_pipes[slot].k = *k;
++                s_pipes[slot].p = d;
++                s_pipes[slot].used = 1;
++                s_pipes[slot].standin = 1;
++                s_npipes++;
++                added = 1;
++            } else {
++                added = 0;
++                if (found)
++                    d = s_pipes[slot].p;
++            }
++            mtx_unlock(&s_pipe_mtx);
++            if (added) {
++                s_fr_standins++;
++                if (standin_on == 1)     /* 2: every draw a stand-in, to compare */
++                    job_push_standin(k); /* ring full: it stays a stand-in */
++                pl_record(k);
++                return d;
++            }
++            if (found)
++                return d;
++        }
++    }
+     {
+         uint64_t t0 = now_us();
+         p = pipe_build(k, 0);
+@@ -3261,7 +3489,11 @@ static VkPipeline pipe_get(const PipeKey *k)
+         return VK_NULL_HANDLE;
+     p = pipe_add(k, p, &added);
+     if (added) {
+-        if (s_gpl && s_jobs_up > 0)
++        /* Not the in-between variant's: a pipeline for every one the
++         * title's frames use, each new scene kept both compile threads
++         * busy for half a minute on the Deck, and the frames it shows
++         * draw the same linked as optimised. */
++        if (s_gpl && s_jobs_up > 0 && !(k->vsh & VSH_BLEND_BIT))
+             job_push_optimise(k);
+         pl_record(k);
+     }
+@@ -3318,7 +3550,9 @@ static void slot_load(void)
+ static VkResult queue_submit(const VkSubmitInfo *si)
+ {
+     VkResult r;
++    uint64_t t0 = now_us();
+     queue_lock(1);
++    s_fr_qwait_us += now_us() - t0;
+     r = vkQueueSubmit(s_queue, 1, si, s_fence);
+     queue_lock(0);
+     return r;
+@@ -3658,7 +3892,12 @@ typedef struct {
+     uint32_t attr[16][4];
+     float    value[16][4];
+     float    vp[4], vp2[4], fogp[4];
++    float    ip[4];          /* x: toward s_vsh_kb (rec_replay), 0 none */
+ } VkVshDraw;
++/* An in-between frame's program draw (rec_replay): the partner's constants
++ * in B and how far toward them; the shader runs the program on both. */
++static const float (*s_vsh_kb)[4];
++static float s_vsh_t;
+ 
+ /* The textures a batch's stages sample, as descriptors (decoding or
+  * resolving one may flush, so this comes first). */
+@@ -3738,6 +3977,29 @@ static void fill_draw_uniforms(VkDraw *u, const Nv2aFullBatch *b,
+     }
+     u->misc[3] = b->stage_input;
+     memcpy(u->fogc, b->fog_color, 16);
++    /* RECOMP_VK_VERBOSE: a projected stage (PROJECT2D/3D) addressed BORDER
++     * with the border from the texture, which is drawn clamped to its edge
++     * here -- a projected shadow then runs on past its frustum (the
++     * training cave's doors). Once per texture, to see what the title asks. */
++    if (s_verbose && b->use_rc) {
++        static uint32_t seen[32];
++        static int nseen;
++        for (st = 0; st < 4; st++) {
++            const Nv2aStage *sg = &b->stage[st];
++            uint32_t mode = (b->rc->stage_program >> (5 * st)) & 0x1F, k;
++            if ((mode != 1 && mode != 2) || sg->border_color
++                || (sg->addr_u != 4 && sg->addr_v != 4) || nseen >= 32)
++                continue;
++            for (k = 0; k < (uint32_t)nseen && seen[k] != sg->offset; k++) {}
++            if (k < (uint32_t)nseen)
++                continue;
++            seen[nseen++] = sg->offset;
++            fprintf(stderr, "[VK] projected texture, border from the texture: stage %u %ux%u"
++                    " format 0x%02X at %08X, address u %u v %u, border colour %08X\n",
++                    st, sg->width, sg->height, sg->color, sg->offset, sg->addr_u, sg->addr_v,
++                    sg->border);
++        }
++    }
+ }
+ 
+ static void pipe_key(PipeKey *pk, const Surf *s, const Zeta *z,
+@@ -3834,6 +4096,330 @@ static void submit_if_due(void)
+         soft_flush();
+ }
+ 
++/* ---- Draw trace (nv2a_vk_trace_arm) --------------------------------- */
++/* One frame's draws, armed from the game (the debug build's mark): from
++ * the next flip to the one after, every draw's state on a line of
++ * <path>.txt, and for those into a frame-sized surface the part of it
++ * RECOMP_VK_TRACE_BOX (fractions x0,y0,x1,y1) covers as it stood after the
++ * draw, into <path>.bin -- only those that changed it; without the box,
++ * the whole surface at a quarter of its size (a frame of 1700 draws fits,
++ * and a glare anywhere shows). The in-between
++ * frames drawn meanwhile are in it too (replay t). For what only one GPU
++ * draws (Berri's window on the Deck). */
++#define TRACE_BYTES (224u << 20)
++static char s_trace_path[1024];
++static atomic_int s_trace_arm;
++static int s_trace_on, s_trace_n;
++static float s_trace_rt;
++static Ring s_trace_buf;
++static VkDeviceSize s_trace_used;
++static FILE *s_trace_txt;
++typedef struct { VkDeviceSize off; uint32_t w, h, draw; uint32_t va; } TraceCrop;
++static TraceCrop s_trace_crop[4096];
++static Img s_trace_small;          /* the frame at a quarter, blitted (no box set) */
++static int s_trace_ncrop;
++
++void nv2a_vk_trace_arm(const char *path)
++{
++    if (atomic_load(&s_trace_arm))
++        return;
++    snprintf(s_trace_path, sizeof s_trace_path, "%s", path);
++    atomic_store(&s_trace_arm, 1);
++}
++
++static void trace_box(uint32_t w, uint32_t h, uint32_t *x0, uint32_t *y0, uint32_t *x1, uint32_t *y1)
++{
++    float b[4] = { 0.40f, 0.12f, 0.78f, 0.62f };
++    const char *e = getenv("RECOMP_VK_TRACE_BOX");
++    if (e)
++        sscanf(e, "%f,%f,%f,%f", &b[0], &b[1], &b[2], &b[3]);
++    *x0 = (uint32_t)(b[0] * w); *y0 = (uint32_t)(b[1] * h);
++    *x1 = (uint32_t)(b[2] * w); *y1 = (uint32_t)(b[3] * h);
++    if (*x1 > w) *x1 = w;
++    if (*y1 > h) *y1 = h;
++    if (*x0 >= *x1) *x0 = *x1 ? *x1 - 1 : 0;
++    if (*y0 >= *y1) *y0 = *y1 ? *y1 - 1 : 0;
++}
++
++/* At a flip: start an armed trace, or write out the one running. */
++static void trace_flip(void)
++{
++    static long at = -2;
++    if (at == -2) {      /* RECOMP_VK_TRACE_AT=flip,path: armed without a mark */
++        const char *e = getenv("RECOMP_VK_TRACE_AT"), *c = e ? strchr(e, ',') : NULL;
++        at = c ? atol(e) : -1;
++        if (c)
++            snprintf(s_trace_path, sizeof s_trace_path, "%s", c + 1);
++    }
++    if (at >= 0 && (long)s_frame == at && !atomic_load(&s_trace_arm))
++        atomic_store(&s_trace_arm, 1);
++    if (s_trace_on) {
++        FILE *f;
++        char p[1100];
++        int i;
++        /* The copies done: a full flush waits for the submission in flight
++         * only when it has something to submit itself -- with the last
++         * draws handed over by a soft flush it returned at once, and the
++         * crops were read before the GPU wrote them (white or stale). */
++        cmd();
++        flush();
++        snprintf(p, sizeof p, "%s.bin", s_trace_path);
++        f = fopen(p, "wb");
++        for (i = 0; f && i < s_trace_ncrop; i++) {
++            const TraceCrop *c = &s_trace_crop[i];
++            uint32_t hdr[4] = { c->draw, c->w, c->h, c->va };
++            size_t n = (size_t)c->w * c->h * 4;
++            int k, same = 0;
++            for (k = i - 1; k >= 0; k--)   /* the same surface's previous crop */
++                if (s_trace_crop[k].va == c->va && s_trace_crop[k].w == c->w && s_trace_crop[k].h == c->h
++                    && !((s_trace_crop[k].draw ^ c->draw) & 0x80000000u)) {
++                    same = !memcmp(s_trace_buf.map + s_trace_crop[k].off, s_trace_buf.map + c->off, n);
++                    break;
++                }
++            if (same)
++                continue;
++            fwrite(hdr, sizeof hdr, 1, f);
++            fwrite(s_trace_buf.map + c->off, 1, n, f);
++        }
++        if (f)
++            fclose(f);
++        if (s_trace_txt) {
++            fprintf(s_trace_txt, "end: %d draws, %d crops\n", s_trace_n, s_trace_ncrop);
++            fclose(s_trace_txt);
++        }
++        s_trace_txt = NULL;
++        fprintf(stderr, "[VK] trace: %d draws, %d crops -> %s.txt/.bin\n", s_trace_n, s_trace_ncrop, s_trace_path);
++        s_trace_on = 0;
++        atomic_store(&s_trace_arm, 0);
++        return;
++    }
++    if (atomic_load(&s_trace_arm) == 1) {
++        char p[1100];
++        atomic_store(&s_trace_arm, 2);     /* running: a second mark waits */
++        if (!s_trace_buf.buf && !ring_create(&s_trace_buf, TRACE_BYTES, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
++            fprintf(stderr, "[VK] trace: no buffer\n");
++            atomic_store(&s_trace_arm, 0);
++            return;
++        }
++        snprintf(p, sizeof p, "%s.txt", s_trace_path);
++        s_trace_txt = fopen(p, "w");
++        s_trace_on = 1;
++        s_trace_n = s_trace_ncrop = 0;
++        s_trace_used = 0;
++        if (s_trace_txt)
++            fprintf(s_trace_txt, "trace from flip %u; msaa %u\n", s_frame, s_msaa);
++    }
++}
++
++/* A multiply-blended program draw (a projected shadow laid on the scene):
++ * its program, the constants, and each vertex as the CPU interpreter runs
++ * it -- inputs, oPos, oD0, oT0 -- so a fade the program computes per
++ * vertex can be checked against what the screen shows. */
++static void trace_vertices(FILE *f, const Nv2aProgramBatch *pb)
++{
++    uint32_t v, a, i, n = 0;
++
++    if (pb->program) {
++        char *g = nv2a_vk_vprog_glsl(pb->program, (int)pb->ninst, 0);
++        const char *m = g ? strstr(g, "#ifdef VSH_PROGRAM") : NULL;
++        const char *e = m ? strstr(m + 1, "#e") : NULL;
++        fprintf(f, "  program:\n%.*s\n", m && e ? (int)(e - m) : 6, m && e ? m : "(none)");
++        free(g);
++    }
++    if (pb->constants)
++        for (i = 0; i < 192; i++) {
++            const float *c = pb->constants[i];
++            if (c[0] != 0.0f || c[1] != 0.0f || c[2] != 0.0f || c[3] != 0.0f)
++                fprintf(f, "  c%u %g %g %g %g\n", i, c[0], c[1], c[2], c[3]);
++        }
++    for (a = 0; a < 16; a++)
++        if (pb->attr[a].data)
++            fprintf(f, "  attr %u stride %u type %u size %u\n", a, pb->attr[a].stride,
++                    pb->attr[a].type, pb->attr[a].size);
++    nv2a_vsh_prepare();
++    for (v = pb->min_index; v <= pb->max_index && n < 600; v++, n++) {
++        float in[NV2A_VSH_INPUTS][4];
++        Nv2aVshOutput o;
++        for (a = 0; a < 16; a++) {
++            const Nv2aAttrib *at = &pb->attr[a];
++            const uint8_t *p = at->data ? at->data + (size_t)v * at->stride : NULL;
++            memcpy(in[a], at->value, sizeof in[a]);
++            if (!p)
++                continue;
++            in[a][0] = in[a][1] = in[a][2] = 0.0f; in[a][3] = 1.0f;
++            for (i = 0; i < at->size && i < 4; i++) {
++                switch (at->type) {
++                case 0: in[a][i] = p[i == 3 ? 3 : 2 - i] / 255.0f; break;
++                case 1: in[a][i] = ((const int16_t *)p)[i] / 32767.0f; break;
++                case 2: memcpy(&in[a][i], p + 4 * i, 4); break;
++                case 4: in[a][i] = p[i] / 255.0f; break;
++                case 5: in[a][i] = ((const int16_t *)p)[i]; break;
++                default: in[a][i] = -999.0f; break;
++                }
++            }
++        }
++        memset(&o, 0, sizeof o);
++        if (!nv2a_vsh_run((const float (*)[4])in, &o))
++            break;
++        fprintf(f, "  v %u", v);
++        for (a = 0; a < 16; a++)
++            if (pb->attr[a].data)
++                fprintf(f, " in%u %g %g %g %g", a, in[a][0], in[a][1], in[a][2], in[a][3]);
++        fprintf(f, " | pos %g %g %g %g d0 %g %g %g %g t0 %g %g %g %g\n",
++                o.pos[0], o.pos[1], o.pos[2], o.pos[3], o.d0[0], o.d0[1], o.d0[2], o.d0[3],
++                o.tex[0][0], o.tex[0][1], o.tex[0][2], o.tex[0][3]);
++    }
++    if (pb->indices) {
++        fprintf(f, "  idx");
++        for (i = 0; i < pb->count; i++)
++            fprintf(f, " %u", pb->indices[i]);
++        fprintf(f, "\n");
++    }
++}
++
++static void trace_draw(const char *kind, const Nv2aSurface *ns, const Nv2aRenderState *rs,
++                       const Nv2aFullBatch *b, Surf *s, const PipeKey *pk, uint32_t count,
++                       const Nv2aProgramBatch *pb, uint32_t vsh)
++{
++    FILE *f = s_trace_txt;
++    int i;
++    uint32_t h = 2166136261u;
++
++    if (!s_trace_on)
++        return;
++    s_trace_n++;
++    if (f) {
++        fprintf(f, "draw %d %s%s t %.3f surf %08X %ux%u fmt %u img %ux%u sc %u count %u",
++                s_trace_n, kind, s_replay ? " replay" : "", s_replay ? s_trace_rt : 0.0f,
++                ns->color_va, ns->width, ns->height, ns->color_format, s->color.w, s->color.h, s->sc, count);
++        fprintf(f, " | blend %u %X %X %X c %08X atest %u %X %u depth %u %X w %u mask %08X cull %u %X stencil %u zpass %u zeta %08X",
++                rs->blend_enable, rs->blend_src, rs->blend_dst, rs->blend_eq, rs->blend_color,
++                rs->alpha_test_enable, rs->alpha_func, rs->alpha_ref, rs->depth_test_enable,
++                rs->depth_func, rs->depth_write, rs->color_mask, rs->cull_enable, rs->cull_face,
++                rs->stencil_enable, rs->zpass_enable, rs->zeta_va);
++        if (pb)
++            fprintf(f, " | prog gen %llu ninst %u vsh %X idx %u..%u",
++                    (unsigned long long)pb->prog_gen, pb->ninst, vsh, pb->min_index, pb->max_index);
++        if (b) {
++            fprintf(f, " | rc %u stage_input %X clip %X fogc %.2f %.2f %.2f %.2f",
++                    b->use_rc, b->stage_input, b->clip_plane_mode,
++                    b->fog_color[0], b->fog_color[1], b->fog_color[2], b->fog_color[3]);
++            for (i = 0; i < 4; i++) {
++                const Nv2aStage *t = &b->stage[i];
++                if (!t->valid)
++                    continue;
++                fprintf(f, " | t%d %08X %ux%u fmt %X lv %u flt %08X addr %u %u %u cube %u norm %u pal %08X brd %u %08X bump %g %g %g %g %g %g",
++                        i, t->offset, t->width, t->height, t->color, t->levels, t->filter,
++                        t->addr_u, t->addr_v, t->addr_p, t->cube, t->normalized, t->palette,
++                        t->border_color, t->border, t->bump_mat[0], t->bump_mat[1], t->bump_mat[2],
++                        t->bump_mat[3], t->bump_scale, t->bump_offset);
++            }
++            if (b->use_rc && b->rc) {
++                const uint32_t *w = (const uint32_t *)b->rc;
++                fprintf(f, " | rcw");
++                for (i = 0; i < (int)(sizeof *b->rc / 4); i++)
++                    fprintf(f, " %X", w[i]);
++            }
++        }
++        {
++            const uint8_t *k = (const uint8_t *)pk;
++            for (i = 0; i < (int)sizeof *pk; i++)
++                h = (h ^ k[i]) * 16777619u;
++            fprintf(f, " | key %08X\n", h);
++        }
++        if (b && !pb && b->vertices && count) {   /* where a pre-transformed draw lands */
++            float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
++            uint32_t v;
++            for (v = 0; v < count; v++) {
++                const float *p = b->vertices[v].pos;
++                if (p[0] < x0) x0 = p[0];
++                if (p[0] > x1) x1 = p[0];
++                if (p[1] < y0) y0 = p[1];
++                if (p[1] > y1) y1 = p[1];
++            }
++            fprintf(f, "  bbox %.1f %.1f %.1f %.1f\n", x0, y0, x1, y1);
++        }
++        if (pb && !s_replay && rs->blend_enable && rs->blend_src == 0x306 && rs->blend_dst == 0)
++            trace_vertices(f, pb);
++    }
++    /* The box, after the draw, from a frame-sized surface. */
++    if (s_msaa <= 1 && s->color.image && s->color.w >= 32 && s->color.h >= 32
++        && (s->color.fmt == VK_FORMAT_B8G8R8A8_UNORM || s->color.fmt == VK_FORMAT_R8G8B8A8_UNORM
++            || (s->color.fmt == VK_FORMAT_R5G6B5_UNORM_PACK16 && s->color.w * s->color.h <= 256 * 256))
++        && s_trace_ncrop < (int)(sizeof s_trace_crop / sizeof s_trace_crop[0])) {
++        uint32_t x0, y0, x1, y1;
++        VkDeviceSize n;
++        VkBufferImageCopy rg;
++        VkImage from = s->color.image;
++        int small = s->color.w * s->color.h <= 256 * 256;
++        int whole = !small && !getenv("RECOMP_VK_TRACE_BOX");
++        /* 16-bit (a projected shadow's 128x128 R5G6B5): blitted to 8-bit whole */
++        int conv = s->color.fmt == VK_FORMAT_R5G6B5_UNORM_PACK16;
++        if (small) {          /* a bloom stage, a light map: all of it */
++            x0 = y0 = 0;
++            x1 = s->color.w;
++            y1 = s->color.h;
++        } else if (whole) {
++            x0 = y0 = 0;
++            x1 = s->color.w / 4;
++            y1 = s->color.h / 4;
++        } else if (s->color.w >= 256 && s->color.h >= 192) {
++            trace_box(s->color.w, s->color.h, &x0, &y0, &x1, &y1);
++        } else {
++            return;
++        }
++        n = (VkDeviceSize)(x1 - x0) * (y1 - y0) * 4;
++        if (s_trace_used + n > TRACE_BYTES)
++            return;
++        end_rendering();
++        s_rt = NULL;
++        s_rt_z = NULL;
++        if (whole || conv) {
++            VkImageBlit bl;
++            /* One image, made once, used in its top left corner. */
++            if (!s_trace_small.image
++                && !img_create(&s_trace_small, 512, 512, 1, VK_FORMAT_B8G8R8A8_UNORM,
++                               VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
++                               | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, 0))
++                return;
++            if (x1 > s_trace_small.w || y1 > s_trace_small.h)
++                return;
++            barrier_all();
++            memset(&bl, 0, sizeof bl);
++            bl.srcSubresource.aspectMask = bl.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++            bl.srcSubresource.layerCount = bl.dstSubresource.layerCount = 1;
++            bl.srcOffsets[1].x = (int32_t)s->color.w;
++            bl.srcOffsets[1].y = (int32_t)s->color.h;
++            bl.srcOffsets[1].z = 1;
++            bl.dstOffsets[1].x = (int32_t)x1;
++            bl.dstOffsets[1].y = (int32_t)y1;
++            bl.dstOffsets[1].z = 1;
++            vkCmdBlitImage(cmd(), from, VK_IMAGE_LAYOUT_GENERAL, s_trace_small.image,
++                           VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
++            from = s_trace_small.image;
++        }
++        barrier_all();
++        memset(&rg, 0, sizeof rg);
++        rg.bufferOffset = s_trace_used;
++        rg.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++        rg.imageSubresource.layerCount = 1;
++        rg.imageOffset.x = whole ? 0 : (int32_t)x0;
++        rg.imageOffset.y = whole ? 0 : (int32_t)y0;
++        rg.imageExtent.width = x1 - x0;
++        rg.imageExtent.height = y1 - y0;
++        rg.imageExtent.depth = 1;
++        vkCmdCopyImageToBuffer(cmd(), from, VK_IMAGE_LAYOUT_GENERAL, s_trace_buf.buf, 1, &rg);
++        barrier_all();
++        s_trace_crop[s_trace_ncrop].off = s_trace_used;
++        s_trace_crop[s_trace_ncrop].w = x1 - x0;
++        s_trace_crop[s_trace_ncrop].h = y1 - y0;
++        s_trace_crop[s_trace_ncrop].draw = (uint32_t)s_trace_n | (s_replay ? 0x80000000u : 0);
++        s_trace_crop[s_trace_ncrop].va = ns->color_va;
++        s_trace_ncrop++;
++        s_trace_used += (n + 15) & ~(VkDeviceSize)15;
++    }
++}
++
+ static void end_draw(VkCommandBuffer c, Surf *s, const PipeKey *pk, int use_q)
+ {
+     (void)c;
+@@ -3918,6 +4504,7 @@ static void vk_draw_full(const Nv2aSurface *ns, const Nv2aFullBatch *b)
+     if (use_q)
+         vkCmdEndQuery(c, s_qpool, s_q_used++);
+     end_draw(c, s, &pk, use_q);
++    trace_draw("full", ns, rs, b, s, &pk, b->count, NULL, 0);
+     if (z && writes_zeta(rs)) {
+         z->gpu_dirty = 1;
+         z->version = ++s_writes;
+@@ -3938,8 +4525,9 @@ static void vk_draw_program(const Nv2aSurface *ns, const Nv2aProgramBatch *b)
+     const Nv2aFullBatch *pix = &b->pix;
+     const Nv2aRenderState *rs = pix->state;
+     VkDescriptorImageInfo img2d[4], imgcube[4];
+-    VkDescriptorBufferInfo bi[4];
+-    VkWriteDescriptorSet w[4];
++    VkDescriptorBufferInfo bi[5];
++    VkWriteDescriptorSet w[5];
++    VkDeviceSize kboff = UINT64_MAX;
+     Stream st[16];
+     int ns_ = 0, order[16], na = 0, i, j, need_z, use_q;
+     uint32_t nv = b->max_index - b->min_index + 1, k;
+@@ -4022,9 +4610,16 @@ static void vk_draw_program(const Nv2aSurface *ns, const Nv2aProgramBatch *b)
+                 memcpy(s_ru.map + s_kp_off, s_kp_last, sizeof s_kp_last);
+             }
+         }
++        kboff = s_kc_off;
++        if (s_vsh_kb && s_vsh_t > 0.0f) {
++            kboff = ring_take(&s_ru, sizeof s_kc_last, s_ubo_align);
++            if (kboff != UINT64_MAX)
++                memcpy(s_ru.map + kboff, s_vsh_kb, sizeof s_kc_last);
++        }
+         voff = ring_take(&s_rv, total, 16);
+         ioff = ring_take(&s_rv, ibytes, 16);
+         ok &= uoff != UINT64_MAX && s_kc_off != UINT64_MAX && s_kp_off != UINT64_MAX
++           && kboff != UINT64_MAX
+            && voff != UINT64_MAX && ioff != UINT64_MAX
+            && !(use_q && s_q_used == VK_MAX_QUERIES);
+         if (ok)
+@@ -4080,6 +4675,7 @@ static void vk_draw_program(const Nv2aSurface *ns, const Nv2aProgramBatch *b)
+     vd->fogp[1] = (float)b->fog_mode;
+     vd->fogp[2] = b->fog_param[0];
+     vd->fogp[3] = b->fog_param[1];
++    vd->ip[0] = s_vsh_kb ? s_vsh_t : 0.0f;
+ 
+     ix = (uint32_t *)(s_rv.map + ioff);
+     for (k = 0; k < b->count; k++)
+@@ -4099,8 +4695,11 @@ static void vk_draw_program(const Nv2aSurface *ns, const Nv2aProgramBatch *b)
+     bi[2].buffer = s_ru.buf;
+     bi[2].offset = s_kp_off;
+     bi[2].range = sizeof s_kp_last;
++    bi[4].buffer = s_ru.buf;
++    bi[4].offset = kboff;
++    bi[4].range = sizeof s_kc_last;
+     memset(w, 0, sizeof w);
+-    for (i = 0; i < 4; i++) {
++    for (i = 0; i < 5; i++) {
+         w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+         w[i].dstBinding = 9 + (uint32_t)i;
+         w[i].descriptorCount = 1;
+@@ -4108,7 +4707,7 @@ static void vk_draw_program(const Nv2aSurface *ns, const Nv2aProgramBatch *b)
+                                 : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+         w[i].pBufferInfo = &bi[i];
+     }
+-    c = bind_draw(ns, rs, s, z, pipe, uoff, img2d, imgcube, w, 4);
++    c = bind_draw(ns, rs, s, z, pipe, uoff, img2d, imgcube, w, 5);
+     vkCmdBindIndexBuffer(c, s_rv.buf, ioff, VK_INDEX_TYPE_UINT32);
+     if (use_q)
+         vkCmdBeginQuery(c, s_qpool, s_q_used,
+@@ -4117,6 +4716,7 @@ static void vk_draw_program(const Nv2aSurface *ns, const Nv2aProgramBatch *b)
+     if (use_q)
+         vkCmdEndQuery(c, s_qpool, s_q_used++);
+     end_draw(c, s, &pk, use_q);
++    trace_draw("prog", ns, rs, pix, s, &pk, b->count, b, s_vsh_last);
+     if (z && writes_zeta(rs)) {
+         z->gpu_dirty = 1;
+         z->version = ++s_writes;
+@@ -4707,27 +5307,55 @@ static void quality_change(void)
+     }
+ }
+ 
++static uint64_t s_tick_total_us;   /* drawing in-between frames, all along (vk_tick) */
++
+ static void vk_flip(void)
+ {
+     unsigned req = s_scale_req;
+     int i;
+ 
+     flush();
++    trace_flip();
+     if (req && req != s_scale)
+         scale_change(req);
+     quality_change();
+     s_frame++;
+     {
++        extern uint64_t nv2a_pb_busy_ns, nv2a_pb_cpu_ns, nv2a_pb_gate_ns;   /* nv2a_pb_scan.c */
++        static uint64_t cpu0, gate0;
++        static uint64_t busy0, tick0, res0, wb0, th0, thb0;
++        static uint32_t dr0, fl0, sfl0, rb0;
++        static long slow_us = -1;
+         uint64_t t = now_us();
+-        if (s_verbose && s_fr_t0 && t - s_fr_t0 > 50000)
+-            fprintf(stderr, "[VK] slow frame %u: %.0f ms; %u pipelines %.0f ms (parts compiled:"
++#define FR_D(cur, snap) ((cur) >= (snap) ? (cur) - (snap) : (cur))
++        if (slow_us < 0) {   /* RECOMP_VK_SLOW_MS: what a slow frame is (50) */
++            const char *e = getenv("RECOMP_VK_SLOW_MS");
++            slow_us = (e ? atol(e) : 50) * 1000;
++        }
++        if (s_verbose && s_fr_t0 && t - s_fr_t0 > (uint64_t)slow_us)
++            fprintf(stderr, "[VK] slow frame %u: %.0f ms; %u stand-ins, %u pipelines %.0f ms (parts compiled:"
+                     " input %u, vertex %u, pixel %u, output %u, %.0f ms), %u uploads %.0f ms,"
+-                    " GPU waits %.0f ms\n", s_frame, (t - s_fr_t0) / 1000.0, s_fr_pipes,
++                    " GPU waits %.0f ms, queue waits %.0f ms; executing the title's commands %.0f ms"
++                    " (its CPU time %.0f ms, waiting at the one-CPU gate %.0f ms; in-between frames %.0f ms); %u draws, %u flushes (+%u soft), %u read back,"
++                    " resolve %.1f ms (writing back %.1f), texture hashing %.1f ms (%.2f MB)\n",
++                    s_frame, (t - s_fr_t0) / 1000.0, s_fr_standins, s_fr_pipes,
+                     s_fr_pipe_us / 1000.0, s_fr_libs[0], s_fr_libs[1], s_fr_libs[2], s_fr_libs[3],
+-                    s_fr_lib_us / 1000.0, s_fr_ups, s_fr_up_us / 1000.0, s_fr_wait_us / 1000.0);
++                    s_fr_lib_us / 1000.0, s_fr_ups, s_fr_up_us / 1000.0, s_fr_wait_us / 1000.0,
++                    s_fr_qwait_us / 1000.0, (nv2a_pb_busy_ns - busy0) / 1e6, (nv2a_pb_cpu_ns - cpu0) / 1e6, (nv2a_pb_gate_ns - gate0) / 1e6,
++                    (s_tick_total_us - tick0) / 1000.0,
++                    s_draws - dr0, s_flushes - fl0, s_soft_flushes - sfl0, s_tex_rt - rb0,
++                    FR_D(s_t_resolve, res0) / 1000.0, FR_D(s_t_wb, wb0) / 1000.0,
++                    FR_D(s_t_texhash, th0) / 1000.0, FR_D(s_texhash_bytes, thb0) / 1048576.0);
++#undef FR_D
++        busy0 = nv2a_pb_busy_ns;
++        cpu0 = nv2a_pb_cpu_ns;
++        gate0 = nv2a_pb_gate_ns;
++        tick0 = s_tick_total_us;
++        dr0 = s_draws; fl0 = s_flushes; sfl0 = s_soft_flushes; rb0 = s_tex_rt;
++        res0 = s_t_resolve; wb0 = s_t_wb; th0 = s_t_texhash; thb0 = s_texhash_bytes;
+         s_fr_t0 = t;
+-        s_fr_pipe_us = s_fr_lib_us = s_fr_up_us = s_fr_wait_us = 0;
+-        s_fr_pipes = s_fr_ups = 0;
++        s_fr_pipe_us = s_fr_lib_us = s_fr_up_us = s_fr_wait_us = s_fr_qwait_us = 0;
++        s_fr_pipes = s_fr_ups = s_fr_standins = 0;
+         memset(s_fr_libs, 0, sizeof s_fr_libs);
+     }
+     /* Drop textures nothing has drawn with for a while. */
+@@ -4820,6 +5448,8 @@ typedef struct {
+     uint8_t  blend;             /* constants close enough to blend */
+     uint8_t  apart;             /* paired among several alike, but not near */
+     uint8_t  single;            /* the only one of its key in A and in B */
++    uint8_t  skip;              /* left out of in-between frames (rec_passes) */
++    uint8_t  taken;             /* B's: some draw of A pairs with it */
+     uint16_t dlo, dhi;          /* the floats that differ from B's, dlo > dhi none */
+     uint32_t vsh;               /* its compiled vertex program, once ready */
+     Nv2aSurface ns;
+@@ -4844,6 +5474,7 @@ typedef struct {
+     uint32_t last_ninst;
+     uint32_t shown_va;
+     uint32_t shown_ver;         /* its surface's version at the flip */
++    uint32_t zsnap_gen;         /* its depth in s_zsnap, while that is s_zsnap_gen */
+     int      cut;               /* as A of a pair: shown without blending */
+ } RecFrame;
+ 
+@@ -4851,7 +5482,11 @@ static RecFrame s_recf[3];
+ static int s_rec_cur, s_pair_a = -1, s_pair_b = -1, s_prev_done = -1;
+ static int s_sub_done, s_in_tick, s_showed_b;
+ /* RECOMP_VK_VERBOSE: per 300 frames drawn, how the blending went. */
+-static unsigned s_is_frames, s_is_cuts, s_is_shown, s_is_skipped;
++static unsigned s_is_frames, s_is_cuts, s_is_shown, s_is_skipped, s_is_whole, s_is_torn,
++                s_is_relinked, s_is_skipped_pass, s_is_under[4], s_is_under_z, s_is_kmix,
++                s_is_coh, s_is_fixed, s_is_jumped, s_is_jumped_checked;
++static uint64_t s_is_coh_us, s_is_jump_us;
++static unsigned s_is_repaired, s_is_single_jumped;
+ static uint64_t s_is_draws, s_is_matched, s_is_blended, s_is_us;
+ static uint64_t s_pair_t0, s_last_flip_us, s_period_us = 33333;
+ static atomic_uint s_interp_req = 1;
+@@ -4954,7 +5589,19 @@ static void rec_keys(RecFrame *f)
+             key = rec_stage_key(f, key, &r->fb, &r->rc, 1);
+         } else {
+             const uint32_t (*prog)[8] = (const uint32_t (*)[8])(f->mem + r->prog);
+-            key = rec_mix(rec_mix(key, r->pb.count), r->pb.ninst);
++            const uint32_t *ix = (const uint32_t *)(f->mem + r->data);
++            uint64_t mesh = r->pb.max_index - r->pb.min_index;
++            uint32_t j;
++            /* Which mesh: pieces of a level drawn alike (the same count,
++             * program and textures) told apart by their triangles, which
++             * the constants do not -- two pieces of rock lit alike were
++             * paired, one drawn where the other is, and the sky showed
++             * through the wall where the first should have been (white
++             * shards along the training level's water as the camera
++             * turned). */
++            for (j = 0; j < r->pb.count && j < 48; j++)
++                mesh = mesh * 1099511628211ull ^ (ix[j] - r->pb.min_index);
++            key = rec_mix(rec_mix(rec_mix(key, r->pb.count), r->pb.ninst), mesh);
+             for (k = 0; k < 16; k++)
+                 key = rec_mix(key, r->attr[k] != (size_t)-1
+                               ? (uint64_t)r->pb.attr[k].stride << 16
+@@ -5132,6 +5779,9 @@ static float rec_moved(const float *a, const float *b)
+     return m > 0 ? (float)(d / m) : 0.0f;
+ }
+ 
++#define REC_SHIFT_SAMPLES 48   /* draws whose vertex is run to find a cut */
++#define REC_SHIFT_CUT 0.2f     /* most moved further than this, of the surface: a cut */
++#define REC_JUMP_FAR 0.08f     /* one alike draw moved further than this: a wrong pair */
+ #define REC_RUN_NEAREST 256   /* larger runs: frame order */
+ #define REC_RUN_KEYS 64        /* constants that tell a run apart, at most */
+ #define REC_RUN_FAR 0.25f
+@@ -5262,12 +5912,440 @@ static int rec_fcmp(const void *x, const void *y)
+ /* Pair A's draws with B's by key: first whole, then for what is left
+  * without the textures -- a cutscene can swap a draw's lighting texture
+  * between two copies frame by frame. */
++/* ---- A program's oPos on the CPU (rec_coherent) ------------------- */
++
++/* nv2a_vsh.vert's interpreter, positions only: the exported program
++ * (nv2a_vsh_interp.h), constants c, inputs V. 0 when the program ends
++ * without one. */
++static float rv_fetch1(const uint8_t *p, uint32_t type, uint32_t k)
++{
++    float f;
++    int16_t h;
++    switch (type) {
++    case 2: memcpy(&f, p + 4 * k, 4); return f;
++    case 4: return p[k] / 255.0f;
++    case 1: memcpy(&h, p + 2 * k, 2); return h / 32767.0f;
++    case 5: memcpy(&h, p + 2 * k, 2); return (float)h;
++    default: return 0.0f;
++    }
++}
++
++static void rv_fetch(const Rec *r, const uint8_t *mem, int i, uint32_t vid, float o[4])
++{
++    const Nv2aAttrib *at = &r->pb.attr[i];
++    const uint8_t *p;
++    uint32_t k, size, v;
++
++    o[0] = o[1] = o[2] = 0.0f;
++    o[3] = 1.0f;
++    if (r->attr[i] == (size_t)-1) {
++        memcpy(o, at->value, 16);
++        return;
++    }
++    p = mem + r->attr[i] + (size_t)(vid - r->pb.min_index) * at->stride;
++    if (at->type == 0) {
++        memcpy(&v, p, 4);
++        o[0] = ((v >> 16) & 0xFF) / 255.0f;
++        o[1] = ((v >> 8) & 0xFF) / 255.0f;
++        o[2] = (v & 0xFF) / 255.0f;
++        o[3] = (v >> 24) / 255.0f;
++        return;
++    }
++    if (at->type == 6) {
++        memcpy(&v, p, 4);
++        o[0] = (float)((int32_t)(v << 21) >> 21) / 1023.0f;
++        o[1] = (float)((int32_t)(v << 10) >> 21) / 1023.0f;
++        o[2] = (float)((int32_t)v >> 22) / 511.0f;
++        return;
++    }
++    size = at->size < 4 ? at->size : 4;
++    for (k = 0; k < size; k++)
++        o[k] = rv_fetch1(p, at->type, k);
++}
++
++static int rv_run(const uint32_t (*pw)[8], uint32_t n, const float (*c)[4],
++                  const float V[16][4], float pos[4])
++{
++    float R[13][4], a[4], b[4], cc[4], mr[4], ir[4], *src_v;
++    int a0 = 0, done = 0;
++    uint32_t s, k;
++
++    memset(R, 0, sizeof R);
++    for (s = 0; s < n; s++) {
++        uint32_t f = pw[s][0], op = f & 0xF, iop = (f >> 4) & 7, sw[3], u;
++        float *dst[3] = { a, b, cc };
++        sw[0] = pw[s][2]; sw[1] = pw[s][3]; sw[2] = pw[s][4];
++        for (u = 0; u < 3; u++) {
++            float t[4];
++            uint32_t w = sw[u], kind = w & 0xF, idx = (w >> 4) & 0x1F;
++            if (!(f >> (22 + u) & 1)) {
++                memset(dst[u], 0, 16);
++                continue;
++            }
++            if (kind == 0)      src_v = R[idx < 13 ? idx : 0];
++            else if (kind == 1) src_v = R[12];
++            else if (kind == 2) src_v = (float *)V[idx & 15];
++            else {
++                int ci = (int)(w >> 18);
++                if (kind == 4) {
++                    ci += a0;
++                    if (ci < 0 || ci >= NV2A_VSH_CONSTANTS) ci = 0;
++                }
++                if (ci >= NV2A_VSH_CONSTANTS) ci = 0;
++                src_v = (float *)c[ci];
++            }
++            for (k = 0; k < 4; k++)
++                t[k] = src_v[(w >> (10 + 2 * k)) & 3];
++            for (k = 0; k < 4; k++)
++                dst[u][k] = (w >> 9 & 1) ? -t[k] : t[k];
++        }
++        memset(mr, 0, sizeof mr);
++        memset(ir, 0, sizeof ir);
++        switch (op) {
++        case 0: break;
++        case 2: for (k = 0; k < 4; k++) mr[k] = a[k] * b[k]; break;
++        case 3: for (k = 0; k < 4; k++) mr[k] = a[k] + cc[k]; break;
++        case 4: for (k = 0; k < 4; k++) mr[k] = a[k] * b[k] + cc[k]; break;
++        case 5: mr[0] = mr[1] = mr[2] = mr[3] = a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; break;
++        case 6: mr[0] = mr[1] = mr[2] = mr[3] = a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + b[3]; break;
++        case 7: mr[0] = mr[1] = mr[2] = mr[3] = a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3]; break;
++        case 8: mr[0] = 1.0f; mr[1] = a[1] * b[1]; mr[2] = a[2]; mr[3] = b[3]; break;
++        case 9: for (k = 0; k < 4; k++) mr[k] = a[k] < b[k] ? a[k] : b[k]; break;
++        case 10: for (k = 0; k < 4; k++) mr[k] = a[k] >= b[k] ? a[k] : b[k]; break;
++        case 11: for (k = 0; k < 4; k++) mr[k] = a[k] < b[k]; break;
++        case 12: for (k = 0; k < 4; k++) mr[k] = a[k] >= b[k]; break;
++        case 13: a0 = (int)floorf(a[0] + 0.001f); memcpy(mr, a, 16); break;
++        default: memcpy(mr, a, 16); break;
++        }
++        if (iop) {
++            float x = cc[0];
++            switch (iop) {
++            case 2: ir[0] = ir[1] = ir[2] = ir[3] = x == 0.0f ? INFINITY : 1.0f / x; break;
++            case 3: ir[0] = ir[1] = ir[2] = ir[3] = 1.0f / x; break;
++            case 4: ir[0] = ir[1] = ir[2] = ir[3] = x == 0.0f ? INFINITY : 1.0f / sqrtf(fabsf(x)); break;
++            case 5: ir[0] = exp2f(floorf(x)); ir[1] = x - floorf(x); ir[2] = exp2f(x); ir[3] = 1.0f; break;
++            case 6: {
++                float ax = fabsf(x), e = ax == 0.0f ? -INFINITY : floorf(log2f(ax));
++                ir[0] = e; ir[1] = ax == 0.0f ? 1.0f : ax / exp2f(e);
++                ir[2] = ax == 0.0f ? -INFINITY : log2f(ax); ir[3] = 1.0f;
++                break;
++            }
++            case 7: ir[0] = 1.0f; ir[1] = cc[0] > 0 ? cc[0] : 0; ir[2] = 0; ir[3] = 1.0f; break;
++            default: memcpy(ir, cc, 16); break;
++            }
++        }
++        {
++            uint32_t md = (pw[s][1] >> 8) & 0xFF, id = (pw[s][1] >> 16) & 0xFF;
++            uint32_t mm = (f >> 8) & 0xF, im = (f >> 12) & 0xF, om = (f >> 16) & 0xF;
++            done |= md == 13 || id == 13;
++            for (k = 0; k < 4; k++) {
++                if (md && md <= 13 && (mm >> (3 - k) & 1)) R[md - 1][k] = mr[k];
++                if (id && id <= 13 && (im >> (3 - k) & 1)) R[id - 1][k] = ir[k];
++            }
++            if (om && (f >> 21 & 1) && (pw[s][1] & 0xFF) == 0) {
++                const float *v = (f >> 20 & 1) ? ir : mr;
++                for (k = 0; k < 4; k++)
++                    if (om >> (3 - k) & 1) R[12][k] = v[k];
++                done = 1;
++            }
++        }
++    }
++    memcpy(pos, R[12], 16);
++    return done;
++}
++
++/* Whether A's draw, its vertices moved by B's constants instead of its own,
++ * moves as one thing. Paired with a draw that only shares its program and
++ * most constants -- one plant of a field for another, a skinned palette of
++ * bones from another instance -- some vertices jump and others stay, and
++ * halfway between the two they are spikes across the screen (the training
++ * level's white shards). A few vertices on the CPU: no blend when how far
++ * they moved differs, among them, by more than the draw spans. */
++static int rec_coherent(const RecFrame *A, const Rec *r, const float *cb)
++{
++    const uint32_t (*pw)[8] = (const uint32_t (*)[8])(A->mem + r->prog);
++    const float (*ca)[4] = (const float (*)[4])(A->mem + r->consts);
++    const uint32_t *ix = (const uint32_t *)(A->mem + r->data);
++    float pa[8][4], pb[8][4], V[16][4], mx = 0, my = 0, spread = 0, ext = 0;
++    uint32_t j, n = 0, step;
++    int i;
++
++    if (!r->pb.count || !r->pb.ninst)
++        return 1;
++    step = r->pb.count / 8 ? r->pb.count / 8 : 1;
++    for (j = 0; j < r->pb.count && n < 8; j += step) {
++        uint32_t vid = ix[j];
++        if (vid < r->pb.min_index || vid > r->pb.max_index)
++            continue;
++        for (i = 0; i < 16; i++)
++            rv_fetch(r, A->mem, i, vid, V[i]);
++        if (!rv_run(pw, r->pb.ninst, ca, (const float (*)[4])V, pa[n])
++            || !rv_run(pw, r->pb.ninst, (const float (*)[4])cb, (const float (*)[4])V, pb[n]))
++            return 1;
++        if (!(pa[n][3] > 0.0f) || !(pb[n][3] > 0.0f)
++            || !(fabsf(pa[n][0]) < 1e5f) || !(fabsf(pb[n][0]) < 1e5f)
++            || !(fabsf(pa[n][1]) < 1e5f) || !(fabsf(pb[n][1]) < 1e5f))
++            continue;                      /* behind the eye, or off at infinity */
++        mx += pb[n][0] - pa[n][0];
++        my += pb[n][1] - pa[n][1];
++        n++;
++    }
++    if (n < 2)
++        return 1;
++    mx /= (float)n;
++    my /= (float)n;
++    for (j = 0; j < n; j++) {
++        uint32_t q;
++        float dx = pb[j][0] - pa[j][0] - mx, dy = pb[j][1] - pa[j][1] - my, d = sqrtf(dx * dx + dy * dy);
++        if (d > spread) spread = d;
++        for (q = 0; q < j; q++) {
++            float ea = hypotf(pa[j][0] - pa[q][0], pa[j][1] - pa[q][1]);
++            float eb = hypotf(pb[j][0] - pb[q][0], pb[j][1] - pb[q][1]);
++            if (ea > ext) ext = ea;
++            if (eb > ext) ext = eb;
++        }
++    }
++    return spread <= 0.75f * ext + 8.0f;
++}
++
++/* Vertex `nth` of draw r (frame F) on the CPU: its oPos. 0 if it cannot. */
++static int rec_vpos(const RecFrame *F, const Rec *r, uint32_t nth, float pos[4])
++{
++    const uint32_t *ix = (const uint32_t *)(F->mem + r->data);
++    float V[16][4];
++    uint32_t vid;
++    int i;
++
++    if (!r->pb.count || !r->pb.ninst)
++        return 0;
++    vid = ix[nth < r->pb.count ? nth : r->pb.count - 1];
++    if (vid < r->pb.min_index || vid > r->pb.max_index)
++        return 0;
++    for (i = 0; i < 16; i++)
++        rv_fetch(r, F->mem, i, vid, V[i]);
++    return rv_run((const uint32_t (*)[8])(F->mem + r->prog), r->pb.ninst,
++                  (const float (*)[4])(F->mem + r->consts), (const float (*)[4])V, pos);
++}
++
++/* How far a draw's middle vertex lands from where it was, run with A's
++ * constants and then with B's, against the surface's size (1 off to the
++ * other side, or in front of the eye in one and behind it in the other).
++ * -1 when it cannot tell. `held`: each end held to two surfaces around it
++ * first -- near the eye a small step lands far out there. */
++static float rec_shift(const RecFrame *A, const Rec *r, const float *cb, int held)
++{
++    const uint32_t *ix = (const uint32_t *)(A->mem + r->data);
++    float V[16][4], pa[4], pb[4], size;
++    uint32_t vid;
++    int i;
++
++    if (!r->pb.count || !r->pb.ninst)
++        return -1.0f;
++    vid = ix[r->pb.count / 2];
++    if (vid < r->pb.min_index || vid > r->pb.max_index)
++        return -1.0f;
++    for (i = 0; i < 16; i++)
++        rv_fetch(r, A->mem, i, vid, V[i]);
++    if (!rv_run((const uint32_t (*)[8])(A->mem + r->prog), r->pb.ninst,
++                (const float (*)[4])(A->mem + r->consts), (const float (*)[4])V, pa)
++        || !rv_run((const uint32_t (*)[8])(A->mem + r->prog), r->pb.ninst,
++                   (const float (*)[4])cb, (const float (*)[4])V, pb))
++        return -1.0f;
++    if ((pa[3] > 0.0f) != (pb[3] > 0.0f))
++        return 1.0f;
++    if (!(pa[3] > 0.0f) || !(fabsf(pa[0]) < 1e5f) || !(fabsf(pb[0]) < 1e5f)
++        || !(fabsf(pa[1]) < 1e5f) || !(fabsf(pb[1]) < 1e5f))
++        return -1.0f;
++    size = (float)(r->ns.width > r->ns.height ? r->ns.width : r->ns.height);
++    if (size < 64.0f)
++        return -1.0f;
++    if (held) {
++        float w = (float)r->ns.width, h = (float)r->ns.height;
++        float ax = fminf(fmaxf(pa[0], -2.0f * w), 3.0f * w), ay = fminf(fmaxf(pa[1], -2.0f * h), 3.0f * h);
++        float bx = fminf(fmaxf(pb[0], -2.0f * w), 3.0f * w), by = fminf(fmaxf(pb[1], -2.0f * h), 3.0f * h);
++        return hypotf(bx - ax, by - ay) / size;
++    }
++    return hypotf(pb[0] - pa[0], pb[1] - pa[1]) / size;
++}
++
++/* Whether two draws put their first and last vertices in the same place:
++ * the same surface drawn twice. */
++static int rec_same_place(const RecFrame *F1, const Rec *a, const RecFrame *F2, const Rec *b)
++{
++    float pa[4], pb[4];
++    uint32_t e;
++    int k;
++
++    if (a->kind != 2 || b->kind != 2 || a->pb.count != b->pb.count)
++        return 0;
++    for (e = 0; e < 2; e++) {
++        uint32_t nth = e ? a->pb.count - 1 : 0;
++        if (!rec_vpos(F1, a, nth, pa) || !rec_vpos(F2, b, nth, pb))
++            return 0;
++        for (k = 0; k < 4; k++)
++            if (!(fabsf(pa[k] - pb[k]) <= 1e-3f * (1.0f + fabsf(pa[k]))))
++                return 0;
++    }
++    return 1;
++}
++
++/* A surface drawn again in the same frame -- a second pass over the first
++ * one's depth, additive, with depth EQUAL or LEQUAL -- is only right in
++ * between if it lands exactly where the first pass did. Paired on their own
++ * the two passes could take different partners in B (or one be blended and
++ * the other not), and the second then passed its depth test in stripes:
++ * white streaks over the training level's walls while the camera turned.
++ * A later pass (the same vertices, in the same place, as a draw shortly
++ * before it) follows the first: B's draw of its kind in the place of the
++ * first pass's partner, or as in A when the first pass is not blended; when
++ * B has none, it is left out of the in-between frame. */
++static void rec_passes(RecFrame *A, const RecFrame *B)
++{
++    int i, j, k;
++
++    for (i = 0; i < A->n; i++) {
++        Rec *ra = &A->r[i];
++        const Rec *base = NULL, *bb;
++
++        ra->skip = 0;
++        /* Only a pass over the first one's depth: full-screen passes are
++         * all in the same place too, and one of a cutscene's left out
++         * blacked out the barn behind Conker for a frame. */
++        if (ra->kind != 2 || !ra->rs.depth_test_enable
++            || (ra->rs.depth_func != 0x202 && ra->rs.depth_func != 0x203))
++            continue;
++        for (j = i - 1; j >= 0 && j >= i - 8; j--)
++            if (A->r[j].kind == 2 && A->r[j].pb.count == ra->pb.count
++                && A->r[j].ns.color_va == ra->ns.color_va
++                && rec_same_place(A, &A->r[j], A, ra)) {
++                base = &A->r[j];
++                break;
++            }
++        if (!base)
++            continue;
++        if (base->partner < 0 || !base->blend) {
++            ra->blend = 0;
++            continue;
++        }
++        bb = &B->r[base->partner];
++        if (ra->blend && ra->partner >= 0 && rec_same_place(B, &B->r[ra->partner], B, bb))
++            continue;
++        for (k = base->partner + 1; k < B->n && k <= base->partner + 8; k++)
++            if (B->r[k].key == ra->key && rec_same_place(B, &B->r[k], B, bb))
++                break;
++        if (k < B->n && k <= base->partner + 8) {
++            ra->partner = k;
++            ra->blend = 1;
++            ra->dlo = 0;
++            ra->dhi = NV2A_VSH_CONSTANTS * 4 - 1;
++            s_is_relinked++;
++        } else {
++            ra->skip = 1;
++            s_is_skipped_pass++;
++        }
++    }
++}
++
++/* Whether another of A's draws of r's kind lands near under B's draw k's
++ * constants: k is in its place. */
++static int rec_claimed(const RecFrame *A, const Rec *r, const RecFrame *B, int k, float lim)
++{
++    const float *cb = (const float *)(B->mem + B->r[k].consts);
++    int j;
++
++    for (j = 0; j < A->n; j++) {
++        float f;
++        if (A->r[j].key != r->key || &A->r[j] == r)
++            continue;
++        f = rec_shift(A, &A->r[j], cb, 1);
++        if (f >= 0.0f && f <= lim)
++            return 1;
++    }
++    return 0;
++}
++
++/* A's draw r, one of several alike, landed `d` away under its partner's
++ * constants, farther than the frame's draws move (`lim`). Grass right in
++ * front of the eye does that by itself. But the plants by the windmill's
++ * path, alike but for where each stands and how the wind bends it, were
++ * paired by their constants with another plant, and one stood for a frame
++ * where neither frame has one, or stretched along the path. When another
++ * of A's lands near the partner, the partner is that one's: r is paired
++ * anew with one of B's where it lands near and no other of A's does, or
++ * with none such drawn as A drew it. So is one of a run that is one more
++ * or fewer in B -- its own may have left as another came into view --
++ * unless it finds its own. Otherwise only one of B's where it lands as
++ * near as the frame's draws move (`tight`) takes it from its partner: its
++ * own, while the plant it went with came into view as it left. */
++static void rec_repair(RecFrame *A, Rec *r, const RecFrame *B, float d, float lim, float tight)
++{
++    float best = d;
++    int k, alt = -1, na = 0, nb = 0, wrong;
++
++    for (k = 0; k < A->n; k++)
++        na += A->r[k].key == r->key;
++    for (k = 0; k < B->n; k++)
++        nb += B->r[k].key == r->key;
++    wrong = na != nb || rec_claimed(A, r, B, r->partner, lim);
++    for (k = 0; k < B->n; k++) {
++        float e;
++        if (B->r[k].key != r->key || k == r->partner)
++            continue;
++        e = rec_shift(A, r, (const float *)(B->mem + B->r[k].consts), 1);
++        if (e >= 0.0f && e < best && e <= (wrong ? lim : tight) && !rec_claimed(A, r, B, k, lim)) {
++            best = e;
++            alt = k;
++        }
++    }
++    if (!wrong && alt < 0)
++        return;
++    if (alt >= 0) {
++        const float *ca = (const float *)(A->mem + r->consts);
++        const float *cb = (const float *)(B->mem + B->r[alt].consts);
++        int lo = -1, hi = -2;
++        for (k = 0; k < NV2A_VSH_CONSTANTS * 4; k++)
++            if (ca[k] != cb[k]) {
++                if (lo < 0) lo = k;
++                hi = k;
++            }
++        r->partner = alt;
++        r->dlo = (uint16_t)(lo < 0 ? 1 : lo);
++        r->dhi = (uint16_t)(lo < 0 ? 0 : hi);
++        s_is_repaired++;
++    } else {
++        r->blend = 0;
++        s_is_jumped++;
++    }
++}
++
++/* Whether A's draw i, `d` away under its partner's constants, goes with a
++ * neighbour: one drawn next to it, paired with the draw next to its partner,
++ * that moves about as far -- a part of one character turning with it. */
++static int rec_goes_along(const RecFrame *A, int i, const RecFrame *B, float d)
++{
++    int b = A->r[i].partner, s;
++
++    for (s = -1; s <= 1; s += 2) {
++        const Rec *n;
++        float e;
++        if (i + s < 0 || i + s >= A->n || b + s < 0 || b + s >= B->n)
++            continue;
++        n = &A->r[i + s];
++        if (n->kind != 2 || n->partner != b + s)
++            continue;
++        e = rec_shift(A, n, (const float *)(B->mem + B->r[b + s].consts), 1);
++        if (e >= 0.5f * d)
++            return 1;
++    }
++    return 0;
++}
++
+ static void rec_match(RecFrame *A, RecFrame *B)
+ {
+     uint8_t *ua = (uint8_t *)calloc((size_t)A->n + 1, 1);
+     uint8_t *ub = (uint8_t *)calloc((size_t)B->n + 1, 1);
+-    int i, pass, progs = 0, matched = 0, moved_far = 0, nmv = 0;
+-    float *mvr, *mvs;
++    int i, pass, progs = 0, matched = 0, moved_far = 0, nmv = 0, nsh = 0, sh_step;
++    float *mvr, *mvs, sh[REC_SHIFT_SAMPLES], sh_med = 0.0f;
+ 
+     for (i = 0; i < A->n; i++) {
+         A->r[i].partner = -1;
+@@ -5297,6 +6375,7 @@ static void rec_match(RecFrame *A, RecFrame *B)
+     free(ub);
+     mvr = (float *)malloc((size_t)(A->n ? A->n : 1) * sizeof *mvr);
+     mvs = (float *)malloc((size_t)(A->n ? A->n : 1) * sizeof *mvs);
++    sh_step = A->n / (2 * REC_SHIFT_SAMPLES) + 1;
+     for (i = 0; i < A->n; i++) {
+         Rec *ra = &A->r[i];
+         ra->blend = 0;
+@@ -5328,8 +6407,49 @@ static void rec_match(RecFrame *A, RecFrame *B)
+              * own -- a few small constants crossing zero read as far -- so it
+              * only finds cuts, where most draws jump. */
+             ra->blend = !ra->apart;
++            /* A pass over the whole surface (a quad or a triangle, no depth
++             * test): the glow's stages, a fade. It does not move, and its
++             * partner among B's alike ones (same count, program and target)
++             * can be another stage: the downsample paired with the blur
++             * read the frame at the other's offsets and scale, and the
++             * in-between frames glared (the training level's sky behind the
++             * scarecrow, the windmill's in its cutscene, on the Deck). As A
++             * drew it. */
++            if (ra->pb.count <= 6 && !ra->rs.depth_test_enable) {
++                ra->blend = 0;
++                s_is_fixed++;
++            }
++            /* A constant that jumps (more than 0.5, and most of its own size)
++             * is what a wrong pair shows: only then the vertices are run.
++             * Not for the only draw of its key in both frames: the key holds
++             * the mesh, so it has no look-alike to be paired with (on the
++             * Deck the checks took 50 to 70 ms a second, a few hundred a
++             * frame in the training level, and tore nothing there). */
++            if (ra->blend && lo >= 0 && !ra->single) {
++                int q, jump = 0;
++                for (q = lo; q <= hi && !jump; q++) {
++                    double x = ca[q], y = cb[q];
++                    jump = x != y && fabs(x - y) > 0.5 && fabs(x - y) > 0.8 * (fabs(x) + fabs(y))
++                        && fabs(x) < 1e6 && fabs(y) < 1e6;
++                }
++                if (jump) {
++                    uint64_t t0 = now_us();
++                    int ok = rec_coherent(A, ra, cb);
++                    s_is_coh++;
++                    s_is_coh_us += now_us() - t0;
++                    if (!ok) {
++                        ra->blend = 0;
++                        s_is_torn++;
++                    }
++                }
++            }
+             if (mv > 0.25f)
+                 moved_far++;
++            if (nsh < REC_SHIFT_SAMPLES && ra->rs.depth_test_enable && i % sh_step == 0) {
++                float d = rec_shift(A, ra, cb, 0);
++                if (d >= 0.0f)
++                    sh[nsh++] = d;
++            }
+             if (mvr)
+                 mvr[i] = mv;
+             if (mvs)
+@@ -5341,26 +6461,79 @@ static void rec_match(RecFrame *A, RecFrame *B)
+      * paired and blended halfway between them. Not blended when it moved far
+      * more than the frame's draws do and neither neighbour went with the
+      * neighbour on its side in B (one character's parts are drawn one after
+-     * another). */
++     * another). That missed a bush by the windmill's path, a lone one at the
++     * edge of A paired with one far across B: its constants moved little
++     * more than the others' (the same camera, another place), and the
++     * plants drawn next to it went with theirs. So where its vertex lands
++     * tells too, for one whose constants moved more than most: far across
++     * the surface, it is drawn as A drew it unless a neighbour paired with
++     * its partner's neighbour moves about as far (rec_goes_along).
++     * One of many alike (a bush, a tuft of grass) can be paired with another
++     * of them too, when one is gone from B: drawn halfway, it stood for one
++     * frame where neither frame has one (a shrub by the windmill's path, on
++     * the Deck). Its neighbours are of its kind and go wrong with it, so for
++     * these it is where its vertex lands that tells: far across the surface
++     * while the frame's draws stay near, it is drawn as A drew it. Every one
++     * of a run, whatever its constants did, and its ends off the surface too
++     * (held to two surfaces around it): the shrub came back while only the
++     * draws whose constants moved far were looked at, and only with both
++     * ends near the surface -- one end was out of view or hidden. Far, it
++     * is paired anew where it can be (rec_repair). */
++    if (nsh >= 6) {
++        qsort(sh, (size_t)nsh, sizeof *sh, rec_fcmp);
++        sh_med = sh[nsh / 2];
++    }
+     if (mvr && mvs && nmv) {
+         float med;
++        uint64_t t0 = now_us();
+         qsort(mvs, (size_t)nmv, sizeof *mvs, rec_fcmp);
+         med = mvs[nmv / 2];
+         for (i = 0; i < A->n; i++) {
+             Rec *ra = &A->r[i];
+             int b = ra->partner;
+-            if (!ra->single || ra->kind != 2 || b < 0 || !ra->blend
+-                || mvr[i] <= 4.0f * med + 0.02f)
++            const float *cbb;
++            if (ra->kind != 2 || b < 0 || !ra->blend)
++                continue;
++            cbb = (const float *)(B->mem + B->r[b].consts);
++            if (ra->rs.depth_test_enable && (!ra->single || mvr[i] > 1.5f * med)) {
++                float d = rec_shift(A, ra, cbb, 1), lim = REC_JUMP_FAR > 4.0f * sh_med + 0.02f
++                                                        ? REC_JUMP_FAR : 4.0f * sh_med + 0.02f;
++                s_is_jumped_checked++;
++                if (!ra->single) {
++                    if (d > lim)
++                        rec_repair(A, ra, B, d, lim, 2.0f * sh_med + 0.01f);
++                    continue;
++                }
++                if (d > lim && !rec_goes_along(A, i, B, d)) {
++                    ra->blend = 0;
++                    s_is_single_jumped++;
++                    continue;
++                }
++            }
++            if (mvr[i] <= 4.0f * med + 0.02f)
+                 continue;
+-            if (!((i > 0 && b > 0 && A->r[i - 1].partner == b - 1)
+-                  || (i + 1 < A->n && b + 1 < B->n && A->r[i + 1].partner == b + 1)))
++            if (ra->single
++                && !((i > 0 && b > 0 && A->r[i - 1].partner == b - 1)
++                     || (i + 1 < A->n && b + 1 < B->n && A->r[i + 1].partner == b + 1)))
+                 ra->blend = 0;
+         }
++        s_is_jump_us += now_us() - t0;
+     }
+     free(mvr);
+     free(mvs);
+-    /* A cut: most of A gone from B, or most of it moved far. */
+-    A->cut = progs > 8 && (matched * 2 < progs || moved_far * 2 > matched);
++    rec_passes(A, B);
++    for (i = 0; i < B->n; i++)
++        B->r[i].taken = 0;
++    for (i = 0; i < A->n; i++)
++        if (A->r[i].partner >= 0)
++            B->r[A->r[i].partner].taken = 1;
++    /* A cut: most of A gone from B, or most of it moved far -- in its
++     * constants, or on the surface. A cutscene's cut keeps its characters,
++     * whose constants (their bones) change little more than from one frame
++     * to the next, and the in-between frames showed a camera halfway between
++     * the two shots (the scarecrow's and the cave doors' cutscenes, on the
++     * Deck); where the draws' vertices land tells it. */
++    A->cut = progs > 8 && (matched * 2 < progs || moved_far * 2 > matched || sh_med > REC_SHIFT_CUT);
+     s_is_frames++;
+     s_is_cuts += A->cut;
+     s_is_draws += (uint64_t)progs;
+@@ -5369,11 +6542,23 @@ static void rec_match(RecFrame *A, RecFrame *B)
+         s_is_blended += A->r[i].kind == 2 && A->r[i].blend && A->r[i].partner >= 0;
+     if (s_verbose && s_is_frames % 300 == 0) {
+         fprintf(stderr, "[VK] interpolation: %u frames, %u cuts; program draws %.0f%% matched,"
+-                        " %.0f%% blended; %u in-between frames shown (%.1f ms each), %u skipped\n",
++                        " %.0f%% blended; %u in-between frames shown (%.1f ms each), %u skipped;"
++                        " %u screen-space triangles kept whole, %u program draws torn (%u checked, %.1f ms);"
++                        " later passes %u relinked, %u left out; underlay %u (changed %u, none %u, other %u);"
++                        " %u holes filled; %u program draws on blended constants (variant not compiled yet);"
++                        " %u full-surface passes as A drew them; %u alike draws jumped, %u paired anew, %u lone draws jumped (%u checked, %.1f ms)\n",
+                 s_is_frames, s_is_cuts, s_is_draws ? 100.0 * s_is_matched / s_is_draws : 0.0,
+                 s_is_draws ? 100.0 * s_is_blended / s_is_draws : 0.0, s_is_shown,
+-                s_is_shown ? s_is_us / 1000.0 / s_is_shown : 0.0, s_is_skipped);
+-        s_is_cuts = s_is_shown = s_is_skipped = 0;
++                s_is_shown ? s_is_us / 1000.0 / s_is_shown : 0.0, s_is_skipped, s_is_whole, s_is_torn,
++                s_is_coh, s_is_coh_us / 1000.0,
++                s_is_relinked, s_is_skipped_pass, s_is_under[0], s_is_under[1], s_is_under[2],
++                s_is_under[3], s_is_under_z, s_is_kmix, s_is_fixed, s_is_jumped, s_is_repaired, s_is_single_jumped, s_is_jumped_checked, s_is_jump_us / 1000.0);
++        memset(s_is_under, 0, sizeof s_is_under);
++        s_is_under_z = s_is_kmix = s_is_coh = s_is_fixed = s_is_jumped = s_is_jumped_checked = 0;
++        s_is_coh_us = s_is_jump_us = 0;
++        s_is_repaired = s_is_single_jumped = 0;
++        s_is_cuts = s_is_shown = s_is_skipped = s_is_whole = s_is_torn = 0;
++        s_is_relinked = s_is_skipped_pass = 0;
+         s_is_draws = s_is_matched = s_is_blended = s_is_us = 0;
+     }
+ }
+@@ -5393,16 +6578,390 @@ static void *lerp_space(size_t bytes)
+     return s_lerp_buf;
+ }
+ 
++static Surf *title_surf(uint32_t va);
++
++/* B's picture under an in-between frame's solid geometry (rec_replay puts
++ * it after the sky, before the first draw that writes depth). Geometry
++ * blended between two views does not cover the screen as either does: the
++ * edge the view turns toward holds what only B's frustum had, and near and far pieces part where a camera
++ * that moves and turns is blended in a straight line. What showed through
++ * was the sky behind the cave's walls -- white and blue shards across the
++ * training level as the camera turned. Under them is now the scene as B
++ * has it. */
++static VkImageView depth_view(VkImage image)
++{
++    VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
++    VkImageView v;
++    vi.image = image;
++    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
++    vi.format = s_depth_fmt;
++    vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
++    vi.subresourceRange.levelCount = 1;
++    vi.subresourceRange.layerCount = 1;
++    return vkCreateImageView(s_dev, &vi, NULL, &v) == VK_SUCCESS ? v : VK_NULL_HANDLE;
++}
++
++/* hole_fill.frag's pipeline for colour format cf: depth always passes and
++ * is written (gl_FragDepth). */
++static VkPipelineLayout s_hf_layout;
++static VkDescriptorSetLayout s_hf_dsl;
++static struct { VkFormat cf; VkPipeline p; } s_hf[4];
++static int s_hf_n, s_hf_failed;
++
++static VkPipeline hole_pipeline(VkFormat cf)
++{
++    VkShaderModuleCreateInfo sm = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
++    VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
++    VkPipelineShaderStageCreateInfo stages[2];
++    VkPipelineVertexInputStateCreateInfo vin = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
++    VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
++    VkPipelineViewportStateCreateInfo vp = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
++    VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
++    VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
++    VkPipelineDepthStencilStateCreateInfo dss = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
++    VkPipelineColorBlendAttachmentState cba;
++    VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
++    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
++    VkPipelineDynamicStateCreateInfo ds = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
++    VkPipelineRenderingCreateInfo ri = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
++    VkGraphicsPipelineCreateInfo gi = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
++    VkPipeline pipe = VK_NULL_HANDLE;
++    int i;
++
++    for (i = 0; i < s_hf_n; i++)
++        if (s_hf[i].cf == cf)
++            return s_hf[i].p;
++    if (s_hf_failed || s_hf_n == 4)
++        return VK_NULL_HANDLE;
++    if (!s_hf_layout && !(s_hf_layout = pass_layout(3, 4, &s_hf_dsl))) {
++        s_hf_failed = 1;
++        return VK_NULL_HANDLE;
++    }
++    sm.codeSize = sizeof k_zpack_vert_spv;
++    sm.pCode = k_zpack_vert_spv;
++    if (vkCreateShaderModule(s_dev, &sm, NULL, &vs) != VK_SUCCESS)
++        return VK_NULL_HANDLE;
++    sm.codeSize = sizeof k_hole_frag_spv;
++    sm.pCode = k_hole_frag_spv;
++    if (vkCreateShaderModule(s_dev, &sm, NULL, &fs) != VK_SUCCESS) {
++        vkDestroyShaderModule(s_dev, vs, NULL);
++        return VK_NULL_HANDLE;
++    }
++    memset(stages, 0, sizeof stages);
++    stages[0].sType = stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
++    stages[0].module = vs;
++    stages[0].pName = "main";
++    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++    stages[1].module = fs;
++    stages[1].pName = "main";
++    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++    vp.viewportCount = vp.scissorCount = 1;
++    rs.polygonMode = VK_POLYGON_MODE_FILL;
++    rs.cullMode = VK_CULL_MODE_NONE;
++    rs.lineWidth = 1.0f;
++    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++    dss.depthTestEnable = VK_TRUE;
++    dss.depthWriteEnable = VK_TRUE;
++    dss.depthCompareOp = VK_COMPARE_OP_ALWAYS;
++    memset(&cba, 0, sizeof cba);
++    cba.colorWriteMask = 0xF;
++    cb.attachmentCount = 1;
++    cb.pAttachments = &cba;
++    ds.dynamicStateCount = 2;
++    ds.pDynamicStates = dyn;
++    ri.colorAttachmentCount = 1;
++    ri.pColorAttachmentFormats = &cf;
++    ri.depthAttachmentFormat = s_depth_fmt;
++    ri.stencilAttachmentFormat = s_depth_fmt != VK_FORMAT_D32_SFLOAT ? s_depth_fmt : VK_FORMAT_UNDEFINED;
++    gi.pNext = &ri;
++    gi.stageCount = 2;
++    gi.pStages = stages;
++    gi.pVertexInputState = &vin;
++    gi.pInputAssemblyState = &ia;
++    gi.pViewportState = &vp;
++    gi.pRasterizationState = &rs;
++    gi.pMultisampleState = &ms;
++    gi.pDepthStencilState = &dss;
++    gi.pColorBlendState = &cb;
++    gi.pDynamicState = &ds;
++    gi.layout = s_hf_layout;
++    if (vkCreateGraphicsPipelines(s_dev, s_pcache, 1, &gi, NULL, &pipe) != VK_SUCCESS)
++        pipe = VK_NULL_HANDLE;
++    vkDestroyShaderModule(s_dev, vs, NULL);
++    vkDestroyShaderModule(s_dev, fs, NULL);
++    if (!pipe) {
++        s_hf_failed = 1;
++        fprintf(stderr, "[VK] no hole-fill pipeline; in-between frames keep their holes\n");
++        return VK_NULL_HANDLE;
++    }
++    s_hf[s_hf_n].cf = cf;
++    s_hf[s_hf_n++].p = pipe;
++    return pipe;
++}
++
++/* Whether rec_holefill can run for this pair. */
++static int holefill_ok(const RecFrame *B)
++{
++    return s_zsample && s_msaa <= 1 && !s_hf_failed && B->zsnap_gen
++        && B->zsnap_gen == s_zsnap_gen && s_zsnap.image && s_zsnap_dv;
++}
++
++/* After A's solid geometry, before what is drawn over the whole picture:
++ * where the depth is still as A cleared it, B's picture and depth. Geometry
++ * blended between two views does not cover the screen as either does: the
++ * edge the view turns toward holds what only B's frustum had, and near and far pieces part where a camera
++ * that moves and turns is blended in a straight line. What showed through
++ * was the far plane, which the level's haze turns white: white and blue
++ * shards, and lines along the edges of near walls, as the camera turned.
++ * B's depth goes with its colour so that the passes after see a surface
++ * there. */
++static void rec_holefill(const RecFrame *B, const Nv2aSurface *ns,
++                         const Nv2aRenderState *rs, const Rec *zc)
++{
++    Surf *src = B->shown_va ? title_surf(B->shown_va) : NULL, *d;
++    Zeta *dz;
++    VkPipeline pipe;
++    VkDescriptorImageInfo ii[3];
++    VkRenderingInfo ri = { VK_STRUCTURE_TYPE_RENDERING_INFO };
++    VkRenderingAttachmentInfo ca = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
++    VkRenderingAttachmentInfo da = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
++    VkWriteDescriptorSet wr[3];
++    VkImageCopy rg;
++    VkViewport vp;
++    VkRect2D sc;
++    VkCommandBuffer c;
++    float clear_at;
++    int k;
++
++    if (!zc || !holefill_ok(B) || !src || src->version != B->shown_ver)
++        return;
++    d = surf_get(ns, ns->clip_y + ns->height);
++    dz = d ? zeta_for(rs, d, 1) : NULL;
++    if (!d || !dz || !d->color.image || !dz->depth.image
++        || d->color.w != src->color.w || d->color.h != src->color.h
++        || dz->depth.w != s_zsnap.w || dz->depth.h != s_zsnap.h
++        || d->color.w > dz->depth.w || d->color.h > dz->depth.h)
++        return;
++    if (!(pipe = hole_pipeline(d->color.fmt)))
++        return;
++    clear_at = zc->rs.zeta_format == 1 ? (float)((zc->zs & 0xFFFF) - 1) / 65535.0f
++                                        : (float)((zc->zs >> 8) - 2) / 16777215.0f;
++    if (!(clear_at > 0.5f))
++        return;
++    /* This frame's depth so far, to read while the pass writes it. */
++    if (s_zcur.image && (s_zcur.w != dz->depth.w || s_zcur.h != dz->depth.h)) {
++        view_retire(&s_zcur_dv);
++        img_retire(&s_zcur);
++    }
++    if (!s_zcur.image
++        && !img_create(&s_zcur, dz->depth.w, dz->depth.h, 1, s_depth_fmt,
++                       VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 0))
++        return;
++    if (!s_zcur_dv && !(s_zcur_dv = depth_view(s_zcur.image)))
++        return;
++    end_rendering();
++    s_rt = NULL;
++    s_rt_z = NULL;
++    memset(&rg, 0, sizeof rg);
++    rg.srcSubresource.aspectMask = rg.dstSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
++    rg.srcSubresource.layerCount = rg.dstSubresource.layerCount = 1;
++    rg.extent.width = dz->depth.w;
++    rg.extent.height = dz->depth.h;
++    rg.extent.depth = 1;
++    barrier_all();
++    vkCmdCopyImage(cmd(), dz->depth.image, VK_IMAGE_LAYOUT_GENERAL, s_zcur.image,
++                   VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
++    barrier_all();
++
++    for (k = 0; k < 3; k++) {
++        ii[k].sampler = sampler_get(0, 0, 0, 0, 0);
++        ii[k].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
++    }
++    ii[0].imageView = src->color.view;
++    ii[1].imageView = s_zsnap_dv;
++    ii[2].imageView = s_zcur_dv;
++    ca.imageView = d->color.view;
++    ca.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
++    ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
++    ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++    da.imageView = dz->depth.view;
++    da.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
++    da.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
++    da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++    ri.renderArea.extent.width = d->color.w;
++    ri.renderArea.extent.height = d->color.h;
++    ri.layerCount = 1;
++    ri.colorAttachmentCount = 1;
++    ri.pColorAttachments = &ca;
++    ri.pDepthAttachment = &da;
++    ri.pStencilAttachment = s_depth_fmt != VK_FORMAT_D32_SFLOAT ? &da : NULL;
++    c = cmd();
++    vkCmdBeginRendering(c, &ri);
++    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
++    memset(&vp, 0, sizeof vp);
++    vp.width = (float)d->color.w;
++    vp.height = (float)d->color.h;
++    vp.maxDepth = 1.0f;
++    vkCmdSetViewport(c, 0, 1, &vp);
++    memset(&sc, 0, sizeof sc);
++    sc.extent.width = d->color.w;
++    sc.extent.height = d->color.h;
++    vkCmdSetScissor(c, 0, 1, &sc);
++    memset(wr, 0, sizeof wr);
++    for (k = 0; k < 3; k++) {
++        wr[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++        wr[k].dstBinding = (uint32_t)k;
++        wr[k].descriptorCount = 1;
++        wr[k].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
++        wr[k].pImageInfo = &ii[k];
++    }
++    s_push_desc(c, VK_PIPELINE_BIND_POINT_GRAPHICS, s_hf_layout, 0, 3, wr);
++    vkCmdPushConstants(c, s_hf_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 4, &clear_at);
++    vkCmdDraw(c, 3, 1, 0, 0);
++    vkCmdEndRendering(c);
++    barrier_all();
++    d->version = ++s_writes;
++    dz->version = ++s_writes;
++    s_is_under_z++;
++}
++
++static void rec_underlay(const Nv2aSurface *ns, const Nv2aRenderState *rs,
++                         const RecFrame *B, const Rec *zc)
++{
++    Surf *src = B->shown_va ? title_surf(B->shown_va) : NULL, *d;
++
++    if (!src || src->version != B->shown_ver) {
++        s_is_under[src ? 1 : 2]++;
++        return;
++    }
++    d = surf_get(ns, ns->clip_y + ns->height);
++    if (!d || !d->color.image || d->color.w != src->color.w || d->color.h != src->color.h
++        || d->color.fmt != src->color.fmt) {
++        s_is_under[3]++;
++        return;
++    }
++    s_is_under[0]++;
++    blit(src->color.image, d->color.image, src->color.w, src->color.h,
++         d->color.w, d->color.h, VK_IMAGE_ASPECT_COLOR_BIT, VK_FILTER_NEAREST);
++    d->version = ++s_writes;
++    /* And depth a step short of the far value A cleared to, when the holes
++     * cannot be filled (rec_holefill): what tests depth after the geometry
++     * (a sky drawn last) then leaves B's picture alone. */
++    if (zc) {
++        uint32_t zs = zc->zs;
++        if (zc->rs.zeta_format == 1 && (zs & 0xFFFF) > 0x8000)
++            vk_clear(ns, &zc->rs, 1, 0, (zs & 0xFFFF0000u) | ((zs & 0xFFFF) - 2));
++        else if (zc->rs.zeta_format != 1 && (zs >> 8) > 0x800000)
++            vk_clear(ns, &zc->rs, 1, 0, (((zs >> 8) - 64) << 8) | (zs & 0xFF));
++    }
++}
++
++/* Whether slot's in-between variant is ready; asks for it if not. */
++static int vprog_blend_ready(uint32_t slot)
++{
++    int want = 0;
++    if (atomic_load(&s_vprogs[slot].bstate) == VPROG_READY + 1)
++        return 1;
++    if (s_jobs_up >= 0 && atomic_compare_exchange_strong(&s_vprogs[slot].bstate, &want, VPROG_QUEUED + 1))
++        job_push_vprog(slot | VSH_BLEND_BIT);
++    return 0;
++}
++
++/* A program draw of frame F into ns; with kb, the GPU runs the program on
++ * F's constants and on kb and blends the two by t (nv2a_vsh.vert
++ * VSH_BLEND): blending the constants instead put a vertex behind the eye in
++ * one frame at w near 0 in between, a spike across the screen. Until the
++ * program's variant is compiled, and in the interpreter, the constants are
++ * blended. */
++static void rec_draw_prog(const RecFrame *F, Rec *r, const Nv2aSurface *ns,
++                          const float (*kb)[4], float t)
++{
++    static float mixed[NV2A_VSH_CONSTANTS][4];
++    Nv2aProgramBatch b = r->pb;
++    uint32_t vsh = r->vsh;
++    int k;
++
++    b.pix.state = &r->rs;
++    b.pix.rc = &r->rc;
++    b.indices = (const uint32_t *)(F->mem + r->data);
++    b.program = (const uint32_t (*)[8])(F->mem + r->prog);
++    b.constants = (const float (*)[4])(F->mem + r->consts);
++    for (k = 0; k < 16; k++)
++        if (r->attr[k] != (size_t)-1)
++            b.attr[k].data = (const uint8_t *)((uintptr_t)(F->mem + r->attr[k])
++                             - (uintptr_t)b.min_index * b.attr[k].stride);
++        else
++            b.attr[k].data = NULL;
++    if (kb && t > 0.0f) {
++        if (!vsh)
++            vsh = vprog_for(b.program, b.ninst, 0);
++        if (vsh >= 2 && vprog_blend_ready(vsh - 2)) {
++            s_vsh_kb = kb;
++            s_vsh_t = t;
++            vsh |= VSH_BLEND_BIT;
++        } else {
++            const float *a = &b.constants[0][0], *c = &kb[0][0];
++            for (k = 0; k < NV2A_VSH_CONSTANTS * 4; k++)
++                (&mixed[0][0])[k] = a[k] + (c[k] - a[k]) * t;
++            b.constants = (const float (*)[4])mixed;
++            vsh = r->vsh;
++            s_is_kmix++;
++        }
++    }
++    s_vsh_force = vsh;
++    vk_draw_program(ns, &b);
++    s_vsh_force = 0;
++    s_vsh_kb = NULL;
++    s_vsh_t = 0.0f;
++    if (!r->vsh && (s_vsh_last & ~VSH_BLEND_BIT) >= 2)
++        r->vsh = s_vsh_last & ~VSH_BLEND_BIT;
++}
++
+ /* Draw frame A again, t of the way toward B (B NULL or t 0: A as it was). */
+ static void rec_replay(RecFrame *A, const RecFrame *B, float t)
+ {
+-    float kc[NV2A_VSH_CONSTANTS * 4];
+-    int i, k;
++    int i, k, under_at = -1, enter_after = -1, zclear = -1;
++
++    /* B's picture goes under A's solid geometry: after the last clear of the
++     * shown surface's colour and after what is drawn before the geometry
++     * (the sky), just before the first draw that writes depth. */
++    static int fill = -1;
++
++    if (fill < 0) {
++        const char *e = getenv("RECOMP_VK_FILL");
++        fill = !(e && e[0] == '0');
++    }
++    if (fill && B && t > 0.0f && !A->cut && A->shown_va && B->shown_va) {
++        int from = 0;
++        for (i = 0; i < A->n; i++)
++            if (A->r[i].kind == 0 && A->r[i].ns.color_va == A->shown_va && (A->r[i].flags & 0xF0))
++                from = i + 1;
++        for (i = 0; i < A->n; i++)
++            if (A->r[i].kind == 0 && A->r[i].ns.color_va == A->shown_va && (A->r[i].flags & 1))
++                zclear = i;
++        for (i = from; i < A->n; i++)
++            if (A->r[i].kind != 0 && A->r[i].ns.color_va == A->shown_va
++                && A->r[i].rs.depth_write && A->r[i].rs.depth_test_enable) {
++                /* Not the sky: a dome that writes depth at the far end
++                 * would cover B's picture again. */
++                if (under_at < 0) {
++                    float pos[4];
++                    if (!(A->r[i].kind == 2 && rec_vpos(A, &A->r[i], 0, pos)
++                          && pos[2] > 0.98f * zmax_of(A->r[i].rs.zeta_format)))
++                        under_at = i;
++                }
++                if (A->r[i].kind == 2)
++                    enter_after = i;
++            }
++    }
+ 
+     for (i = 0; i < A->n; i++) {
+         Rec *r = &A->r[i];
+         const Rec *p = (B && t > 0.0f && !A->cut && r->partner >= 0)
+                      ? &B->r[r->partner] : NULL;
++        if (i == under_at && !holefill_ok(B))
++            rec_underlay(&r->ns, &r->rs, B, zclear >= 0 && zclear < under_at ? &A->r[zclear] : NULL);
+         if (r->kind == 0) {
+             vk_clear(&r->ns, &r->rs, r->flags, r->argb, r->zs);
+         } else if (r->kind == 1) {
+@@ -5416,42 +6975,45 @@ static void rec_replay(RecFrame *A, const RecFrame *B, float t)
+                 Nv2aFullVertex *o = (Nv2aFullVertex *)lerp_space((size_t)b.count * sizeof *o);
+                 uint32_t n;
+                 if (o) {
++                    /* A triangle whose corners jump much farther than the
++                     * draw's do (a particle born elsewhere, a sprite reused
++                     * for another): drawn whole at A or B, not stretched
++                     * between the two -- a one-frame streak across the
++                     * screen. */
++                    float mean = 0.0f, lim;
+                     memcpy(o, v, (size_t)b.count * sizeof *o);
+                     for (n = 0; n < b.count; n++)
+-                        for (k = 0; k < 4; k++)
+-                            o[n].pos[k] += (w[n].pos[k] - v[n].pos[k]) * t;
++                        mean += fabsf(w[n].pos[0] - v[n].pos[0]) + fabsf(w[n].pos[1] - v[n].pos[1]);
++                    mean /= (float)b.count;
++                    lim = 4.0f * mean > 24.0f ? 4.0f * mean : 24.0f;
++                    for (n = 0; n + 2 < b.count; n += 3) {
++                        uint32_t j;
++                        int far_ = 0;
++                        for (j = n; j < n + 3; j++)
++                            far_ |= !(fabsf(w[j].pos[0] - v[j].pos[0])
++                                      + fabsf(w[j].pos[1] - v[j].pos[1]) <= lim);
++                        if (far_) {
++                            if (t >= 0.5f)
++                                memcpy(&o[n], &w[n], 3 * sizeof *o);
++                            s_is_whole++;
++                            continue;
++                        }
++                        for (j = n; j < n + 3; j++)
++                            for (k = 0; k < 4; k++)
++                                o[j].pos[k] += (w[j].pos[k] - v[j].pos[k]) * t;
++                    }
+                     b.vertices = o;
+                 }
+             }
+             vk_draw_full(&r->ns, &b);
+         } else {
+-            Nv2aProgramBatch b = r->pb;
+-            const float *ca = (const float *)(A->mem + r->consts);
+-            b.pix.state = &r->rs;
+-            b.pix.rc = &r->rc;
+-            b.indices = (const uint32_t *)(A->mem + r->data);
+-            b.program = (const uint32_t (*)[8])(A->mem + r->prog);
+-            b.constants = (const float (*)[4])ca;
+-            if (p && r->blend && r->dlo <= r->dhi) {
+-                const float *cb = (const float *)(B->mem + p->consts);
+-                memcpy(kc, ca, sizeof kc);
+-                for (k = r->dlo; k <= r->dhi; k++)
+-                    if (ca[k] == ca[k] && cb[k] == cb[k])
+-                        kc[k] = ca[k] + (cb[k] - ca[k]) * t;
+-                b.constants = (const float (*)[4])kc;
+-            }
+-            for (k = 0; k < 16; k++)
+-                if (r->attr[k] != (size_t)-1)
+-                    b.attr[k].data = (const uint8_t *)((uintptr_t)(A->mem + r->attr[k])
+-                                     - (uintptr_t)b.min_index * b.attr[k].stride);
+-                else
+-                    b.attr[k].data = NULL;
+-            s_vsh_force = r->vsh;
+-            vk_draw_program(&r->ns, &b);
+-            s_vsh_force = 0;
+-            if (!r->vsh && s_vsh_last >= 2)
+-                r->vsh = s_vsh_last;
++            if (r->skip && B && t > 0.0f && !A->cut)
++                continue;
++            rec_draw_prog(A, r, &r->ns, (p && r->blend && r->dlo <= r->dhi)
++                          ? (const float (*)[4])(B->mem + p->consts) : NULL, t);
+         }
++        if (i == enter_after)
++            rec_holefill(B, &r->ns, &r->rs, zclear >= 0 && zclear < i ? &A->r[zclear] : NULL);
+     }
+ }
+ 
+@@ -5491,6 +7053,7 @@ static void replay_frame(RecFrame *A, const RecFrame *B, float t)
+ {
+     uint32_t target = s_draw_target_va, va = A->shown_va;
+ 
++    s_trace_rt = t;
+     if (!va)
+         return;
+     end_rendering();
+@@ -5499,6 +7062,7 @@ static void replay_frame(RecFrame *A, const RecFrame *B, float t)
+     s_surfs = s_surfs_replay;
+     s_zetas = s_zetas_replay;
+     s_replay = 1;
++    s_replay_w0 = s_writes;
+     rec_replay(A, B, t);
+     end_rendering();
+     replay_present(va);
+@@ -5602,6 +7166,7 @@ static void vk_tick(void)
+     s_sub_done = k + 1;
+     s_is_shown++;
+     s_is_us += now_us() - now;
++    s_tick_total_us += now_us() - now;
+     s_in_tick = 0;
+ }
+ 
+@@ -5690,9 +7255,49 @@ static Surf *title_surf(uint32_t va)
+ static void interp_shown(uint32_t va)
+ {
+     if (s_interp_k > 1) {
++        RecFrame *f = &s_recf[s_rec_cur];
+         Surf *s = title_surf(va);
+-        s_recf[s_rec_cur].shown_va = va;
+-        s_recf[s_rec_cur].shown_ver = s ? s->version : 0;
++        uint32_t zva = 0;
++        int i;
++        f->shown_va = va;
++        f->shown_ver = s ? s->version : 0;
++        f->zsnap_gen = 0;
++        for (i = f->n - 1; i >= 0 && !zva; i--)
++            if (f->r[i].kind != 0 && f->r[i].ns.color_va == va && f->r[i].rs.depth_write)
++                zva = f->r[i].rs.zeta_va;
++        for (i = 0; zva && s_msaa <= 1 && i < VK_MAX_ZETAS; i++) {
++            Zeta *z = &s_zetas_title[i];
++            VkImageCopy rg;
++            if (z->va != zva || !z->depth.image)
++                continue;
++            if (!s_zsample)
++                break;
++            if (s_zsnap.image && (s_zsnap.w != z->depth.w || s_zsnap.h != z->depth.h)) {
++                view_retire(&s_zsnap_dv);
++                img_retire(&s_zsnap);
++            }
++            if (!s_zsnap.image
++                && !img_create(&s_zsnap, z->depth.w, z->depth.h, 1, s_depth_fmt,
++                               VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
++                               | VK_IMAGE_USAGE_SAMPLED_BIT, 0))
++                break;
++            if (!s_zsnap_dv && !(s_zsnap_dv = depth_view(s_zsnap.image)))
++                break;
++            memset(&rg, 0, sizeof rg);
++            rg.srcSubresource.aspectMask = rg.dstSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT
++                | (s_depth_fmt != VK_FORMAT_D32_SFLOAT ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
++            rg.srcSubresource.layerCount = rg.dstSubresource.layerCount = 1;
++            rg.extent.width = z->depth.w;
++            rg.extent.height = z->depth.h;
++            rg.extent.depth = 1;
++            end_rendering();
++            barrier_all();
++            vkCmdCopyImage(cmd(), z->depth.image, VK_IMAGE_LAYOUT_GENERAL, s_zsnap.image,
++                           VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
++            barrier_all();
++            f->zsnap_gen = ++s_zsnap_gen;
++            break;
++        }
+     }
+ }
+ 
+@@ -5936,7 +7541,7 @@ static int create_objects(void)
+     VkCommandPoolCreateInfo pi = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+     VkCommandBufferAllocateInfo ai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+     VkFenceCreateInfo fi = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+-    VkDescriptorSetLayoutBinding bind[7];
++    VkDescriptorSetLayoutBinding bind[8];
+     VkDescriptorSetLayoutCreateInfo dl = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+     VkPipelineLayoutCreateInfo pl = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+     VkShaderModuleCreateInfo sm = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+@@ -5973,8 +7578,8 @@ static int create_objects(void)
+     bind[2] = bind[1];
+     bind[2].binding = 5;
+     /* The vertex stage of program batches: vertex data, constants, program,
+-     * per-draw attribute table. */
+-    for (int k = 3; k < 7; k++) {
++     * per-draw attribute table, and B's constants (rec_replay). */
++    for (int k = 3; k < 8; k++) {
+         bind[k].binding = 9 + (uint32_t)(k - 3);
+         bind[k].descriptorType = k == 3 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                                         : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+@@ -5982,7 +7587,7 @@ static int create_objects(void)
+         bind[k].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+     }
+     dl.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+-    dl.bindingCount = 7;
++    dl.bindingCount = 8;
+     dl.pBindings = bind;
+     VK_CHECK(vkCreateDescriptorSetLayout(s_dev, &dl, NULL, &s_dsl));
+     pl.setLayoutCount = 1;
+@@ -5995,6 +7600,9 @@ static int create_objects(void)
+     sm.codeSize = sizeof k_frag_spv;
+     sm.pCode = k_frag_spv;
+     VK_CHECK(vkCreateShaderModule(s_dev, &sm, NULL, &s_fs));
++    sm.codeSize = sizeof k_frag_dyn_spv;
++    sm.pCode = k_frag_dyn_spv;
++    VK_CHECK(vkCreateShaderModule(s_dev, &sm, NULL, &s_fs_dyn));
+     {
+         VkPipelineCacheCreateInfo pc = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
+         if (vkCreatePipelineCache(s_dev, &pc, NULL, &s_pcache) != VK_SUCCESS)
+diff --git a/src/vulkan/nv2a_vk.h b/src/vulkan/nv2a_vk.h
+index 996e042..235e345 100644
+--- a/src/vulkan/nv2a_vk.h
++++ b/src/vulkan/nv2a_vk.h
+@@ -62,6 +62,10 @@ void nv2a_vk_set_render_scale(unsigned scale);
+  * part of the way from where it was to where it is (nv2a_vk.c, "Frame
+  * interpolation"). 1 shows the title's frames as they are. */
+ void nv2a_vk_set_interpolation(unsigned factor);
++/* A debugging aid: the next frame's draws, each with its state and the part
++ * of the frame RECOMP_VK_TRACE_BOX covers after it, into <path>.txt and
++ * <path>.bin (nv2a_vk.c, "Draw trace"). */
++void nv2a_vk_trace_arm(const char *path);
+ 
+ /* Image quality, each taking effect at the next flip, callable before
+  * nv2a_vk_install too:
+diff --git a/src/vulkan/nv2a_vk_vprog.c b/src/vulkan/nv2a_vk_vprog.c
+index 448a32f..d9623c7 100644
+--- a/src/vulkan/nv2a_vk_vprog.c
++++ b/src/vulkan/nv2a_vk_vprog.c
+@@ -70,9 +70,9 @@ static void put_src(Text *t, uint32_t w)
+     else if (kind == 2u)
+         put(t, idx < 16u ? "V[%u]" : "vec4(0.0)", idx);
+     else if (kind == 3u)
+-        put(t, "kc.c[%u]", ci < 192u ? ci : 0u);
++        put(t, "KC(%u)", ci < 192u ? ci : 0u);
+     else
+-        put(t, "kc.c[(%u + a0) < 0 || (%u + a0) >= 192 ? 0 : %u + a0]", ci, ci, ci);
++        put(t, "KC((%u + a0) < 0 || (%u + a0) >= 192 ? 0 : %u + a0)", ci, ci, ci);
+     for (k = 0; k < 4; k++)
+         sw[1 + k] = xyzw[(w >> (10 + 2 * k)) & 3u];
+     if (strcmp(sw, ".xyzw"))
+@@ -94,7 +94,7 @@ static void put_write(Text *t, const char *dst, const char *v, uint32_t m)
+         put(t, " %s.%s = %s.%s;", dst, mk, v, mk);
+ }
+ 
+-char *nv2a_vk_vprog_glsl(const uint32_t (*prog)[8], int n)
++char *nv2a_vk_vprog_glsl(const uint32_t (*prog)[8], int n, int blend)
+ {
+     static const char marker[] = "    VSH_PROGRAM\n";
+     const char *at = strstr(s_vsh_template, marker), *nl = strchr(s_vsh_template, '\n');
+@@ -156,7 +156,8 @@ char *nv2a_vk_vprog_glsl(const uint32_t (*prog)[8], int n)
+         return NULL;
+     }
+     put(&out, "%.*s", (int)(nl + 1 - s_vsh_template), s_vsh_template);   /* #version */
+-    put(&out, "#define VSH_PROGRAM\n#define VSH_INPUTS 0x%Xu\n", inputs);
++    put(&out, "#define VSH_PROGRAM\n#define VSH_INPUTS 0x%Xu\n%s", inputs,
++        blend ? "#define VSH_BLEND\n" : "");
+     put(&out, "%.*s", (int)(at - (nl + 1)), nl + 1);
+     put(&out, "%s", body.p);
+     put(&out, "%s", at + strlen(marker));
+@@ -185,7 +186,7 @@ double sinh(double x)
+ }
+ #endif
+ 
+-uint32_t *nv2a_vk_vprog_compile(const uint32_t (*prog)[8], int n, size_t *words)
++uint32_t *nv2a_vk_vprog_compile(const uint32_t (*prog)[8], int n, int blend, size_t *words)
+ {
+     glslang_input_t in;
+     glslang_shader_t *sh;
+@@ -197,7 +198,7 @@ uint32_t *nv2a_vk_vprog_compile(const uint32_t (*prog)[8], int n, size_t *words)
+ 
+     if (!ready)
+         ready = glslang_initialize_process() ? 1 : -1;
+-    if (ready < 0 || !(src = nv2a_vk_vprog_glsl(prog, n)))
++    if (ready < 0 || !(src = nv2a_vk_vprog_glsl(prog, n, blend)))
+         return NULL;
+     memset(&in, 0, sizeof in);
+     in.language = GLSLANG_SOURCE_GLSL;
+@@ -237,10 +238,11 @@ out:
+     return spv;
+ }
+ #else
+-uint32_t *nv2a_vk_vprog_compile(const uint32_t (*prog)[8], int n, size_t *words)
++uint32_t *nv2a_vk_vprog_compile(const uint32_t (*prog)[8], int n, int blend, size_t *words)
+ {
+     (void)prog;
+     (void)n;
++    (void)blend;
+     (void)words;
+     return NULL;
+ }
+diff --git a/src/vulkan/nv2a_vk_vprog.h b/src/vulkan/nv2a_vk_vprog.h
+index 0ce3a38..e3b8462 100644
+--- a/src/vulkan/nv2a_vk_vprog.h
++++ b/src/vulkan/nv2a_vk_vprog.h
+@@ -8,12 +8,14 @@
+ 
+ /* The program as nv2a_vsh_export() decodes it (n instructions of eight
+  * words), as the GLSL that runs it: nv2a_vsh.vert with the program in
+- * place of its interpreter loop. Returns a malloc'd string. */
+-char *nv2a_vk_vprog_glsl(const uint32_t (*prog)[8], int n);
++ * place of its interpreter loop; with blend, its in-between variant
++ * (VSH_BLEND: run on two sets of constants, the outputs blended). Returns
++ * a malloc'd string. */
++char *nv2a_vk_vprog_glsl(const uint32_t (*prog)[8], int n, int blend);
+ 
+ /* The same, compiled: malloc'd SPIR-V and its length in words, or NULL when
+  * there is no compiler (glslang is loaded at run time and may be missing)
+  * or it failed; the caller then runs the program in the interpreter. */
+-uint32_t *nv2a_vk_vprog_compile(const uint32_t (*prog)[8], int n, size_t *words);
++uint32_t *nv2a_vk_vprog_compile(const uint32_t (*prog)[8], int n, int blend, size_t *words);
+ 
+ #endif
+diff --git a/src/vulkan/shaders/nv2a.frag b/src/vulkan/shaders/nv2a.frag
+index e4089bc..d4c8e9f 100644
+--- a/src/vulkan/shaders/nv2a.frag
++++ b/src/vulkan/shaders/nv2a.frag
+@@ -40,6 +40,54 @@ layout(set = 0, binding = 0, std140) uniform Draw {
+  * program with every branch and register choice folded, where reading them
+  * from the uniform block made one shader interpret all of them per pixel --
+  * ~64 us for a full-screen quad. Constant colours stay in the block. */
++#ifdef NV2A_DYN
++/* The stand-in (nv2a_vk.c pipe_get): the same program read from the
++ * uniform block, one shader for every program, drawing while the draw's
++ * own is compiled on another thread. */
++#define K_CICW0 u.cicw[0].x
++#define K_CICW1 u.cicw[0].y
++#define K_CICW2 u.cicw[0].z
++#define K_CICW3 u.cicw[0].w
++#define K_CICW4 u.cicw[1].x
++#define K_CICW5 u.cicw[1].y
++#define K_CICW6 u.cicw[1].z
++#define K_CICW7 u.cicw[1].w
++#define K_AICW0 u.aicw[0].x
++#define K_AICW1 u.aicw[0].y
++#define K_AICW2 u.aicw[0].z
++#define K_AICW3 u.aicw[0].w
++#define K_AICW4 u.aicw[1].x
++#define K_AICW5 u.aicw[1].y
++#define K_AICW6 u.aicw[1].z
++#define K_AICW7 u.aicw[1].w
++#define K_COCW0 u.cocw[0].x
++#define K_COCW1 u.cocw[0].y
++#define K_COCW2 u.cocw[0].z
++#define K_COCW3 u.cocw[0].w
++#define K_COCW4 u.cocw[1].x
++#define K_COCW5 u.cocw[1].y
++#define K_COCW6 u.cocw[1].z
++#define K_COCW7 u.cocw[1].w
++#define K_AOCW0 u.aocw[0].x
++#define K_AOCW1 u.aocw[0].y
++#define K_AOCW2 u.aocw[0].z
++#define K_AOCW3 u.aocw[0].w
++#define K_AOCW4 u.aocw[1].x
++#define K_AOCW5 u.aocw[1].y
++#define K_AOCW6 u.aocw[1].z
++#define K_AOCW7 u.aocw[1].w
++#define K_FIN0 u.fin.x
++#define K_FIN1 u.fin.y
++#define K_CONTROL u.fin.z
++#define K_STAGEPROG u.fin.w
++#define K_RC u.mode.x
++#define K_ATEST (u.mode.y != 0u ? 1u : 0u)
++#define K_AFUNC u.mode.z
++#define K_CLIPMODE u.misc.x
++#define K_CUBE u.misc.y
++#define K_BORDER u.misc.z
++#define K_STAGEIN u.misc.w
++#else
+ layout(constant_id = 0) const uint K_CICW0 = 0u;
+ layout(constant_id = 1) const uint K_CICW1 = 0u;
+ layout(constant_id = 2) const uint K_CICW2 = 0u;
+@@ -83,6 +131,7 @@ layout(constant_id = 39) const uint K_CLIPMODE = 0u;
+ layout(constant_id = 40) const uint K_CUBE = 0u;
+ layout(constant_id = 41) const uint K_BORDER = 0u;
+ layout(constant_id = 42) const uint K_STAGEIN = 0u;
++#endif
+ uint k_cicw(int s) { switch (s) { case 0: return K_CICW0; case 1: return K_CICW1; case 2: return K_CICW2; case 3: return K_CICW3; case 4: return K_CICW4; case 5: return K_CICW5; case 6: return K_CICW6; case 7: return K_CICW7; } return 0u; }
+ uint k_aicw(int s) { switch (s) { case 0: return K_AICW0; case 1: return K_AICW1; case 2: return K_AICW2; case 3: return K_AICW3; case 4: return K_AICW4; case 5: return K_AICW5; case 6: return K_AICW6; case 7: return K_AICW7; } return 0u; }
+ uint k_cocw(int s) { switch (s) { case 0: return K_COCW0; case 1: return K_COCW1; case 2: return K_COCW2; case 3: return K_COCW3; case 4: return K_COCW4; case 5: return K_COCW5; case 6: return K_COCW6; case 7: return K_COCW7; } return 0u; }
+@@ -350,7 +399,9 @@ vec4 combine(vec4 v0, vec4 v1, vec4 fog, vec4 t[4])
+     } else {
+         o = R12;
+     }
+-    return clamp(o, 0.0, 1.0);
++    /* NaN as 0, as in nv2a_vsh.vert sat(): a clamp leaves it to the GPU. */
++    return mix(clamp(o, 0.0, 1.0), vec4(0.0),
++               greaterThan(floatBitsToUint(o) & 0x7FFFFFFFu, uvec4(0x7F800000u)));
+ }
+ 
+ bool alpha_pass(float a)
+diff --git a/src/vulkan/shaders/nv2a_vsh.vert b/src/vulkan/shaders/nv2a_vsh.vert
+index eaf4c81..9a72082 100644
+--- a/src/vulkan/shaders/nv2a_vsh.vert
++++ b/src/vulkan/shaders/nv2a_vsh.vert
+@@ -33,6 +33,20 @@ out gl_PerVertex {
+ 
+ layout(set = 0, binding = 9, std430) readonly buffer Verts { uint words[]; } vb;
+ layout(set = 0, binding = 10, std140) uniform Consts { vec4 c[192]; } kc;
++#ifdef VSH_BLEND
++/* A program's in-between variant (nv2a_vk.c rec_replay): the paired draw's
++ * constants in the next frame. The program runs once on each set and what
++ * comes out is blended, so a vertex behind the eye in one frame is clipped
++ * as a vertex, where blending the constants put it at w near 0 and far off
++ * the screen. Only the in-between draws run it: built into every draw, the
++ * second run made every program heavier, and the Steam Deck's frame times
++ * jumped about. */
++layout(set = 0, binding = 13, std140) uniform ConstsB { vec4 c[192]; } kb;
++bool g_b = false;
++#define KC(i) (g_b ? kb.c[i] : kc.c[i])
++#else
++#define KC(i) kc.c[i]
++#endif
+ layout(set = 0, binding = 11, std140) uniform Prog { uvec4 p[272]; } kp;
+ /* nv2a_vk.c VkVshDraw: keep the two in step. */
+ layout(set = 0, binding = 12, std140) uniform VshDraw {
+@@ -42,6 +56,7 @@ layout(set = 0, binding = 12, std140) uniform VshDraw {
+     vec4  vp;         /* 2 / width, 2 / height, 1 / zmax, aa x */
+     vec4  vp2;        /* aa y, near-plane screen z, instructions, carried oFog.x */
+     vec4  fogp;       /* enable, mode, param 0, param 1 */
++    vec4  ip;         /* x: how far toward kb (0: kc alone) */
+ } u;
+ 
+ uint rd32(uint a)
+@@ -108,7 +123,7 @@ vec4 src(uint w)
+             ci += a0;
+             if (ci < 0 || ci >= 192) ci = 0;
+         }
+-        s = kc.c[ci];
++        s = KC(ci);
+     }
+     vec4 r = vec4(s[(w >> 10) & 3u], s[(w >> 12) & 3u], s[(w >> 14) & 3u], s[(w >> 16) & 3u]);
+     return ((w >> 9) & 1u) != 0u ? -r : r;
+@@ -203,15 +218,30 @@ float fog_factor(float d)
+     return clamp(f, 0.0, 1.0);
+ }
+ 
+-void main()
++/* clamp(v, 0, 1) with NaN as 0. Which a clamp gives a NaN is up to the
++ * GPU: a program's colour that came out NaN (0 times infinity, which the
++ * NV2A takes as 0) was black on one AMD generation and white on another --
++ * the Steam Deck showed a highlight hopping across Berri's window panes
++ * that the desktop never drew. Tested on the bits, so that no compiler
++ * folds the test away. */
++vec4 sat(vec4 v)
+ {
+-    uint vid = uint(gl_VertexIndex), n = uint(u.vp2.z);
++    uvec4 b = floatBitsToUint(v) & 0x7FFFFFFFu;
++    return mix(clamp(v, 0.0, 1.0), vec4(0.0), greaterThan(b, uvec4(0x7F800000u)));
++}
++
++struct Vout {
++    vec4 p;
++    float c0, c1;
++    vec4 d0, d1;
++    float fog;
++    vec4 t0, t1, t2, t3;
++};
++
++Vout run(uint n)
++{
++    Vout o;
+ 
+-#ifndef VSH_INPUTS
+-#define VSH_INPUTS 0xFFFF
+-#endif
+-    for (int i = 0; i < 16; i++)
+-        V[i] = ((VSH_INPUTS >> i) & 1) != 0 ? fetch(i, vid) : vec4(0.0);
+     for (int i = 0; i < 13; i++) {
+         R[i] = vec4(0.0);
+         O[i] = vec4(0.0);
+@@ -255,16 +285,70 @@ void main()
+         pos.w = 1.0;
+     pos.x *= u.vp.w;
+     pos.y *= u.vp2.x;
+-    gl_ClipDistance[0] = pos.w - 1e-3;
+-    gl_ClipDistance[1] = (pos.z - u.vp2.y) * pos.w;
+-    gl_Position = vec4((pos.x * u.vp.x - 1.0) * pos.w, (pos.y * u.vp.y - 1.0) * pos.w,
+-                       pos.z * u.vp.z * pos.w, pos.w);
++    o.c0 = pos.w - 1e-3;
++    o.c1 = (pos.z - u.vp2.y) * pos.w;
++    o.p = vec4((pos.x * u.vp.x - 1.0) * pos.w, (pos.y * u.vp.y - 1.0) * pos.w,
++               pos.z * u.vp.z * pos.w, pos.w);
++    o.d0 = sat(O[3]);
++    o.d1 = sat(O[4]);
++    o.fog = fog_factor(O[5].x);
++    o.t0 = O[9];
++    o.t1 = O[10];
++    o.t2 = O[11];
++    o.t3 = O[12];
++    return o;
++}
+ 
+-    v_d0 = clamp(O[3], 0.0, 1.0);
+-    v_d1 = clamp(O[4], 0.0, 1.0);
+-    v_fog = fog_factor(O[5].x);
+-    v_t0 = O[9];
+-    v_t1 = O[10];
+-    v_t2 = O[11];
+-    v_t3 = O[12];
++void main()
++{
++    uint vid = uint(gl_VertexIndex), n = uint(u.vp2.z);
++
++#ifndef VSH_INPUTS
++#define VSH_INPUTS 0xFFFF
++#endif
++    for (int i = 0; i < 16; i++)
++        V[i] = ((VSH_INPUTS >> i) & 1) != 0 ? fetch(i, vid) : vec4(0.0);
++    Vout o = run(n);
++#ifdef VSH_BLEND
++    float t = u.ip.x;
++    if (t > 0.0) {
++        g_b = true;
++        Vout q = run(n);
++        /* In front of the eye in both: where on the screen is blended, and
++         * the depth (as the screen-space draws are, so that the two meet).
++         * Blended in clip space, a point the camera swings past -- off one
++         * side of the screen in one frame, off the other in the next --
++         * came close to the eye between the two, and a tree trunk beside
++         * the camera filled the screen. Behind the eye in one: in clip
++         * space, where w crosses zero and the point is clipped. */
++        if (o.p.w > 0.0 && q.p.w > 0.0) {
++            vec3 s = mix(o.p.xyz / o.p.w, q.p.xyz / q.p.w, t);
++            float w = mix(o.p.w, q.p.w, t);
++            o.p = vec4(s * w, w);
++            o.c0 = w - 1e-3;
++            o.c1 = (s.z / u.vp.z - u.vp2.y) * w;
++        } else {
++            o.p = mix(o.p, q.p, t);
++            o.c0 = mix(o.c0, q.c0, t);
++            o.c1 = mix(o.c1, q.c1, t);
++        }
++        o.d0 = mix(o.d0, q.d0, t);
++        o.d1 = mix(o.d1, q.d1, t);
++        o.fog = mix(o.fog, q.fog, t);
++        o.t0 = mix(o.t0, q.t0, t);
++        o.t1 = mix(o.t1, q.t1, t);
++        o.t2 = mix(o.t2, q.t2, t);
++        o.t3 = mix(o.t3, q.t3, t);
++    }
++#endif
++    gl_ClipDistance[0] = o.c0;
++    gl_ClipDistance[1] = o.c1;
++    gl_Position = o.p;
++    v_d0 = o.d0;
++    v_d1 = o.d1;
++    v_fog = o.fog;
++    v_t0 = o.t0;
++    v_t1 = o.t1;
++    v_t2 = o.t2;
++    v_t3 = o.t3;
+ }
+diff --git a/src/vulkan/vk_window.c b/src/vulkan/vk_window.c
+index 6c52ea2..b1f9020 100644
+--- a/src/vulkan/vk_window.c
++++ b/src/vulkan/vk_window.c
+@@ -48,6 +48,8 @@
+ #include "vk_window.h"
+ 
+ static void pace_note(void);
++/* How long the present held the queue (submit and present), for pace_note. */
++static double s_hold_ms, s_hold_max;
+ 
+ static const uint32_t k_present_vert[] =
+ #include "present.vert.inc"
+@@ -1067,11 +1069,20 @@ static void draw(const CpuFrame *cpu, const VImg *gpu)
+     pi.swapchainCount = 1;
+     pi.pSwapchains = &V.sc;
+     pi.pImageIndices = &idx;
+-    V.qlock(1);
+-    r = vkQueueSubmit(V.q, 1, &si, f->fence);
+-    if (r == VK_SUCCESS)
+-        r = vkQueuePresentKHR(V.q, &pi);
+-    V.qlock(0);
++    {
++        uint64_t h0 = SDL_GetPerformanceCounter();
++        double ms;
++        V.qlock(1);
++        r = vkQueueSubmit(V.q, 1, &si, f->fence);
++        if (r == VK_SUCCESS)
++            r = vkQueuePresentKHR(V.q, &pi);
++        V.qlock(0);
++        ms = (double)(SDL_GetPerformanceCounter() - h0) * 1000.0
++           / (double)SDL_GetPerformanceFrequency();
++        s_hold_ms += ms;
++        if (ms > s_hold_max)
++            s_hold_max = ms;
++    }
+     pace_note();
+     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)
+         V.sc_bad = 1;
+@@ -1119,8 +1130,11 @@ static void pace_note(void)
+                 float t = a[j]; a[j] = a[j - 1]; a[j - 1] = t;
+             }
+         fprintf(stderr, "[VK] window: presents every %.2f ms, sd %.2f, 5%% %.2f 95%% %.2f,"
+-                        " %d over 1.5x\n", mean, sqrtf(sq / n), a[n / 20], a[n - n / 20 - 1], over);
++                        " %d over 1.5x; queue held %.2f ms a present, at most %.1f\n",
++                mean, sqrtf(sq / n), a[n / 20], a[n - n / 20 - 1], over,
++                s_hold_ms / n, s_hold_max);
+         n = 0;
++        s_hold_ms = s_hold_max = 0;
+     }
+ }
+ 
+diff --git a/src/vulkan/shaders/hole_fill.frag b/src/vulkan/shaders/hole_fill.frag
+new file mode 100644
+index 0000000..6fe16f3
+--- /dev/null
++++ b/src/vulkan/shaders/hole_fill.frag
+@@ -0,0 +1,26 @@
++#version 450
++/* An in-between frame's holes (nv2a_vk.c rec_holefill): where A's geometry,
++ * blended toward B, left the depth as it was cleared, B's colour and depth.
++ * Everything A drew stays. */
++
++layout(set = 0, binding = 0) uniform sampler2D s_bcol;   /* B's picture */
++layout(set = 0, binding = 1) uniform sampler2D s_bdep;   /* B's depth */
++layout(set = 0, binding = 2) uniform sampler2D s_cdep;   /* this frame's, so far */
++layout(push_constant) uniform P { float clear_at; } pc;  /* at or past: untouched */
++
++layout(location = 0) out vec4 o_color;
++
++void main()
++{
++    ivec2 p = ivec2(gl_FragCoord.xy);
++    float bd = texelFetch(s_bdep, p, 0).r;
++    /* Empty in B as well (sky, a backdrop drawn without depth): not a hole,
++     * and B's picture there is its finished one -- with the glow its
++     * full-screen passes added, which this frame's own passes then add
++     * again (the sky over the training level's scarecrow, every second
++     * frame brighter). */
++    if (texelFetch(s_cdep, p, 0).r < pc.clear_at || bd >= pc.clear_at)
++        discard;
++    o_color = texelFetch(s_bcol, p, 0);
++    gl_FragDepth = bd;
++}

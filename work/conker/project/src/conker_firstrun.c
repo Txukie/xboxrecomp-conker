@@ -129,7 +129,8 @@ const uint8_t *conker_font_glyph(int ch)
 }
 
 /* The next letter the table has: accents dropped, ß as s, what it cannot
- * write skipped. Returns 0 at the end. */
+ * write skipped. Returns 0 at the end. Also the pub's exit question's
+ * (conker_pub.c, as conker_font_next). */
 static int next_letter(const char **s)
 {
     static const char k_latin[] =   /* U+00C0 to U+00FF */
@@ -144,6 +145,11 @@ static int next_letter(const char **s)
             return k_latin[c - 0xC0];
     }
     return 0;
+}
+
+int conker_font_next(const char **s)
+{
+    return next_letter(s);
 }
 
 static int text_width(const char *s, int scale)
@@ -290,9 +296,7 @@ static const char *const k_hints[CONKER_OPT_COUNT] = {
 #define MAX_MODS 32
 
 static struct {
-    SDL_Window *win;
-    SDL_Renderer *ren;
-    SDL_Texture *tex;
+    SDL_Window *win;                    /* shown through the toolkit's view */
     uint32_t *px, *bg;                  /* the page, and its wood and slate */
     int page_w, bg_w;
     int tab, cur, top, foot;            /* cur == nrows: the buttons below */
@@ -747,14 +751,32 @@ static void fit_page(void)
     SDL_GetWindowSize(L.win, &ww, &wh);
     w = ww > 0 && wh > 0 ? (int)((long)PAGE_H * ww / wh) & ~1 : 1280;
     w = w < PAGE_W_MIN ? PAGE_W_MIN : w > PAGE_W_MAX ? PAGE_W_MAX : w;
-    if (w == L.page_w && L.tex)
+    if (w == L.page_w)
         return;
     L.page_w = w;
     fprintf(stderr, "[CONKER] launcher: window %dx%d, page %dx%d\n", ww, wh, w, PAGE_H);
-    if (L.tex)
-        SDL_DestroyTexture(L.tex);
-    L.tex = SDL_CreateTexture(L.ren, SDL_PIXELFORMAT_XRGB8888, SDL_TEXTUREACCESS_STREAMING, w, PAGE_H);
-    SDL_RenderSetLogicalSize(L.ren, w, PAGE_H);
+}
+
+/* A point in the window (SDL's window coordinates) on the page, which fills
+ * the window at its own shape, centred. */
+static void to_page(int *x, int *y)
+{
+    int ww = 0, wh = 0, dw, dh;
+
+    SDL_GetWindowSize(L.win, &ww, &wh);
+    if (ww <= 0 || wh <= 0)
+        return;
+    if ((long)ww * PAGE_H <= (long)wh * L.page_w) {
+        dw = ww;
+        dh = (int)((long)ww * PAGE_H / L.page_w);
+    } else {
+        dh = wh;
+        dw = (int)((long)wh * L.page_w / PAGE_H);
+    }
+    if (dw <= 0 || dh <= 0)
+        return;
+    *x = (int)((long)(*x - (ww - dw) / 2) * L.page_w / dw);
+    *y = (int)((long)(*y - (wh - dh) / 2) * PAGE_H / dh);
 }
 
 /* Wood, the frame and the slate: the same until the page changes width. */
@@ -1174,20 +1196,23 @@ int conker_firstrun_show(const char *data_dir)
     list_mods();
 
     conker_first_run_window(&mode, &w, &h);
+    /* Made for the way the game will show its frames (Vulkan), so that it
+     * can keep this window. */
     L.win = SDL_CreateWindow("Conker: Live & Reloaded recomp",
                              SDL_WINDOWPOS_CENTERED_DISPLAY(L.display),
                              SDL_WINDOWPOS_CENTERED_DISPLAY(L.display), w, h,
-                             SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+                             SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
+                             | xbox_WindowCreateFlags());
+    if (!L.win && xbox_WindowCreateFlags())
+        L.win = SDL_CreateWindow("Conker: Live & Reloaded recomp",
+                                 SDL_WINDOWPOS_CENTERED_DISPLAY(L.display),
+                                 SDL_WINDOWPOS_CENTERED_DISPLAY(L.display), w, h,
+                                 SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     if (L.win)
         follow_window();
-    L.ren = L.win ? SDL_CreateRenderer(L.win, -1, SDL_RENDERER_PRESENTVSYNC) : NULL;
-    if (L.ren)
-        fit_page();
-    if (!L.tex) {
+    if (!L.win || !xbox_WindowViewOpen(L.win)) {
         /* What the cfg says stands: no launcher is no reason not to play. */
         fprintf(stderr, "[CONKER] launcher: no window (%s)\n", SDL_GetError());
-        if (L.ren)
-            SDL_DestroyRenderer(L.ren);
         if (L.win)
             SDL_DestroyWindow(L.win);
         SDL_Quit();
@@ -1197,6 +1222,7 @@ int conker_firstrun_show(const char *data_dir)
         free(L.bg);
         return 0;
     }
+    fit_page();
     list_pads();
     build_rows();
     fprintf(stderr, "[CONKER] launcher: display %d of %d (%dx%d), %d controller(s), %d audio device(s)\n",
@@ -1212,10 +1238,7 @@ int conker_firstrun_show(const char *data_dir)
         c.w = L.page_w;
         c.h = PAGE_H;
         draw_page(&c, now);
-        SDL_UpdateTexture(L.tex, NULL, L.px, L.page_w * 4);
-        SDL_RenderClear(L.ren);
-        SDL_RenderCopy(L.ren, L.tex, NULL, NULL);
-        SDL_RenderPresent(L.ren);
+        xbox_WindowViewShow(L.px, L.page_w, PAGE_H, L.page_w * 4);
 
         if (L.capture >= 0 && now >= L.capture_until)
             L.capture = -1;
@@ -1259,7 +1282,9 @@ int conker_firstrun_show(const char *data_dir)
                 break;
             case SDL_MOUSEBUTTONDOWN:
                 if (ev.button.button == SDL_BUTTON_LEFT) {
-                    int r = mouse_action(ev.button.x, ev.button.y, now);
+                    int mx = ev.button.x, my = ev.button.y, r;
+                    to_page(&mx, &my);
+                    r = mouse_action(mx, my, now);
                     if (r) {
                         done = r;
                         continue;
@@ -1319,22 +1344,19 @@ int conker_firstrun_show(const char *data_dir)
         if (L.pads[n])
             SDL_GameControllerClose(L.pads[n]);
     SDL_QuitSubSystem(SDL_INIT_AUDIO);
-    SDL_DestroyTexture(L.tex);
     conker_mods_prelaunch(0);
     free(L.px);
     free(L.bg);
     if (done > 0) {
-        /* The game keeps this window: it has the focus. */
-        SDL_SetRenderDrawColor(L.ren, 0, 0, 0, 255);
-        SDL_RenderClear(L.ren);
-        SDL_RenderPresent(L.ren);
-        SDL_DestroyRenderer(L.ren);
+        /* The game keeps this window, black until its first frame: it has
+         * the focus. */
+        xbox_WindowViewClose(1);
         xbox_WindowAdopt(L.win);
         conker_first_run_end();
         fprintf(stderr, "[CONKER] launcher: start\n");
         return 0;
     }
-    SDL_DestroyRenderer(L.ren);
+    xbox_WindowViewClose(0);
     SDL_DestroyWindow(L.win);
     SDL_Quit();
     fprintf(stderr, "[CONKER] launcher: quit, nothing saved\n");

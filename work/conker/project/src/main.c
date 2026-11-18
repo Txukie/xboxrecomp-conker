@@ -23,6 +23,7 @@
 #include "conker_mods.h"
 #include "conker_settings.h"
 #include "ohci.h"
+#include "video_player.h"
 #ifdef CONKER_HAVE_VULKAN
 #include "nv2a_vk.h"
 #endif
@@ -70,6 +71,12 @@ void conker_dump_xbox_state(void)
         fprintf(stderr, shown ? "\n" : " (none in range)\n");
     }
     fflush(stderr);
+#ifdef CONKER_DEBUG
+    {   /* the debug log goes through a pipe: into the file before the end */
+        extern void conker_debug_log_drain(void);
+        conker_debug_log_drain();
+    }
+#endif
 }
 
 static int load_file(const char *path, void **data_out, size_t *size_out)
@@ -259,6 +266,13 @@ int main(int argc, char **argv)
         conker_debug_open_log();
         conker_debug_install();
     }
+#else
+    /* The pub's exit question is drawn over the picture (conker_pub.c); the
+     * debug build's readout lays it over itself. */
+    {
+        extern int conker_pub_overlay(int x, int y, int w, int h, XboxOverlay *ov);
+        xbox_WindowSetOverlay(conker_pub_overlay);
+    }
 #endif
     s_save_path = argc > 2 ? argv[2] : getenv("CONKER_SAVE_DIR");
 
@@ -329,6 +343,11 @@ int main(int argc, char **argv)
      * starts (CONKER_SKIP_LAUNCHER=1 goes straight to the game, as a
      * headless run does). Quitting it quits. */
     conker_mods_set_dirs(data_dir, s_save_path);
+#ifdef CONKER_HAVE_VULKAN
+    /* The window shows its frames through Vulkan, the launcher's page as
+     * well as the game's (nv2a_vk.h); else through an SDL renderer. */
+    nv2a_vk_window_install();
+#endif
     {
         const char *skip = getenv("CONKER_SKIP_LAUNCHER");
         if (!getenv("RECOMP_HEADLESS") && !(skip && *skip && *skip != '0')

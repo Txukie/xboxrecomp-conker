@@ -59,6 +59,9 @@ if [ ! -f "$deps/glslang/lib/libglslang.a" ]; then
     cmake --build "$deps/dl/glslang-build" -j"$(nproc)" >/dev/null
     cmake --install "$deps/dl/glslang-build" >/dev/null
 fi
+# Its license, for the zip (../collect-licenses.sh).
+[ -f "$deps/glslang/LICENSE.txt" ] || [ ! -f "$deps/dl/glslang-$glslang_version/LICENSE.txt" ] \
+    || cp "$deps/dl/glslang-$glslang_version/LICENSE.txt" "$deps/glslang/"
 
 [ -f "$vk_include/vulkan/vulkan_core.h" ] || {
     echo "fetch-deps: no Vulkan headers in $vk_include (set VULKAN_INCLUDE)" >&2; exit 1; }

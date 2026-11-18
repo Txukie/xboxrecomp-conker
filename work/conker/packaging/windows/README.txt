@@ -13,8 +13,9 @@ non-Steam game and pick Proton under Compatibility.
 Settings, saves, mods and the installed game live in
 %LOCALAPPDATA%\ConkerRecomp. The log of the last run is conker.log there.
 
-SDL2.dll is SDL 2 (zlib license, README-SDL.txt). The game's data is not
-included.
+SDL2.dll is SDL 2 (zlib license, README-SDL.txt). The licenses of this
+program and of everything in it are in the licenses folder. The game's data
+is not included.
 
 ---
 
@@ -30,3 +31,6 @@ juego que no es de Steam y elige Proton en Compatibilidad.
 Ajustes, partidas, mods y el juego instalado están en
 %LOCALAPPDATA%\ConkerRecomp. El registro de la última ejecución es
 conker.log, ahí mismo.
+
+Las licencias de este programa y de todo lo que incluye están en la carpeta
+licenses. No se incluye ningún dato del juego.

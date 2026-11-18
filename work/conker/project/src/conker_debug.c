@@ -52,12 +52,17 @@
 #include <sys/syscall.h>
 #include <sys/prctl.h>
 #include <sys/time.h>
+#include <sys/ioctl.h>
 #include <ucontext.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <pthread.h>
 #endif
 
 #include "conker_settings.h"
 #include "video_player.h"
+#include "nv2a_vk.h"
 
 extern ptrdiff_t g_xbox_mem_offset;
 extern void (*g_xbox_path_hook)(const char *xbox_path);
@@ -100,6 +105,106 @@ static float gf(uint32_t va)
 
 /* ── The log ──────────────────────────────────────────────────────────── */
 
+#if !defined(_WIN32)
+/* The log through a pipe, written to the file by a thread of its own. Every
+ * line used to be a write() to log.txt from whichever thread printed it --
+ * the executor among them, mid-draw -- and on the Deck a write stalls 30 to
+ * 40 ms while the file system commits its journal, every 5 s (ext4's
+ * default): a frame of 70 ms every 150 the title drew, in the debug build
+ * only. The pipe takes a megabyte (minutes of log); the writer notes its
+ * own stalls in the file. */
+static int s_log_pipe_r = -1, s_log_fd = -1;
+
+static void *log_writer(void *arg)
+{
+    static char buf[65536];
+    (void)arg;
+    for (;;) {
+        ssize_t n = read(s_log_pipe_r, buf, sizeof buf), o = 0;
+        struct timespec a, b;
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR)
+                continue;
+            return NULL;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &a);
+        while (o < n) {
+            ssize_t w = write(s_log_fd, buf + o, (size_t)(n - o));
+            if (w <= 0) {
+                if (w < 0 && errno == EINTR)
+                    continue;
+                break;
+            }
+            o += w;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &b);
+        {
+            long ms = (long)((b.tv_sec - a.tv_sec) * 1000 + (b.tv_nsec - a.tv_nsec) / 1000000);
+            if (ms >= 10) {
+                char line[96];
+                int k = snprintf(line, sizeof line, "[DBG] writing the log stalled %ld ms"
+                                 " (the game no longer waits for it)\n", ms);
+                if (k > 0 && write(s_log_fd, line, (size_t)k) < 0)
+                    break;
+            }
+        }
+    }
+    return NULL;
+}
+
+/* Until what was printed is in the file, at most half a second: before a
+ * crash ends the process (conker_dump_xbox_state) and at exit. Safe in a
+ * signal handler. */
+void conker_debug_log_drain(void)
+{
+    int i, left = 1;
+    if (s_log_pipe_r < 0)
+        return;
+    for (i = 0; i < 100 && left > 0; i++) {
+        struct timespec ts = { 0, 5000000 };
+        if (ioctl(s_log_pipe_r, FIONREAD, &left) < 0)
+            break;
+        if (left > 0)
+            nanosleep(&ts, NULL);
+    }
+}
+
+static int log_through_pipe(const char *path)
+{
+    int p[2];
+    pthread_t t;
+    s_log_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (s_log_fd < 0)
+        return 0;
+    if (pipe(p) < 0) {
+        close(s_log_fd);
+        s_log_fd = -1;
+        return 0;
+    }
+#ifdef F_SETPIPE_SZ
+    fcntl(p[1], F_SETPIPE_SZ, 1 << 20);
+#endif
+    s_log_pipe_r = p[0];
+    if (pthread_create(&t, NULL, log_writer, NULL) != 0) {
+        close(p[0]);
+        close(p[1]);
+        close(s_log_fd);
+        s_log_pipe_r = s_log_fd = -1;
+        return 0;
+    }
+    pthread_detach(t);
+    fflush(stderr);
+    dup2(p[1], fileno(stderr));
+    close(p[1]);
+    atexit(conker_debug_log_drain);
+    return 1;
+}
+#else
+void conker_debug_log_drain(void)
+{
+}
+#endif
+
 static void make_dir(const char *path)
 {
 #if defined(_WIN32)
@@ -115,6 +220,10 @@ void conker_debug_open_log(void)
     const char *base;
     time_t t = time(NULL);
     struct tm tm;
+
+    /* CONKER_DEBUG_STDERR=1: the log stays on stderr (a test rig that reads
+     * it); the run's directory, marks and recordings are made as usual. */
+    int keep = getenv("CONKER_DEBUG_STDERR") && *getenv("CONKER_DEBUG_STDERR") == '1';
 
 #if defined(_WIN32)
     base = getenv("LOCALAPPDATA");
@@ -144,6 +253,14 @@ void conker_debug_open_log(void)
              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
     make_dir(s_run_dir);
     snprintf(s_log_path, sizeof s_log_path, "%s/log.txt", s_run_dir);
+    if (keep) {
+        s_start_ms = now_ms();
+        fprintf(stderr, "[DBG] debug build, log on stderr (CONKER_DEBUG_STDERR)\n");
+        return;
+    }
+#if !defined(_WIN32)
+    if (!log_through_pipe(s_log_path))
+#endif
     if (!freopen(s_log_path, "w", stderr)) {
         s_run_dir[0] = 0;
         s_log_path[0] = 0;
@@ -493,14 +610,12 @@ static void log_changes(const Snapshot *s, double t, double fps, uint64_t now)
 }
 
 /* F12: a [MARK] line and the window as it is, readout included. */
-static void mark(SDL_Renderer *ren, const Snapshot *s, double t)
+static void mark(const Snapshot *s, double t)
 {
     static int down, n;
     const Uint8 *keys = SDL_GetKeyboardState(NULL);
     int now_down = keys && keys[SDL_SCANCODE_F12];
     char path[1100];
-    int w, h;
-    SDL_Surface *sf;
 
     if (!now_down || down) {
         down = now_down;
@@ -511,33 +626,32 @@ static void mark(SDL_Renderer *ren, const Snapshot *s, double t)
     snprintf(path, sizeof path, "%s/mark-%02d.bmp", s_run_dir, n);
     fprintf(stderr, "[MARK] %d t=%.1f frame %u level 0x%02X %s pos %.1f %.1f %.1f state %u -> %s\n",
             n, t, s->frame, s->level, s_package[s_package_cur], s->x, s->y, s->z, s->state, path);
-    if (!s_run_dir[0] || SDL_GetRendererOutputSize(ren, &w, &h) != 0)
-        return;
-    sf = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_ARGB8888);
-    if (!sf)
-        return;
-    if (SDL_RenderReadPixels(ren, NULL, SDL_PIXELFORMAT_ARGB8888, sf->pixels, sf->pitch) == 0)
-        SDL_SaveBMP(sf, path);
-    SDL_FreeSurface(sf);
+    if (s_run_dir[0]) {
+        xbox_WindowShot(path);
+        /* and the next frame's draws (Berri's window, drawn on the Deck
+         * only): trace-NN.txt/.bin */
+        snprintf(path, sizeof path, "%s/trace-%02d", s_run_dir, n);
+        nv2a_vk_trace_arm(path);
+    }
 }
 
-/* The letters into a pixel buffer, white on a dark band, then one texture. */
-static void draw(void *renderer, int x, int y, int w, int h)
+/* The letters into a pixel buffer, white on a dark band, for the window to
+ * lay over the frame (on whichever thread shows it). */
+static int draw(int x, int y, int w, int h, XboxOverlay *ov)
 {
-    static SDL_Texture *tex;
+    extern int conker_pub_overlay(int x, int y, int w, int h, XboxOverlay *ov);
+
     static int tex_w, tex_h;
     static uint32_t *px;
     static uint64_t fps_t0;
     static unsigned fps_frames;
     static double fps;
-    SDL_Renderer *ren = renderer;
     char lines[LINES][COLS];
     Snapshot s;
     uint64_t now = now_ms();
     int scale = h >= 1440 ? 3 : h >= 720 ? 2 : 1;
     int i, tw, th, longest = 0;
     double t = (now - s_start_ms) / 1000.0;
-    SDL_Rect dst;
 
     (void)w;
     fps_frames++;
@@ -550,21 +664,21 @@ static void draw(void *renderer, int x, int y, int w, int h)
     }
     snapshot(&s);
     log_changes(&s, t, fps, now);
+    if (conker_pub_overlay(x, y, w, h, ov)) {   /* the pub's exit question */
+        mark(&s, t);
+        return 1;
+    }
     readout(&s, t, fps, lines);
     for (i = 0; i < LINES; i++)
         if ((int)strlen(lines[i]) > longest)
             longest = (int)strlen(lines[i]);
     tw = longest * 6 + 6;
     th = LINES * 10 + 4;
-    if (!tex || tw != tex_w || th != tex_h) {
-        if (tex)
-            SDL_DestroyTexture(tex);
+    if (!px || tw != tex_w || th != tex_h) {
         free(px);
         px = malloc((size_t)tw * th * 4);
-        tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, tw, th);
-        if (!tex || !px)
-            return;
-        SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+        if (!px)
+            return 0;
         tex_w = tw;
         tex_h = th;
     }
@@ -583,13 +697,14 @@ static void draw(void *renderer, int x, int y, int w, int h)
                         px[(cy + row) * tw + cx + col] = color;
         }
     }
-    SDL_UpdateTexture(tex, NULL, px, tw * 4);
-    dst.x = x + 4;
-    dst.y = y + 4;
-    dst.w = tw * scale;
-    dst.h = th * scale;
-    SDL_RenderCopy(ren, tex, NULL, &dst);
-    mark(ren, &s, t);
+    ov->px = px;
+    ov->w = tw;
+    ov->h = th;
+    ov->x = x + 4;
+    ov->y = y + 4;
+    ov->scale = scale;
+    mark(&s, t);
+    return 1;
 }
 
 void conker_debug_install(void)

@@ -150,8 +150,8 @@ take effect when the game is restarted.
 ### Main menu
 
 The pub starts on **Game 1**, and after that on the save slot last played.
-The first title reads "Online & Co". B on any title asks "Do you want to
-exit?" (No is picked; left and right choose, A answers, B is No); Yes
+The first title reads "Online & Co". B on any title asks, in the middle of
+the screen, "Do you want to exit?" (No is picked; left and right choose, A answers, B is No); Yes
 closes the game. Titles, including the save slots', and this question follow
 the Language option.
 
@@ -217,6 +217,7 @@ The Windows build is cross-compiled on Linux with MinGW-w64: see
 | `CONKER_GAME_DIR`, `CONKER_SAVE_DIR` | Game and save locations |
 | `CONKER_ASPECT=16:9` | Aspect ratio at start (also `16:10`, `21:9` or a number) |
 | `RECOMP_RENDERER=cpu` | Draw on the CPU instead of Vulkan |
+| `RECOMP_PRESENT=sdl` | Show the window's frames through SDL's renderer instead of Vulkan (as up to 0.6.0) |
 | `RECOMP_VK_SCALE=<n>` | Render resolution at start |
 | `RECOMP_FLIP_PACING=0` | No vblank pacing (uncapped) |
 | `RECOMP_VIDEO_STRETCH=1` | Stretch videos instead of keeping 4:3 |
@@ -436,7 +437,7 @@ aplican al reiniciar el juego.
 
 El pub empieza en **Game 1** y, a partir de ahí, en la partida que se jugó
 la última vez. El primer título dice "Online & Co". B en cualquier título
-pregunta "Do you want to exit?" (con No elegido; izquierda y derecha
+pregunta, en el centro de la pantalla, "Do you want to exit?" (con No elegido; izquierda y derecha
 eligen, A responde, B es No); Yes cierra el juego. Los títulos, también los de
 las partidas, y esta pregunta siguen la opción Language.
 
@@ -503,6 +504,7 @@ La versión de Windows se compila desde Linux con MinGW-w64: consulta
 | `CONKER_GAME_DIR`, `CONKER_SAVE_DIR` | Ubicación del juego y de las partidas |
 | `CONKER_ASPECT=16:9` | Proporción al arrancar (también `16:10`, `21:9` o un número) |
 | `RECOMP_RENDERER=cpu` | Dibujar con la CPU en vez de con Vulkan |
+| `RECOMP_PRESENT=sdl` | Mostrar los fotogramas de la ventana con el renderizador de SDL en vez de con Vulkan (como hasta la 0.6.0) |
 | `RECOMP_VK_SCALE=<n>` | Resolución de render al arrancar |
 | `RECOMP_FLIP_PACING=0` | Sin sincronía con el vblank (sin límite) |
 | `RECOMP_VIDEO_STRETCH=1` | Estirar los vídeos en vez de conservar el 4:3 |

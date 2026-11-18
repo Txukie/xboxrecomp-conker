@@ -7,7 +7,8 @@
 # which passes them (VERSION is the CMake project version; SETUP the
 # first-launch window, conker-setup, when Qt 6 was found).
 #
-# Bundled: the binary, AppRun, the desktop entry and icon, and the libraries
+# Bundled: the binary, AppRun, the desktop entry and icon, the license and
+# notice files of all of it (usr/share/licenses), and the libraries
 # a desktop may lack (SDL2, libepoxy, OpenSSL's libcrypto, SPIRV-Tools and
 # the C++ runtime for glslang, which is linked in). With SETUP also
 # conker-setup, the Qt it links and Qt's X11/Wayland plugins. Not bundled, on
@@ -86,6 +87,9 @@ if [ -n "$setup" ] && [ -x "$setup" ]; then
     done
     echo "build-appimage: bundled conker-setup and $(ls "$appdir/usr/lib" | wc -l) libraries"
 fi
+
+# Everything's license, in usr/share/licenses (../collect-licenses.sh).
+sh "$here/../collect-licenses.sh" "$appdir/usr/share/licenses" linux "$appdir"
 
 tool=${APPIMAGETOOL:-}
 if [ -z "$tool" ]; then

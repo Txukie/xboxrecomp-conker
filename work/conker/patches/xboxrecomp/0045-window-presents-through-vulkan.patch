@@ -1,0 +1,2420 @@
+diff --git a/src/video/fb_present_sdl.c b/src/video/fb_present_sdl.c
+index a723fc1..0b3eea6 100644
+--- a/src/video/fb_present_sdl.c
++++ b/src/video/fb_present_sdl.c
+@@ -42,6 +42,7 @@
+ #if !defined(_WIN32) || defined(XBOXRECOMP_WIN32_SDL)
+ 
+ #include <SDL.h>
++#include <SDL_vulkan.h>
+ #include "display_aspect.h"
+ #include <pthread.h>
+ #include <sched.h>
+@@ -87,6 +88,19 @@ static volatile int    s_wake_pending;
+ static volatile int    s_in_present;         /* executor inside Present */
+ static volatile uint32_t s_fb_va, s_fb_pitch; /* AvSetDisplayMode surface */
+ 
++/* The presenter the frames go to instead of an SDL renderer, when there is
++ * one and it opened on the window (XboxPresenter, video_player.h). */
++static const XboxPresenter *s_pr;
++static int             s_pr_open;            /* main thread */
++static SDL_Window     *s_pr_win;
++static volatile int    s_pr_live;            /* the flips go to it */
++static volatile int    s_any_frame;          /* a flip has been handed over */
++
++void xbox_WindowSetPresenter(const XboxPresenter *p)
++{
++    s_pr = p;
++}
++
+ /* Counted at the flip, read once a second for the title bar. */
+ static uint64_t s_flips;
+ static uint32_t s_frame_draws;
+@@ -158,6 +172,11 @@ static void present_copy(uint32_t fb_va, uint32_t pitch)
+         s->cap = need;
+     }
+     src = (const uint8_t *)((uintptr_t)fb_va + xbox_GetMemoryOffset());
++    if (__atomic_load_n(&s_pr_live, __ATOMIC_ACQUIRE)) {
++        s_pr->pixels(src, FB_W, FB_H, pitch, bpp, 0);
++        __atomic_store_n(&s_any_frame, 1, __ATOMIC_RELEASE);
++        return;
++    }
+     for (y = 0; y < FB_H; y++)
+         memcpy(s->px + (size_t)y * FB_W * bpp, src + (size_t)y * pitch,
+                (size_t)FB_W * bpp);
+@@ -176,6 +195,11 @@ static void present_pixels(const uint8_t *src, uint32_t w, uint32_t h,
+     size_t need = (size_t)w * h * bpp;
+     uint32_t y;
+ 
++    if (__atomic_load_n(&s_pr_live, __ATOMIC_ACQUIRE)) {
++        s_pr->pixels(src, w, h, pitch, bpp, 0);
++        __atomic_store_n(&s_any_frame, 1, __ATOMIC_RELEASE);
++        return;
++    }
+     if (s->cap < need) {
+         uint8_t *n = (uint8_t *)realloc(s->px, need);
+         if (!n)
+@@ -238,6 +262,12 @@ void xbox_FramebufferWindowOutputSize(int *w, int *h)
+     *h = __atomic_load_n(&s_out_h, __ATOMIC_RELAXED);
+ }
+ 
++void xbox_WindowSetOutputSize(int w, int h)
++{
++    __atomic_store_n(&s_out_w, w, __ATOMIC_RELAXED);
++    __atomic_store_n(&s_out_h, h, __ATOMIC_RELAXED);
++}
++
+ /* ── Window settings a title can change while it runs ─────────────────── */
+ 
+ /* Requested by any thread, applied by the main loop when s_req_gen moves.
+@@ -525,37 +555,69 @@ static int env_on(const char *name)
+     return e && *e && *e != '0';
+ }
+ 
+-/* RECOMP_FB_WINDOW_SHOT=<prefix>: while <prefix>.req exists, each presented
+- * window image -- scaled, with its bars, as the player sees it -- is written
++/* Screenshots of the window as the player sees it: one asked for
++ * (xbox_WindowShot), and RECOMP_FB_WINDOW_SHOT=<prefix>: while <prefix>.req
++ * exists, each presented window image -- scaled, with its bars -- is written
+  * to <prefix>NNNN.bmp. It shows what the window does to a frame, which the
+  * framebuffer dumps (RECOMP_FB_DUMP) cannot; with SDL_VIDEODRIVER=offscreen
+  * it works without a display. */
+-static void window_shot(SDL_Renderer *ren)
++static pthread_mutex_t s_shot_lock = PTHREAD_MUTEX_INITIALIZER;
++static char s_shot_path[1024];
++static int s_shot_req;
++
++void xbox_WindowShot(const char *path)
++{
++    pthread_mutex_lock(&s_shot_lock);
++    snprintf(s_shot_path, sizeof s_shot_path, "%s", path);
++    s_shot_req = 1;
++    pthread_mutex_unlock(&s_shot_lock);
++}
++
++/* The path of a screenshot to take of the frame being shown, if one is due.
++ * One thread calls it: whichever shows the frames. */
++int xbox_WindowShotPending(char *path, size_t size)
+ {
+     static const char *prefix = (const char *)-1;
+     static unsigned seq;
+-    char path[512];
+     FILE *f;
+-    int w, h;
+-    SDL_Surface *sf;
++    int r = 0;
+ 
++    pthread_mutex_lock(&s_shot_lock);
++    if (s_shot_req) {
++        snprintf(path, size, "%s", s_shot_path);
++        s_shot_req = 0;
++        r = 1;
++    }
++    pthread_mutex_unlock(&s_shot_lock);
++    if (r)
++        return 1;
+     if (prefix == (const char *)-1)
+         prefix = getenv("RECOMP_FB_WINDOW_SHOT");
+     if (!prefix || !*prefix)
+-        return;
+-    snprintf(path, sizeof path, "%s.req", prefix);
++        return 0;
++    snprintf(path, size, "%s.req", prefix);
+     if (!(f = fopen(path, "rb")))
+-        return;
++        return 0;
+     fclose(f);
++    snprintf(path, size, "%s%04u.bmp", prefix, seq++);
++    return 1;
++}
++
++static void window_shot(SDL_Renderer *ren)
++{
++    char path[1024];
++    int w, h;
++    SDL_Surface *sf;
++
++    if (!xbox_WindowShotPending(path, sizeof path))
++        return;
+     if (SDL_GetRendererOutputSize(ren, &w, &h) != 0)
+         return;
+     sf = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_ARGB8888);
+     if (!sf)
+         return;
+-    if (SDL_RenderReadPixels(ren, NULL, SDL_PIXELFORMAT_ARGB8888, sf->pixels, sf->pitch) == 0) {
+-        snprintf(path, sizeof path, "%s%04u.bmp", prefix, seq++);
++    if (SDL_RenderReadPixels(ren, NULL, SDL_PIXELFORMAT_ARGB8888, sf->pixels, sf->pitch) == 0)
+         SDL_SaveBMP(sf, path);
+-    }
+     SDL_FreeSurface(sf);
+ }
+ 
+@@ -569,20 +631,186 @@ void xbox_WindowAdopt(void *sdl_window)
+     s_adopted = sdl_window;
+ }
+ 
+-static void (*volatile s_overlay)(void *sdl_renderer, int x, int y, int w, int h);
++static int (*volatile s_overlay)(int x, int y, int w, int h, XboxOverlay *ov);
+ 
+-void xbox_WindowSetOverlay(void (*draw)(void *sdl_renderer, int x, int y, int w, int h))
++void xbox_WindowSetOverlay(int (*draw)(int x, int y, int w, int h, XboxOverlay *ov))
+ {
+     s_overlay = draw;
+ }
+ 
++int xbox_WindowOverlayPixels(int x, int y, int w, int h, XboxOverlay *ov)
++{
++    int (*draw)(int, int, int, int, XboxOverlay *) = s_overlay;
++    memset(ov, 0, sizeof *ov);
++    return draw ? draw(x, y, w, h, ov) : 0;
++}
++
++/* The overlay over the picture, through an SDL renderer. */
++static void draw_overlay(SDL_Renderer *ren, SDL_Texture **tex, int *tw, int *th,
++                         int x, int y, int w, int h)
++{
++    XboxOverlay ov;
++    SDL_Rect r;
++
++    if (!xbox_WindowOverlayPixels(x, y, w, h, &ov) || !ov.px || ov.w <= 0 || ov.h <= 0)
++        return;
++    if (!*tex || *tw != ov.w || *th != ov.h) {
++        if (*tex)
++            SDL_DestroyTexture(*tex);
++        *tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
++                                 ov.w, ov.h);
++        if (!*tex)
++            return;
++        SDL_SetTextureBlendMode(*tex, SDL_BLENDMODE_BLEND);
++        *tw = ov.w;
++        *th = ov.h;
++    }
++    SDL_UpdateTexture(*tex, NULL, ov.px, ov.w * 4);
++    r.x = ov.x;
++    r.y = ov.y;
++    r.w = ov.w * (ov.scale > 0 ? ov.scale : 1);
++    r.h = ov.h * (ov.scale > 0 ? ov.scale : 1);
++    SDL_RenderCopy(ren, *tex, NULL, &r);
++}
++
++/* ── A title's page before the game (xbox_WindowViewOpen) ──────────────── */
++
++static SDL_Renderer *s_view_ren;
++static SDL_Texture  *s_view_tex;
++static int s_view_tw, s_view_th, s_view_dw, s_view_dh;
++static Uint32 s_view_t;
++
++unsigned xbox_WindowCreateFlags(void)
++{
++    static int flags = -1;
++    if (flags < 0)
++        flags = s_pr && s_pr->window_flags ? (int)s_pr->window_flags() : 0;
++    return (unsigned)flags;
++}
++
++static int presenter_open(SDL_Window *win, int vsync)
++{
++    if (s_pr_open)
++        return s_pr_win == win;
++    if (!s_pr || !(SDL_GetWindowFlags(win) & SDL_WINDOW_VULKAN) || !s_pr->open(win, vsync))
++        return 0;
++    s_pr_open = 1;
++    s_pr_win = win;
++    s_view_dw = s_view_dh = 0;
++    return 1;
++}
++
++/* The presenter follows the window's drawable size. */
++static void presenter_size(void)
++{
++    int w = 0, h = 0;
++    SDL_Vulkan_GetDrawableSize(s_pr_win, &w, &h);
++    if (w != s_view_dw || h != s_view_dh) {
++        s_view_dw = w;
++        s_view_dh = h;
++        s_pr->resized(w, h);
++    }
++}
++
++int xbox_WindowViewOpen(void *sdl_window)
++{
++    SDL_Window *win = (SDL_Window *)sdl_window;
++
++    if (!win)
++        return 0;
++    if (presenter_open(win, 1))
++        return 1;
++    s_view_ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_PRESENTVSYNC);
++    return s_view_ren != NULL;
++}
++
++void xbox_WindowViewShow(const void *px, int w, int h, int pitch)
++{
++    if (s_pr_open) {
++        SDL_DisplayMode m;
++        Uint32 now, period;
++
++        presenter_size();
++        s_pr->pixels(px, (uint32_t)w, (uint32_t)h, (uint32_t)pitch, 4, 1);
++        /* The presenter does not wait for the display here: the page's
++         * loop is paced to it. */
++        period = SDL_GetWindowDisplayMode(s_pr_win, &m) == 0 && m.refresh_rate > 0
++               ? 1000u / (Uint32)m.refresh_rate : 16u;
++        now = SDL_GetTicks();
++        if (now - s_view_t < period)
++            SDL_Delay(period - (now - s_view_t));
++        s_view_t = SDL_GetTicks();
++        return;
++    }
++    if (!s_view_ren)
++        return;
++    if (!s_view_tex || s_view_tw != w || s_view_th != h) {
++        if (s_view_tex)
++            SDL_DestroyTexture(s_view_tex);
++        s_view_tex = SDL_CreateTexture(s_view_ren, SDL_PIXELFORMAT_XRGB8888,
++                                       SDL_TEXTUREACCESS_STREAMING, w, h);
++        s_view_tw = w;
++        s_view_th = h;
++    }
++    SDL_SetRenderDrawColor(s_view_ren, 0, 0, 0, 255);
++    SDL_RenderClear(s_view_ren);
++    if (s_view_tex) {
++        SDL_Rect dst;
++        int ow, oh;
++        SDL_UpdateTexture(s_view_tex, NULL, px, pitch);
++        if (SDL_GetRendererOutputSize(s_view_ren, &ow, &oh) != 0 || ow <= 0 || oh <= 0) {
++            ow = w;
++            oh = h;
++        }
++        if ((long long)ow * h <= (long long)oh * w) {
++            dst.w = ow;
++            dst.h = (int)((long long)ow * h / w);
++        } else {
++            dst.h = oh;
++            dst.w = (int)((long long)oh * w / h);
++        }
++        dst.x = (ow - dst.w) / 2;
++        dst.y = (oh - dst.h) / 2;
++        SDL_RenderCopy(s_view_ren, s_view_tex, NULL, &dst);
++    }
++    SDL_RenderPresent(s_view_ren);
++}
++
++void xbox_WindowViewClose(int keep)
++{
++    static const uint32_t black[16];
++
++    if (s_view_tex)
++        SDL_DestroyTexture(s_view_tex);
++    s_view_tex = NULL;
++    if (s_view_ren) {
++        if (keep) {
++            SDL_SetRenderDrawColor(s_view_ren, 0, 0, 0, 255);
++            SDL_RenderClear(s_view_ren);
++            SDL_RenderPresent(s_view_ren);
++        }
++        SDL_DestroyRenderer(s_view_ren);
++        s_view_ren = NULL;
++    }
++    if (s_pr_open) {
++        if (keep) {
++            s_pr->pixels(black, 4, 4, 16, 4, 1);
++        } else {
++            s_pr->close();
++            s_pr_open = 0;
++            s_pr_win = NULL;
++        }
++    }
++}
++
+ int xbox_HostWindowMain(int (*guest_main)(void))
+ {
+     SDL_Window *win;
+     int adopted = 0;
+-    SDL_Renderer *ren;
+-    SDL_Texture *tex = NULL;
++    SDL_Renderer *ren = NULL;
++    SDL_Texture *tex = NULL, *ov_tex = NULL;
+     uint32_t tex_bpp = 0, tex_w = 0, tex_h = 0;
++    int ov_w = 0, ov_h = 0, pr = 0;
+     unsigned applied_gen = 0;
+     uint64_t shown_seq = 0, t_title = 0, flips_title = 0;
+     const char *e;
+@@ -630,9 +858,13 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+             }
+         } else {
+             int d = target_display(NULL);
++            Uint32 fl = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
+             win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_CENTERED_DISPLAY(d),
+                                    SDL_WINDOWPOS_CENTERED_DISPLAY(d),
+-                                   w, h, SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
++                                   w, h, fl | xbox_WindowCreateFlags());
++            if (!win && xbox_WindowCreateFlags())
++                win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_CENTERED_DISPLAY(d),
++                                       SDL_WINDOWPOS_CENTERED_DISPLAY(d), w, h, fl);
+         }
+     }
+     /* A pad game: no pointer over its window. */
+@@ -645,32 +877,49 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+                 SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS ? "yes" : "no");
+         xbox_InputControllersChanged();
+     }
+-    ren = win ? SDL_CreateRenderer(win, -1,
+-                                   vsync ? SDL_RENDERER_PRESENTVSYNC : 0)
+-              : NULL;
+-    if (!ren) {
+-        fprintf(stderr, "  [FBWIN] SDL window/renderer failed (%s); running headless\n",
+-                SDL_GetError());
+-        if (win)
+-            SDL_DestroyWindow(win);
+-        SDL_QuitSubSystem(FBWIN_SDL_SUBSYSTEMS);
+-        return guest_main();
+-    }
+-    /* The frame is drawn into the largest rectangle of its shown shape
+-     * (display_aspect.h) that fits the window, centred, with black around it
+-     * -- computed per frame, since a video keeps its own shape. */
+-    {
+-        SDL_RendererInfo ri;
+-        if (SDL_GetRendererInfo(ren, &ri) == 0)
+-            fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u, SDL %s renderer,"
+-                    " vsync %s); guest runs on a pthread\n",
+-                    FB_W, FB_H, ri.name, vsync ? "on" : "off");
++    /* The frames through the presenter (Vulkan) when it opens on this
++     * window -- it may already show it, from a page before the game --
++     * else through an SDL renderer. */
++    pr = win && presenter_open(win, vsync);
++    if (pr) {
++        s_pr->set_vsync(vsync);
++        presenter_size();
++        fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u, Vulkan, vsync %s);"
++                " guest runs on a pthread\n", FB_W, FB_H, vsync ? "on" : "off");
++    } else {
++        ren = win ? SDL_CreateRenderer(win, -1,
++                                       vsync ? SDL_RENDERER_PRESENTVSYNC : 0)
++                  : NULL;
++        if (!ren) {
++            fprintf(stderr, "  [FBWIN] SDL window/renderer failed (%s); running headless\n",
++                    SDL_GetError());
++            if (win)
++                SDL_DestroyWindow(win);
++            SDL_QuitSubSystem(FBWIN_SDL_SUBSYSTEMS);
++            return guest_main();
++        }
++        /* The frame is drawn into the largest rectangle of its shown shape
++         * (display_aspect.h) that fits the window, centred, with black
++         * around it -- computed per frame, since a video keeps its own
++         * shape. */
++        {
++            SDL_RendererInfo ri;
++            if (SDL_GetRendererInfo(ren, &ri) == 0)
++                fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u, SDL %s renderer,"
++                        " vsync %s); guest runs on a pthread\n",
++                        FB_W, FB_H, ri.name, vsync ? "on" : "off");
++        }
+     }
+ 
+     s_guest_done_event = SDL_RegisterEvents(2);
+     if (s_guest_done_event == (Uint32)-1) {
+         fprintf(stderr, "  [FBWIN] SDL_RegisterEvents failed; running headless\n");
+-        SDL_DestroyRenderer(ren);
++        if (ren)
++            SDL_DestroyRenderer(ren);
++        if (pr) {
++            s_pr->close();
++            s_pr_open = 0;
++        }
+         SDL_DestroyWindow(win);
+         SDL_QuitSubSystem(FBWIN_SDL_SUBSYSTEMS);
+         return guest_main();
+@@ -685,12 +934,19 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+      * game controllers; the input layer then only reads them. */
+     xbox_InputSetMainPump(1);
+     xbox_InputSdlInit();
++    __atomic_store_n(&s_pr_live, pr, __ATOMIC_RELEASE);
+     s_running = 1;
+     if (!start_guest()) {
+         fprintf(stderr, "  [FBWIN] cannot start the guest thread; running headless\n");
+         s_running = 0;
++        __atomic_store_n(&s_pr_live, 0, __ATOMIC_RELEASE);
+         xbox_InputSetMainPump(0);
+-        SDL_DestroyRenderer(ren);
++        if (ren)
++            SDL_DestroyRenderer(ren);
++        if (pr) {
++            s_pr->close();
++            s_pr_open = 0;
++        }
+         SDL_DestroyWindow(win);
+         SDL_QuitSubSystem(FBWIN_SDL_SUBSYSTEMS);
+         return guest_main();
+@@ -706,7 +962,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+         /* Before the first flip, poll at the display rate: the window then
+          * reads the display surface itself. After, the flip's event wakes
+          * the loop. */
+-        if (SDL_WaitEventTimeout(&ev, shown_seq ? 100 : 16)) {
++        if (SDL_WaitEventTimeout(&ev, shown_seq || s_any_frame ? 100 : 16)) {
+             do {
+                 /* Keys for the pad stand-in, and the window events that
+                  * release them; it only reads the event. */
+@@ -741,9 +997,28 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+         if (gen != applied_gen) {
+             applied_gen = gen;
+             apply_window_settings(win, ren, &vsync);
++            if (pr && s_req_vsync >= 0 && s_req_vsync != vsync) {
++                vsync = s_req_vsync;
++                s_pr->set_vsync(vsync);
++                fprintf(stderr, "  [FBWIN] vsync %s\n", vsync ? "on" : "off");
++            }
+             dirty = 1;
+         }
+ 
++        if (pr) {
++            /* The presenter shows the frames; the display surface until the
++             * first flip, as the GDI window reads it. */
++            if (!__atomic_load_n(&s_any_frame, __ATOMIC_ACQUIRE) && s_fb_va && s_fb_pitch
++                && (s_fb_pitch / FB_W == 2 || s_fb_pitch / FB_W == 4))
++                s_pr->pixels((const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset()),
++                             FB_W, FB_H, s_fb_pitch, s_fb_pitch / FB_W, 0);
++            if (dirty) {
++                dirty = 0;
++                presenter_size();
++            }
++            goto title;
++        }
++
+         pthread_mutex_lock(&s_lock);
+         seq = s_ready_seq;
+         if (seq != shown_seq) {
+@@ -815,12 +1090,12 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+ #endif
+             if (tex)
+                 SDL_RenderCopy(ren, tex, NULL, &dst);
+-            if (s_overlay)
+-                s_overlay(ren, dst.x, dst.y, dst.w, dst.h);
++            draw_overlay(ren, &ov_tex, &ov_w, &ov_h, dst.x, dst.y, dst.w, dst.h);
+             window_shot(ren);
+             SDL_RenderPresent(ren);
+         }
+ 
++    title:
+         now = now_ms();
+         if (now - t_title >= 1000) {
+             uint64_t f = __atomic_load_n(&s_flips, __ATOMIC_RELAXED);
+@@ -848,9 +1123,17 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+      * the game controllers, so with one open SDL stays up and exit()
+      * reclaims it. The main-pump flag stays set, so those threads do not
+      * start calling SDL_GameControllerUpdate while SDL goes down. */
++    __atomic_store_n(&s_pr_live, 0, __ATOMIC_RELEASE);
+     if (tex)
+         SDL_DestroyTexture(tex);
+-    SDL_DestroyRenderer(ren);
++    if (ov_tex)
++        SDL_DestroyTexture(ov_tex);
++    if (ren)
++        SDL_DestroyRenderer(ren);
++    if (pr) {
++        s_pr->close();
++        s_pr_open = 0;
++    }
+     SDL_DestroyWindow(win);
+     if (!xbox_InputAnyOpen())
+         SDL_Quit();
+diff --git a/src/video/video_player.h b/src/video/video_player.h
+index 29d244d..b5a5d11 100644
+--- a/src/video/video_player.h
++++ b/src/video/video_player.h
+@@ -11,6 +11,7 @@
+ #define XBOXRECOMP_VIDEO_PLAYER_H
+ 
+ #include <stdint.h>
++#include <stddef.h>
+ 
+ /* Initialize/shutdown Media Foundation (call once at app start/end) */
+ int  video_init(void);
+@@ -94,11 +95,58 @@ void xbox_WindowApplyTo(void *sdl_window);
+ /* Before xbox_HostWindowMain: use this SDL_Window, already open, for the game
+  * instead of opening one. */
+ void xbox_WindowAdopt(void *sdl_window);
+-/* Called on the window's thread after each frame is drawn into the window and
+- * before it is shown (and before a RECOMP_FB_WINDOW_SHOT image is taken), with
+- * the SDL_Renderer and the frame's rectangle in it: a project draws over the
+- * picture there, a debug readout for example. NULL removes it. */
+-void xbox_WindowSetOverlay(void (*draw)(void *sdl_renderer, int x, int y, int w, int h));
++/* A layer over the picture, a debug readout for example: ARGB8888 pixels,
++ * straight alpha, w x h, shown at window pixel x, y scaled by `scale`. */
++typedef struct XboxOverlay {
++    const uint32_t *px;
++    int w, h, x, y, scale;
++} XboxOverlay;
++/* draw is called before each frame is shown (and before a screenshot is
++ * taken of it), with the frame's rectangle in the window, on whichever
++ * thread shows it; it fills *ov and returns non-zero to show a layer. The
++ * pixels need to last until it is called again. NULL removes it. */
++void xbox_WindowSetOverlay(int (*draw)(int x, int y, int w, int h, XboxOverlay *ov));
++/* The next frame shown, as the player sees it (scaled, with its bars and the
++ * overlay), saved to path as a BMP. Any thread. */
++void xbox_WindowShot(const char *path);
++
++/* What shows the window's frames in place of an SDL renderer, registered by
++ * a back end that has one (vk_window.c: Vulkan). The window uses an SDL
++ * renderer when there is none, or it cannot open. */
++typedef struct XboxPresenter {
++    /* The SDL_CreateWindow flags a window needs for it, 0 when it cannot
++     * run here. */
++    unsigned (*window_flags)(void);
++    /* On the thread that made the window; 0: it cannot show this one. */
++    int  (*open)(void *sdl_window, int vsync);
++    /* On that thread, before the window goes. */
++    void (*close)(void);
++    /* The window's drawable size changed, on its thread. */
++    void (*resized)(int w, int h);
++    void (*set_vsync)(int on);
++    /* A frame from the CPU, from any thread: bpp 2 = R5G6B5, 4 = X8R8G8B8.
++     * own_shape: shown at its own w:h, not at the title's display shape. */
++    void (*pixels)(const void *px, uint32_t w, uint32_t h, uint32_t pitch,
++                   uint32_t bpp, int own_shape);
++} XboxPresenter;
++void xbox_WindowSetPresenter(const XboxPresenter *p);
++/* For a presenter: the overlay for a frame at that rectangle, a screenshot
++ * asked for (its path, then cleared), and the size it showed a title's
++ * frame at (xbox_FramebufferWindowOutputSize). */
++int  xbox_WindowOverlayPixels(int x, int y, int w, int h, XboxOverlay *ov);
++int  xbox_WindowShotPending(char *path, size_t size);
++void xbox_WindowSetOutputSize(int w, int h);
++
++/* A title's own page before the game (a launcher) shows its pictures the way
++ * the game's frames will be: its window made with these flags added, then
++ * opened as a view, each picture (X8R8G8B8, filling the window at its own
++ * shape) shown paced to the display, and the view closed -- keep: the
++ * window goes on to the game (xbox_WindowAdopt) as it is. On the thread that
++ * made the window. */
++unsigned xbox_WindowCreateFlags(void);
++int  xbox_WindowViewOpen(void *sdl_window);
++void xbox_WindowViewShow(const void *px, int w, int h, int pitch);
++void xbox_WindowViewClose(int keep);
+ /* The display's resolutions, largest first, once the window is open (0
+  * before); and the desktop's own size. */
+ int  xbox_WindowResolutions(int (*wh)[2], int max);
+diff --git a/src/vulkan/CMakeLists.txt b/src/vulkan/CMakeLists.txt
+index 7795acb..17e949c 100644
+--- a/src/vulkan/CMakeLists.txt
++++ b/src/vulkan/CMakeLists.txt
+@@ -18,7 +18,7 @@ file(GLOB_RECURSE _vk_includes
+      "${CMAKE_CURRENT_SOURCE_DIR}/shaders/third_party/*.hlsl")
+ foreach(_shader nv2a.vert nv2a.frag nv2a_vsh.vert zeta_pack.vert zeta_pack.frag surf_alias.frag
+                 post_copy.frag smaa_edges.frag smaa_weights.frag smaa_blend.frag
+-                fsr_easu.frag fsr_rcas.frag)
++                fsr_easu.frag fsr_rcas.frag present.vert present.frag)
+     add_custom_command(
+         OUTPUT "${_vk_gen}/${_shader}.inc"
+         COMMAND "${CMAKE_COMMAND}" -E make_directory "${_vk_gen}"
+@@ -80,7 +80,7 @@ else()
+     set(_vk_spirv_found FALSE)
+ endif()
+ 
+-add_library(xbox_nv2a_vk STATIC nv2a_vk.c nv2a_vk_vprog.c ${_vk_spv})
++add_library(xbox_nv2a_vk STATIC nv2a_vk.c nv2a_vk_vprog.c vk_window.c ${_vk_spv})
+ if(XBOXRECOMP_GLSLANG_INCLUDE AND XBOXRECOMP_GLSLANG_LIB AND XBOXRECOMP_GLSLANG_RES_LIB
+    AND _vk_spirv_found)
+     target_include_directories(xbox_nv2a_vk PRIVATE ${XBOXRECOMP_GLSLANG_INCLUDE})
+@@ -100,3 +100,8 @@ target_include_directories(xbox_nv2a_vk
+ target_include_directories(xbox_nv2a_vk PRIVATE
+     $<TARGET_PROPERTY:xbox_kernel,INTERFACE_INCLUDE_DIRECTORIES>)
+ target_link_libraries(xbox_nv2a_vk PUBLIC Vulkan::Vulkan)
++# The window's frames through Vulkan (vk_window.c): an SDL window's surface,
++# shown the way the framebuffer window (src/video) shows its frames.
++find_package(SDL2 REQUIRED)
++target_link_libraries(xbox_nv2a_vk PUBLIC SDL2::SDL2)
++target_include_directories(xbox_nv2a_vk PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../video)
+diff --git a/src/vulkan/nv2a_vk.c b/src/vulkan/nv2a_vk.c
+index 5e0ce2e..c3a075b 100644
+--- a/src/vulkan/nv2a_vk.c
++++ b/src/vulkan/nv2a_vk.c
+@@ -30,6 +30,7 @@
+  */
+ #include "nv2a_vk.h"
+ #include "nv2a_vk_vprog.h"
++#include "vk_window.h"
+ 
+ #include <stdint.h>
+ #include <stdio.h>
+@@ -136,6 +137,16 @@ static VkInstance       s_inst;
+ static VkPhysicalDevice s_phys;
+ static VkDevice         s_dev;
+ static VkQueue          s_queue;
++/* The queue is the window's too (vk_window.c, its own thread): every use of
++ * it under this lock. */
++static mtx_t            s_queue_mtx;
++static void queue_lock(int on)
++{
++    if (on)
++        mtx_lock(&s_queue_mtx);
++    else
++        mtx_unlock(&s_queue_mtx);
++}
+ static uint32_t         s_qfam;
+ static VkCommandPool    s_pool;
+ static VkCommandBuffer  s_cmd;
+@@ -3134,6 +3145,15 @@ static void slot_load(void)
+     s_rv = c->rv; s_ru = c->ru; s_rup = c->rup;
+ }
+ 
++static VkResult queue_submit(const VkSubmitInfo *si)
++{
++    VkResult r;
++    queue_lock(1);
++    r = vkQueueSubmit(s_queue, 1, si, s_fence);
++    queue_lock(0);
++    return r;
++}
++
+ static void soft_flush(void)
+ {
+     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+@@ -3147,7 +3167,7 @@ static void soft_flush(void)
+     vkEndCommandBuffer(s_cmd);
+     si.commandBufferCount = 1;
+     si.pCommandBuffers = &s_cmd;
+-    if (vkQueueSubmit(s_queue, 1, &si, s_fence) != VK_SUCCESS) {
++    if (queue_submit(&si) != VK_SUCCESS) {
+         fprintf(stderr, "[VK] submit failed\n");
+         s_recording = 0;
+         flush();
+@@ -3184,7 +3204,7 @@ static void flush(void)
+     vkEndCommandBuffer(s_cmd);
+     si.commandBufferCount = 1;
+     si.pCommandBuffers = &s_cmd;
+-    if (vkQueueSubmit(s_queue, 1, &si, s_fence) != VK_SUCCESS) {
++    if (queue_submit(&si) != VK_SUCCESS) {
+         fprintf(stderr, "[VK] submit failed\n");
+     } else {
+         wait_fence(&s_fence);
+@@ -4150,6 +4170,74 @@ static uint32_t pres_copy(const Surf *shown, uint32_t *pw, uint32_t *ph)
+     return bpp;
+ }
+ 
++static int fmt_blits(VkFormat f, int linear);
++
++/* The frame for the window as an image (vk_window.c): post-processed, or
++ * the surface's top-left pw x ph as it is, copied on the GPU into the
++ * window's next frame image. 0 when frames do not go that way (no window
++ * shown through Vulkan, or one this surface cannot be copied to): then
++ * through memory (pres_copy). The caller submits, then vkw_publish(). */
++static int window_frame(const Surf *shown, uint32_t pw, uint32_t ph)
++{
++    Img *pp;
++    const Img *src;
++    VkImage dst;
++    int fresh;
++
++    if (!vkw_active())
++        return 0;
++    pp = post_process(shown, pw, ph);
++    src = pp ? pp : &shown->color;
++    if (pp) {
++        pw = pp->w;
++        ph = pp->h;
++    }
++    if (src->fmt != VK_FORMAT_B8G8R8A8_UNORM && !fmt_blits(src->fmt, 0))
++        return 0;
++    dst = vkw_target(pw, ph, &fresh);
++    if (!dst)
++        return 0;
++    end_rendering();
++    if (fresh) {
++        VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
++        b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++        b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
++        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++        b.image = dst;
++        b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++        b.subresourceRange.levelCount = b.subresourceRange.layerCount = 1;
++        vkCmdPipelineBarrier(cmd(), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
++    }
++    /* Also orders this write after the window's last read of the image,
++     * submitted before. */
++    barrier_all();
++    if (src->fmt == VK_FORMAT_B8G8R8A8_UNORM) {
++        VkImageCopy c;
++        memset(&c, 0, sizeof c);
++        c.srcSubresource.aspectMask = c.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++        c.srcSubresource.layerCount = c.dstSubresource.layerCount = 1;
++        c.extent.width = pw;
++        c.extent.height = ph;
++        c.extent.depth = 1;
++        vkCmdCopyImage(cmd(), src->image, VK_IMAGE_LAYOUT_GENERAL, dst,
++                       VK_IMAGE_LAYOUT_GENERAL, 1, &c);
++    } else {
++        VkImageBlit bl;
++        memset(&bl, 0, sizeof bl);
++        bl.srcSubresource.aspectMask = bl.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++        bl.srcSubresource.layerCount = bl.dstSubresource.layerCount = 1;
++        bl.srcOffsets[1].x = bl.dstOffsets[1].x = (int32_t)pw;
++        bl.srcOffsets[1].y = bl.dstOffsets[1].y = (int32_t)ph;
++        bl.srcOffsets[1].z = bl.dstOffsets[1].z = 1;
++        vkCmdBlitImage(cmd(), src->image, VK_IMAGE_LAYOUT_GENERAL, dst,
++                       VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_NEAREST);
++    }
++    barrier_all();
++    return 1;
++}
++
+ static void vk_resolve(uint32_t va)
+ {
+     extern void xbox_FramebufferWindowPresentPixels(uint32_t, const void *, uint32_t,
+@@ -4157,7 +4245,7 @@ static void vk_resolve(uint32_t va)
+     static int shown_only = -1;
+     Surf *shown = NULL;
+     uint32_t pw = 0, ph = 0, bpp = 0;
+-    int i, any = 0;
++    int i, any = 0, to_window = 0;
+ 
+     if (shown_only < 0) {
+         const char *e = getenv("RECOMP_VK_RESOLVE");
+@@ -4169,7 +4257,8 @@ static void vk_resolve(uint32_t va)
+             surf_queue_readback(s);
+             any = 1;
+         }
+-        if (s->color.image && s->va == va && (s->sc > 1 || s_smaa_req || s_fsr_req)
++        if (s->color.image && s->va == va
++            && (s->sc > 1 || s_smaa_req || s_fsr_req || vkw_active())
+             && (!shown || s->last_use > shown->last_use))
+             shown = s;
+     }
+@@ -4181,18 +4270,30 @@ static void vk_resolve(uint32_t va)
+         xbox_FramebufferWindowClaimFlip(va);
+         shown = NULL;
+     }
+-    /* The window shows the top-left 640x480 of the surface. */
++    /* The window shows the top-left 640x480 of the surface: straight from
++     * the GPU when it shows frames through Vulkan, else read back. */
+     if (shown) {
+         pw = (shown->w < 640 ? shown->w : 640) * shown->sc;
+         ph = (shown->h < 480 ? shown->h : 480) * shown->sc;
+-        bpp = pres_copy(shown, &pw, &ph);
+-        if (bpp)
++        if (window_frame(shown, pw, ph)) {
++            extern void xbox_FramebufferWindowClaimFlip(uint32_t);
++            to_window = 1;
++            xbox_FramebufferWindowClaimFlip(va);
++            shown = NULL;
++        } else if ((bpp = pres_copy(shown, &pw, &ph)) != 0) {
+             any = 1;
+-        else
++        } else {
+             shown = NULL;
++        }
+     }
++    /* Guest memory is waited for; a frame for the window only needs its
++     * commands submitted ahead of the window's. */
+     if (any)
+         flush();
++    else if (to_window)
++        soft_flush();
++    if (to_window)
++        vkw_publish();
+     if (shown)
+         xbox_FramebufferWindowPresentPixels(va, s_pres.map, pw, ph, pw * bpp, bpp);
+ }
+@@ -4839,6 +4940,11 @@ static void replay_present(uint32_t va)
+         return;
+     pw = (shown->w < 640 ? shown->w : 640) * shown->sc;
+     ph = (shown->h < 480 ? shown->h : 480) * shown->sc;
++    if (window_frame(shown, pw, ph)) {
++        soft_flush();
++        vkw_publish();
++        return;
++    }
+     bpp = pres_copy(shown, &pw, &ph);
+     if (!bpp)
+         return;
+@@ -5028,38 +5134,9 @@ static int has_ext(const VkExtensionProperties *e, uint32_t n, const char *name)
+ 
+ static int create_instance(void)
+ {
+-    VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
+-    VkInstanceCreateInfo ci = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+-    VkExtensionProperties *ext;
+-    const char *exts[2], *layer = "VK_LAYER_KHRONOS_validation";
+-    uint32_t n = 0, ne = 0;
+-
+-    app.pApplicationName = "xboxrecomp";
+-    app.apiVersion = VK_API_VERSION_1_3;
+-    ci.pApplicationInfo = &app;
+-    vkEnumerateInstanceExtensionProperties(NULL, &n, NULL);
+-    ext = (VkExtensionProperties *)calloc(n ? n : 1, sizeof *ext);
+-    if (!ext)
+-        return 0;
+-    vkEnumerateInstanceExtensionProperties(NULL, &n, ext);
+-    /* MoltenVK is a portability implementation: listed only when asked. */
+-    if (has_ext(ext, n, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+-        exts[ne++] = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+-        ci.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+-    }
+-    free(ext);
+-    ci.enabledExtensionCount = ne;
+-    ci.ppEnabledExtensionNames = exts;
+-    if (getenv("RECOMP_VK_VALIDATE")) {
+-        ci.enabledLayerCount = 1;
+-        ci.ppEnabledLayerNames = &layer;
+-        if (vkCreateInstance(&ci, NULL, &s_inst) == VK_SUCCESS)
+-            return 1;
+-        fprintf(stderr, "[VK] no validation layer (%s); going on without\n", layer);
+-        ci.enabledLayerCount = 0;
+-    }
+-    VK_CHECK(vkCreateInstance(&ci, NULL, &s_inst));
+-    return 1;
++    /* The window's surface comes from the same instance (vk_window.c). */
++    s_inst = vkw_instance();
++    return s_inst != VK_NULL_HANDLE;
+ }
+ 
+ static int pick_device(void)
+@@ -5085,6 +5162,21 @@ static int pick_device(void)
+             continue;
+         score = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 3
+               : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2 : 1;
++        /* One that shows in the window first (vk_window.c), on a graphics
++         * queue family that presents there. */
++        if (vkw_surface()) {
++            uint32_t g;
++            for (g = k; g < nq; g++) {
++                VkBool32 ok = VK_FALSE;
++                if ((q[g].queueFlags & VK_QUEUE_GRAPHICS_BIT)
++                    && vkGetPhysicalDeviceSurfaceSupportKHR(devs[i], g, vkw_surface(), &ok)
++                       == VK_SUCCESS && ok) {
++                    k = g;
++                    score += 4;
++                    break;
++                }
++            }
++        }
+         if (score > best_score) {
+             best_score = score;
+             best = i;
+@@ -5117,7 +5209,7 @@ static int create_device(void)
+     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT hgpl = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT };
+     VkExtensionProperties ext[512];
+     uint32_t n = 512;
+-    const char *exts[4], *e = getenv("RECOMP_VK_GPL");
++    const char *exts[6], *e = getenv("RECOMP_VK_GPL");
+     uint32_t ne = 0;
+ 
+     h12.pNext = &hgpl;
+@@ -5138,6 +5230,9 @@ static int create_device(void)
+     exts[ne++] = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
+     if (has_ext(ext, n, "VK_KHR_portability_subset"))
+         exts[ne++] = "VK_KHR_portability_subset";
++    /* The window's swapchain (vk_window.c). */
++    if (has_ext(ext, n, VK_KHR_SWAPCHAIN_EXTENSION_NAME))
++        exts[ne++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+     s_gpl = hgpl.graphicsPipelineLibrary && !(e && e[0] == '0')
+          && has_ext(ext, n, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME)
+          && has_ext(ext, n, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+@@ -5394,7 +5489,8 @@ int nv2a_vk_install(void)
+         s_vprog_on = 0;
+     if ((e = getenv("RECOMP_VK_SUBMIT_DRAWS")))
+         s_submit_draws = (uint32_t)strtoul(e, NULL, 0);
+-    if (mtx_init(&s_pipe_mtx, mtx_plain) != thrd_success)
++    if (mtx_init(&s_pipe_mtx, mtx_plain) != thrd_success
++        || mtx_init(&s_queue_mtx, mtx_plain) != thrd_success)
+         return 0;
+     if (!create_instance() || !pick_device() || !create_device()
+         || !pick_depth_format() || !create_objects()) {
+@@ -5424,6 +5520,7 @@ int nv2a_vk_install(void)
+         pl_load(e);
+     jobs_start();
+     nv2a_backend_register(&s_backend);
++    vkw_attach(s_phys, s_dev, s_qfam, s_queue, queue_lock);
+     fprintf(stderr, "[VK] rendering on the GPU (depth format %d, vertex programs on the %s,"
+             " pipeline libraries %s, scale %ux)\n", (int)s_depth_fmt,
+             s_backend.draw_program ? "GPU" : "CPU", s_gpl ? "on" : "off", s_scale);
+diff --git a/src/vulkan/nv2a_vk.h b/src/vulkan/nv2a_vk.h
+index 9da020b..996e042 100644
+--- a/src/vulkan/nv2a_vk.h
++++ b/src/vulkan/nv2a_vk.h
+@@ -45,6 +45,13 @@ extern "C" {
+  * title starts submitting work. */
+ int nv2a_vk_install(void);
+ 
++/* The framebuffer window shows its frames through Vulkan (vk_window.c):
++ * the renderer's straight from the GPU, the CPU's uploaded, on a surface
++ * and swapchain of the window's own, instead of through an SDL renderer.
++ * Call before the window opens (and before a page the title shows ahead of
++ * the game, xbox_WindowViewOpen); RECOMP_PRESENT=sdl keeps the SDL one. */
++void nv2a_vk_window_install(void);
++
+ /* Render at scale x 640x480 (1..10): every surface the title draws into is
+  * kept at that size on the GPU, guest memory still gets it at its own size,
+  * and the framebuffer window is handed the frame at the larger size. Takes
+diff --git a/src/vulkan/shaders/present.frag b/src/vulkan/shaders/present.frag
+new file mode 100644
+index 0000000..8c12f10
+--- /dev/null
++++ b/src/vulkan/shaders/present.frag
+@@ -0,0 +1,14 @@
++#version 450
++/* A frame, or the overlay over it, into the window (vk_window.c). A frame's
++ * alpha is whatever the surface held: it is shown opaque. */
++
++layout(set = 0, binding = 0) uniform sampler2D u_src;
++layout(push_constant) uniform Pc { float opaque; } pc;
++layout(location = 0) in vec2 v_uv;
++layout(location = 0) out vec4 o_color;
++
++void main()
++{
++    vec4 c = texture(u_src, v_uv);
++    o_color = pc.opaque > 0.5 ? vec4(c.rgb, 1.0) : c;
++}
+diff --git a/src/vulkan/shaders/present.vert b/src/vulkan/shaders/present.vert
+new file mode 100644
+index 0000000..12a434f
+--- /dev/null
++++ b/src/vulkan/shaders/present.vert
+@@ -0,0 +1,12 @@
++#version 450
++/* One triangle over the viewport, which is where the image goes in the
++ * window (vk_window.c); v_uv runs 0..1 across it. */
++
++layout(location = 0) out vec2 v_uv;
++
++void main()
++{
++    vec2 p = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);
++    v_uv = p;
++    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
++}
+diff --git a/src/vulkan/vk_window.c b/src/vulkan/vk_window.c
+new file mode 100644
+index 0000000..0865c3d
+--- /dev/null
++++ b/src/vulkan/vk_window.c
+@@ -0,0 +1,1381 @@
++/*
++ * The framebuffer window's frames through Vulkan.
++ *
++ * The window (fb_present_sdl.c) used to show every frame with an SDL
++ * renderer: the renderer (nv2a_vk.c) drew the frame on the GPU, read it back
++ * into memory, and SDL uploaded it again to OpenGL to show it -- a copy each
++ * way per frame, at 4K 33 MB each, with the GPU waited for in between, and a
++ * window no Vulkan overlay (MangoHud, the Steam overlay's Vulkan side) could
++ * see, since nothing was ever presented through Vulkan.
++ *
++ * Here the window gets a Vulkan surface and swapchain instead. Frames come
++ * two ways:
++ *
++ *   the renderer's   an image on its device (vkw_target): the frame shown,
++ *                    post-processed, copied on the GPU into one of three
++ *                    images, and shown from there -- nothing goes through
++ *                    memory;
++ *   the CPU's        pixels (XboxPresenter.pixels): the launcher's page, the
++ *                    pipeline build's picture, the CPU rasteriser's frames,
++ *                    the display surface before the first flip; uploaded.
++ *
++ * A thread of its own shows them, the latest of either, letterboxed to the
++ * frame's shape on black, with the window's overlay over it; it waits on the
++ * swapchain (vsync) while the renderer goes on, and a frame that is not
++ * shown in time is replaced by the next, as the SDL window's three slots
++ * did. Before the renderer's device is there (the launcher runs before the
++ * game) the window shows the CPU's frames on a small device of its own,
++ * which goes when the renderer's takes over.
++ *
++ * Both images and pixels use three slots, one each for the writer, the
++ * frame ready and the frame shown, swapped under a mutex. The renderer's
++ * image slot is written by commands it submits after the present thread's
++ * last use of it was submitted (the swaps order them), on the same queue,
++ * behind full barriers: queue order is all the synchronisation they need.
++ *
++ * Off with RECOMP_PRESENT=sdl (the SDL renderer, as before).
++ */
++#include <SDL.h>
++#include <SDL_vulkan.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "display_aspect.h"
++#include "video_player.h"
++#include "vk_window.h"
++
++static const uint32_t k_present_vert[] =
++#include "present.vert.inc"
++;
++static const uint32_t k_present_frag[] =
++#include "present.frag.inc"
++;
++
++#define NFR 2           /* frames in flight */
++#define MAX_IMG 8       /* swapchain images */
++
++typedef struct {
++    VkImage image;
++    VkDeviceMemory mem;
++    VkImageView view;
++    uint32_t w, h;
++} VImg;
++
++typedef struct {
++    VkBuffer buf;
++    VkDeviceMemory mem;
++    void *map;
++    VkDeviceSize size;
++} VBuf;
++
++typedef struct {
++    uint8_t *px;            /* X8R8G8B8, w * 4 per row */
++    size_t cap;
++    uint32_t w, h;
++    int own_shape;
++} CpuFrame;
++
++typedef struct {
++    VkCommandBuffer cb;
++    VkFence fence;
++    VkSemaphore acquired;
++    VkDescriptorSet set[2]; /* the frame, the overlay */
++    VBuf up;                /* uploads: CPU frame, overlay */
++} Frame;
++
++static struct {
++    int inst_state;         /* 0 not tried, 1 made, -1 none */
++    VkInstance inst;
++
++    SDL_Window *win;
++    VkSurfaceKHR surf;
++    SDL_Thread *thread;
++    SDL_mutex *m;           /* everything below shared with the thread */
++    SDL_cond *c;
++    SDL_mutex *wm;          /* one CPU frame writer at a time */
++    int quit, redraw, vsync, dw, dh;
++
++    CpuFrame cpu[3];
++    int cb, cr, cf;
++    uint64_t cpu_seq, cpu_taken;
++    VImg gpu[3];            /* on the renderer's device */
++    int gb, gr, gf;
++    uint64_t gpu_seq, gpu_taken;
++    uint64_t stamp, cpu_stamp, gpu_stamp;
++
++    /* The renderer's device, as offered; usable: it can present here. */
++    int offered, usable;
++    VkPhysicalDevice o_phys;
++    VkDevice o_dev;
++    uint32_t o_qfam;
++    VkQueue o_q;
++    void (*o_lock)(int);
++    VkPhysicalDeviceMemoryProperties o_memp;
++
++    /* The present thread's own from here on. */
++    int attached;           /* showing on the renderer's device */
++    VkPhysicalDevice phys;
++    VkDevice dev;
++    uint32_t qfam;
++    VkQueue q;
++    void (*qlock)(int);
++    VkPhysicalDeviceMemoryProperties memp;
++    int ready;              /* the objects below exist */
++    VkCommandPool pool;
++    Frame fr[NFR];
++    int fi;
++    VkSampler lin, near;
++    VkDescriptorSetLayout dsl;
++    VkPipelineLayout pl;
++    VkDescriptorPool dpool;
++    VkPipeline pipe[2];     /* opaque, blended */
++    VkFormat pipe_fmt;
++    VImg cpu_img, ov_img;
++    int cpu_have, cpu_shape, src_gpu, reupload;
++    VBuf shot;
++
++    VkSwapchainKHR sc;
++    VkFormat fmt;
++    VkExtent2D ext;
++    VkImageUsageFlags usage;
++    uint32_t nimg;
++    VkImage imgs[MAX_IMG];
++    VkImageView views[MAX_IMG];
++    VkSemaphore done[MAX_IMG];
++    int sc_bad, sc_vsync;
++} V;
++
++static void no_lock(int on) { (void)on; }
++
++/* ── The instance ─────────────────────────────────────────────────────── */
++
++static int has_ext(const VkExtensionProperties *e, uint32_t n, const char *name)
++{
++    uint32_t i;
++    for (i = 0; i < n; i++)
++        if (!strcmp(e[i].extensionName, name))
++            return 1;
++    return 0;
++}
++
++VkInstance vkw_instance(void)
++{
++    static const char *const want[] = {
++        "VK_KHR_surface", "VK_KHR_xlib_surface", "VK_KHR_xcb_surface",
++        "VK_KHR_wayland_surface", "VK_KHR_win32_surface", "VK_EXT_metal_surface",
++        "VK_MVK_macos_surface", "VK_EXT_headless_surface",
++        /* What a layer's VK_EXT_swapchain_maintenance1 needs (gamescope's
++         * forces it on). */
++        "VK_KHR_get_surface_capabilities2", "VK_EXT_surface_maintenance1",
++        VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME,
++    };
++    VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
++    VkInstanceCreateInfo ci = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
++    VkExtensionProperties *ext;
++    const char *exts[16], *layer = "VK_LAYER_KHRONOS_validation";
++    uint32_t n = 0, ne = 0, i;
++
++    if (V.inst_state)
++        return V.inst_state > 0 ? V.inst : VK_NULL_HANDLE;
++    V.inst_state = -1;
++    app.pApplicationName = "xboxrecomp";
++    app.apiVersion = VK_API_VERSION_1_3;
++    ci.pApplicationInfo = &app;
++    if (vkEnumerateInstanceExtensionProperties(NULL, &n, NULL) != VK_SUCCESS)
++        return VK_NULL_HANDLE;
++    ext = (VkExtensionProperties *)calloc(n ? n : 1, sizeof *ext);
++    if (!ext)
++        return VK_NULL_HANDLE;
++    vkEnumerateInstanceExtensionProperties(NULL, &n, ext);
++    for (i = 0; i < sizeof want / sizeof *want; i++)
++        if (has_ext(ext, n, want[i]))
++            exts[ne++] = want[i];
++    /* MoltenVK is a portability implementation: listed only when asked. */
++    if (has_ext(ext, n, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME))
++        ci.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
++    free(ext);
++    ci.enabledExtensionCount = ne;
++    ci.ppEnabledExtensionNames = exts;
++    if (getenv("RECOMP_VK_VALIDATE")) {
++        ci.enabledLayerCount = 1;
++        ci.ppEnabledLayerNames = &layer;
++        if (vkCreateInstance(&ci, NULL, &V.inst) == VK_SUCCESS) {
++            V.inst_state = 1;
++            return V.inst;
++        }
++        fprintf(stderr, "[VK] no validation layer (%s); going on without\n", layer);
++        ci.enabledLayerCount = 0;
++    }
++    if (vkCreateInstance(&ci, NULL, &V.inst) != VK_SUCCESS)
++        return VK_NULL_HANDLE;
++    V.inst_state = 1;
++    return V.inst;
++}
++
++VkSurfaceKHR vkw_surface(void)
++{
++    return V.surf;
++}
++
++/* ── Memory ───────────────────────────────────────────────────────────── */
++
++static uint32_t mem_type(const VkPhysicalDeviceMemoryProperties *mp, uint32_t bits,
++                         VkMemoryPropertyFlags want)
++{
++    uint32_t i;
++    for (i = 0; i < mp->memoryTypeCount; i++)
++        if ((bits & (1u << i)) && (mp->memoryTypes[i].propertyFlags & want) == want)
++            return i;
++    return UINT32_MAX;
++}
++
++static int img_make(VkDevice dev, const VkPhysicalDeviceMemoryProperties *mp, VImg *im,
++                    uint32_t w, uint32_t h, VkImageUsageFlags usage)
++{
++    VkImageCreateInfo ii = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
++    VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
++    VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
++    VkMemoryRequirements mr;
++
++    memset(im, 0, sizeof *im);
++    ii.imageType = VK_IMAGE_TYPE_2D;
++    ii.format = VK_FORMAT_B8G8R8A8_UNORM;
++    ii.extent.width = w;
++    ii.extent.height = h;
++    ii.extent.depth = 1;
++    ii.mipLevels = ii.arrayLayers = 1;
++    ii.samples = VK_SAMPLE_COUNT_1_BIT;
++    ii.tiling = VK_IMAGE_TILING_OPTIMAL;
++    ii.usage = usage;
++    ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    if (vkCreateImage(dev, &ii, NULL, &im->image) != VK_SUCCESS)
++        return 0;
++    vkGetImageMemoryRequirements(dev, im->image, &mr);
++    ai.allocationSize = mr.size;
++    ai.memoryTypeIndex = mem_type(mp, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++    if (ai.memoryTypeIndex == UINT32_MAX)
++        ai.memoryTypeIndex = mem_type(mp, mr.memoryTypeBits, 0);
++    if (vkAllocateMemory(dev, &ai, NULL, &im->mem) != VK_SUCCESS) {
++        vkDestroyImage(dev, im->image, NULL);
++        im->image = VK_NULL_HANDLE;
++        return 0;
++    }
++    vkBindImageMemory(dev, im->image, im->mem, 0);
++    vi.image = im->image;
++    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
++    vi.format = ii.format;
++    vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    vi.subresourceRange.levelCount = vi.subresourceRange.layerCount = 1;
++    if (vkCreateImageView(dev, &vi, NULL, &im->view) != VK_SUCCESS) {
++        vkDestroyImage(dev, im->image, NULL);
++        vkFreeMemory(dev, im->mem, NULL);
++        memset(im, 0, sizeof *im);
++        return 0;
++    }
++    im->w = w;
++    im->h = h;
++    return 1;
++}
++
++static void img_free(VkDevice dev, VImg *im)
++{
++    if (im->view)
++        vkDestroyImageView(dev, im->view, NULL);
++    if (im->image)
++        vkDestroyImage(dev, im->image, NULL);
++    if (im->mem)
++        vkFreeMemory(dev, im->mem, NULL);
++    memset(im, 0, sizeof *im);
++}
++
++static int buf_make(VBuf *b, VkDeviceSize size, VkBufferUsageFlags usage)
++{
++    VkBufferCreateInfo bi = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
++    VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
++    VkMemoryRequirements mr;
++
++    memset(b, 0, sizeof *b);
++    bi.size = size;
++    bi.usage = usage;
++    if (vkCreateBuffer(V.dev, &bi, NULL, &b->buf) != VK_SUCCESS)
++        return 0;
++    vkGetBufferMemoryRequirements(V.dev, b->buf, &mr);
++    ai.allocationSize = mr.size;
++    ai.memoryTypeIndex = mem_type(&V.memp, mr.memoryTypeBits,
++                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
++                                  | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
++                                  | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
++    if (ai.memoryTypeIndex == UINT32_MAX)
++        ai.memoryTypeIndex = mem_type(&V.memp, mr.memoryTypeBits,
++                                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
++                                      | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++    if (ai.memoryTypeIndex == UINT32_MAX
++        || vkAllocateMemory(V.dev, &ai, NULL, &b->mem) != VK_SUCCESS) {
++        vkDestroyBuffer(V.dev, b->buf, NULL);
++        memset(b, 0, sizeof *b);
++        return 0;
++    }
++    vkBindBufferMemory(V.dev, b->buf, b->mem, 0);
++    if (vkMapMemory(V.dev, b->mem, 0, VK_WHOLE_SIZE, 0, &b->map) != VK_SUCCESS) {
++        vkDestroyBuffer(V.dev, b->buf, NULL);
++        vkFreeMemory(V.dev, b->mem, NULL);
++        memset(b, 0, sizeof *b);
++        return 0;
++    }
++    b->size = size;
++    return 1;
++}
++
++static void buf_free(VBuf *b)
++{
++    if (b->buf)
++        vkDestroyBuffer(V.dev, b->buf, NULL);
++    if (b->mem)
++        vkFreeMemory(V.dev, b->mem, NULL);
++    memset(b, 0, sizeof *b);
++}
++
++static void wait_idle(void)
++{
++    if (!V.dev)
++        return;
++    V.qlock(1);
++    vkQueueWaitIdle(V.q);
++    V.qlock(0);
++}
++
++/* ── The device: the renderer's, or one of the window's own ──────────── */
++
++/* A device of the window's own, for the CPU's frames until the renderer's
++ * is there: a graphics queue that presents here, Vulkan 1.3. */
++static int own_device(void)
++{
++    VkPhysicalDevice devs[16];
++    uint32_t n = 16, i, k, best = UINT32_MAX, bq = 0;
++    int best_score = -1;
++    float prio = 1.0f;
++    VkDeviceQueueCreateInfo qi = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
++    VkPhysicalDeviceVulkan13Features f13 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
++    VkPhysicalDeviceFeatures2 f2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
++    VkDeviceCreateInfo ci = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
++    VkExtensionProperties ext[512];
++    const char *exts[2];
++    uint32_t ne = 0, nx = 512;
++
++    if (vkEnumeratePhysicalDevices(V.inst, &n, devs) < 0 || !n)
++        return 0;
++    for (i = 0; i < n; i++) {
++        VkPhysicalDeviceProperties p;
++        VkQueueFamilyProperties q[16];
++        uint32_t nq = 16;
++        int score;
++        vkGetPhysicalDeviceProperties(devs[i], &p);
++        if (p.apiVersion < VK_API_VERSION_1_3)
++            continue;
++        vkGetPhysicalDeviceQueueFamilyProperties(devs[i], &nq, q);
++        for (k = 0; k < nq; k++) {
++            VkBool32 ok = VK_FALSE;
++            if ((q[k].queueFlags & VK_QUEUE_GRAPHICS_BIT)
++                && vkGetPhysicalDeviceSurfaceSupportKHR(devs[i], k, V.surf, &ok) == VK_SUCCESS
++                && ok)
++                break;
++        }
++        if (k == nq)
++            continue;
++        score = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 3
++              : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2 : 1;
++        if (score > best_score) {
++            best_score = score;
++            best = i;
++            bq = k;
++        }
++    }
++    if (best == UINT32_MAX)
++        return 0;
++    if (vkEnumerateDeviceExtensionProperties(devs[best], NULL, &nx, ext) < 0
++        || !has_ext(ext, nx, VK_KHR_SWAPCHAIN_EXTENSION_NAME))
++        return 0;
++    exts[ne++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
++    if (has_ext(ext, nx, "VK_KHR_portability_subset"))
++        exts[ne++] = "VK_KHR_portability_subset";
++    f13.dynamicRendering = VK_TRUE;
++    f2.pNext = &f13;
++    qi.queueFamilyIndex = bq;
++    qi.queueCount = 1;
++    qi.pQueuePriorities = &prio;
++    ci.pNext = &f2;
++    ci.queueCreateInfoCount = 1;
++    ci.pQueueCreateInfos = &qi;
++    ci.enabledExtensionCount = ne;
++    ci.ppEnabledExtensionNames = exts;
++    if (vkCreateDevice(devs[best], &ci, NULL, &V.dev) != VK_SUCCESS) {
++        V.dev = VK_NULL_HANDLE;
++        return 0;
++    }
++    V.phys = devs[best];
++    V.qfam = bq;
++    vkGetDeviceQueue(V.dev, bq, 0, &V.q);
++    V.qlock = no_lock;
++    vkGetPhysicalDeviceMemoryProperties(V.phys, &V.memp);
++    return 1;
++}
++
++static VkPipeline make_pipeline(VkFormat cf, int blend)
++{
++    VkShaderModuleCreateInfo sm = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
++    VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
++    VkPipelineShaderStageCreateInfo st[2];
++    VkPipelineVertexInputStateCreateInfo vin = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
++    VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
++    VkPipelineViewportStateCreateInfo vp = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
++    VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
++    VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
++    VkPipelineColorBlendAttachmentState cba;
++    VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
++    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
++    VkPipelineDynamicStateCreateInfo ds = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
++    VkPipelineRenderingCreateInfo ri = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
++    VkGraphicsPipelineCreateInfo gi = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
++    VkPipeline pipe = VK_NULL_HANDLE;
++
++    sm.codeSize = sizeof k_present_vert;
++    sm.pCode = k_present_vert;
++    if (vkCreateShaderModule(V.dev, &sm, NULL, &vs) != VK_SUCCESS)
++        return VK_NULL_HANDLE;
++    sm.codeSize = sizeof k_present_frag;
++    sm.pCode = k_present_frag;
++    if (vkCreateShaderModule(V.dev, &sm, NULL, &fs) != VK_SUCCESS) {
++        vkDestroyShaderModule(V.dev, vs, NULL);
++        return VK_NULL_HANDLE;
++    }
++    memset(st, 0, sizeof st);
++    st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++    st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
++    st[0].module = vs;
++    st[0].pName = "main";
++    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++    st[1].module = fs;
++    st[1].pName = "main";
++    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++    vp.viewportCount = vp.scissorCount = 1;
++    rs.polygonMode = VK_POLYGON_MODE_FILL;
++    rs.cullMode = VK_CULL_MODE_NONE;
++    rs.lineWidth = 1.0f;
++    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++    memset(&cba, 0, sizeof cba);
++    /* The window's alpha stays 1: a screenshot of it is opaque. */
++    cba.colorWriteMask = blend ? 0x7 : 0xF;
++    if (blend) {
++        cba.blendEnable = VK_TRUE;
++        cba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
++        cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
++        cba.colorBlendOp = VK_BLEND_OP_ADD;
++        cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
++        cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
++        cba.alphaBlendOp = VK_BLEND_OP_ADD;
++    }
++    cb.attachmentCount = 1;
++    cb.pAttachments = &cba;
++    ds.dynamicStateCount = 2;
++    ds.pDynamicStates = dyn;
++    ri.colorAttachmentCount = 1;
++    ri.pColorAttachmentFormats = &cf;
++    gi.pNext = &ri;
++    gi.stageCount = 2;
++    gi.pStages = st;
++    gi.pVertexInputState = &vin;
++    gi.pInputAssemblyState = &ia;
++    gi.pViewportState = &vp;
++    gi.pRasterizationState = &rs;
++    gi.pMultisampleState = &ms;
++    gi.pColorBlendState = &cb;
++    gi.pDynamicState = &ds;
++    gi.layout = V.pl;
++    if (vkCreateGraphicsPipelines(V.dev, VK_NULL_HANDLE, 1, &gi, NULL, &pipe) != VK_SUCCESS)
++        pipe = VK_NULL_HANDLE;
++    vkDestroyShaderModule(V.dev, vs, NULL);
++    vkDestroyShaderModule(V.dev, fs, NULL);
++    return pipe;
++}
++
++static void destroy_swapchain(void)
++{
++    uint32_t i;
++    for (i = 0; i < V.nimg; i++)
++        if (V.views[i])
++            vkDestroyImageView(V.dev, V.views[i], NULL);
++    memset(V.views, 0, sizeof V.views);
++    V.nimg = 0;
++    if (V.sc)
++        vkDestroySwapchainKHR(V.dev, V.sc, NULL);
++    V.sc = VK_NULL_HANDLE;
++}
++
++/* Everything on the device in use, and the device if it is the window's. */
++static void drop_device(void)
++{
++    int i;
++
++    if (!V.dev)
++        return;
++    wait_idle();
++    destroy_swapchain();
++    for (i = 0; i < MAX_IMG; i++)
++        if (V.done[i])
++            vkDestroySemaphore(V.dev, V.done[i], NULL);
++    memset(V.done, 0, sizeof V.done);
++    if (V.ready) {
++        for (i = 0; i < NFR; i++) {
++            vkDestroyFence(V.dev, V.fr[i].fence, NULL);
++            vkDestroySemaphore(V.dev, V.fr[i].acquired, NULL);
++            buf_free(&V.fr[i].up);
++        }
++        memset(V.fr, 0, sizeof V.fr);
++        for (i = 0; i < 2; i++)
++            if (V.pipe[i])
++                vkDestroyPipeline(V.dev, V.pipe[i], NULL);
++        memset(V.pipe, 0, sizeof V.pipe);
++        V.pipe_fmt = VK_FORMAT_UNDEFINED;
++        vkDestroyDescriptorPool(V.dev, V.dpool, NULL);
++        vkDestroyPipelineLayout(V.dev, V.pl, NULL);
++        vkDestroyDescriptorSetLayout(V.dev, V.dsl, NULL);
++        vkDestroySampler(V.dev, V.lin, NULL);
++        vkDestroySampler(V.dev, V.near, NULL);
++        vkDestroyCommandPool(V.dev, V.pool, NULL);
++        img_free(V.dev, &V.cpu_img);
++        img_free(V.dev, &V.ov_img);
++        buf_free(&V.shot);
++        V.ready = 0;
++    }
++    if (!V.attached)
++        vkDestroyDevice(V.dev, NULL);
++    V.dev = VK_NULL_HANDLE;
++    V.cpu_have = 0;
++}
++
++/* The objects every frame uses, on V.dev. */
++static int make_objects(void)
++{
++    VkCommandPoolCreateInfo pi = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
++    VkCommandBufferAllocateInfo ca = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
++    VkFenceCreateInfo fi = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
++    VkSemaphoreCreateInfo si = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
++    VkSamplerCreateInfo sa = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
++    VkDescriptorSetLayoutBinding b;
++    VkDescriptorSetLayoutCreateInfo dl = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
++    VkPushConstantRange pcr = { VK_SHADER_STAGE_FRAGMENT_BIT, 0, 4 };
++    VkPipelineLayoutCreateInfo pl = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
++    VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * NFR };
++    VkDescriptorPoolCreateInfo dp = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
++    VkDescriptorSetAllocateInfo da = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
++    VkDescriptorSetLayout layouts[2];
++    int i;
++
++    pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
++    pi.queueFamilyIndex = V.qfam;
++    if (vkCreateCommandPool(V.dev, &pi, NULL, &V.pool) != VK_SUCCESS)
++        return 0;
++    sa.magFilter = sa.minFilter = VK_FILTER_LINEAR;
++    sa.addressModeU = sa.addressModeV = sa.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    vkCreateSampler(V.dev, &sa, NULL, &V.lin);
++    sa.magFilter = sa.minFilter = VK_FILTER_NEAREST;
++    vkCreateSampler(V.dev, &sa, NULL, &V.near);
++    memset(&b, 0, sizeof b);
++    b.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
++    b.descriptorCount = 1;
++    b.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
++    dl.bindingCount = 1;
++    dl.pBindings = &b;
++    vkCreateDescriptorSetLayout(V.dev, &dl, NULL, &V.dsl);
++    pl.setLayoutCount = 1;
++    pl.pSetLayouts = &V.dsl;
++    pl.pushConstantRangeCount = 1;
++    pl.pPushConstantRanges = &pcr;
++    vkCreatePipelineLayout(V.dev, &pl, NULL, &V.pl);
++    dp.maxSets = 2 * NFR;
++    dp.poolSizeCount = 1;
++    dp.pPoolSizes = &ps;
++    vkCreateDescriptorPool(V.dev, &dp, NULL, &V.dpool);
++    layouts[0] = layouts[1] = V.dsl;
++    ca.commandPool = V.pool;
++    ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++    ca.commandBufferCount = 1;
++    fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
++    da.descriptorPool = V.dpool;
++    da.descriptorSetCount = 2;
++    da.pSetLayouts = layouts;
++    for (i = 0; i < NFR; i++) {
++        if (vkAllocateCommandBuffers(V.dev, &ca, &V.fr[i].cb) != VK_SUCCESS
++            || vkCreateFence(V.dev, &fi, NULL, &V.fr[i].fence) != VK_SUCCESS
++            || vkCreateSemaphore(V.dev, &si, NULL, &V.fr[i].acquired) != VK_SUCCESS
++            || vkAllocateDescriptorSets(V.dev, &da, V.fr[i].set) != VK_SUCCESS)
++            return 0;
++    }
++    for (i = 0; i < MAX_IMG; i++)
++        vkCreateSemaphore(V.dev, &si, NULL, &V.done[i]);
++    V.ready = 1;
++    V.sc_bad = 1;
++    return 1;
++}
++
++/* The renderer's device, when it was offered and the window is not on it
++ * yet; else the window's own, when there is no device at all. */
++static int device_ready(void)
++{
++    int offered;
++
++    SDL_LockMutex(V.m);
++    offered = V.usable && !V.attached;
++    SDL_UnlockMutex(V.m);
++    if (offered) {
++        drop_device();
++        V.attached = 1;
++        V.phys = V.o_phys;
++        V.dev = V.o_dev;
++        V.qfam = V.o_qfam;
++        V.q = V.o_q;
++        V.qlock = V.o_lock;
++        V.memp = V.o_memp;
++        V.reupload = 1;
++        fprintf(stderr, "[VK] window: shown on the renderer's device\n");
++    }
++    if (!V.dev && !own_device())
++        return 0;
++    return V.ready || make_objects();
++}
++
++/* ── The swapchain ────────────────────────────────────────────────────── */
++
++static int make_swapchain(void)
++{
++    VkSurfaceCapabilitiesKHR caps;
++    VkSurfaceFormatKHR fmts[64];
++    VkPresentModeKHR modes[16], mode = VK_PRESENT_MODE_FIFO_KHR;
++    VkSwapchainCreateInfoKHR ci = { VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR };
++    VkSwapchainKHR old = V.sc;
++    uint32_t nf = 64, nm = 16, i, w, h;
++    VkFormat fmt = VK_FORMAT_UNDEFINED;
++    VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
++    int vsync, dw, dh, changed;
++
++    SDL_LockMutex(V.m);
++    vsync = V.vsync;
++    dw = V.dw;
++    dh = V.dh;
++    SDL_UnlockMutex(V.m);
++    V.sc_bad = 0;
++    changed = V.sc_vsync != vsync;
++    V.sc_vsync = vsync;     /* asked for, made or not: nothing to retry */
++    if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(V.phys, V.surf, &caps) != VK_SUCCESS)
++        return 0;
++    if (caps.currentExtent.width != UINT32_MAX) {
++        w = caps.currentExtent.width;
++        h = caps.currentExtent.height;
++    } else {
++        w = dw > 0 ? (uint32_t)dw : 0;
++        h = dh > 0 ? (uint32_t)dh : 0;
++        if (w < caps.minImageExtent.width) w = caps.minImageExtent.width;
++        if (h < caps.minImageExtent.height) h = caps.minImageExtent.height;
++        if (w > caps.maxImageExtent.width) w = caps.maxImageExtent.width;
++        if (h > caps.maxImageExtent.height) h = caps.maxImageExtent.height;
++    }
++    wait_idle();
++    if (!w || !h) {         /* minimised */
++        destroy_swapchain();
++        return 0;
++    }
++    vkGetPhysicalDeviceSurfaceFormatsKHR(V.phys, V.surf, &nf, fmts);
++    for (i = 0; i < nf && fmt == VK_FORMAT_UNDEFINED; i++)
++        if (fmts[i].format == VK_FORMAT_B8G8R8A8_UNORM
++            && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
++            fmt = fmts[i].format;
++    for (i = 0; i < nf && fmt == VK_FORMAT_UNDEFINED; i++)
++        if (fmts[i].format == VK_FORMAT_R8G8B8A8_UNORM
++            && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
++            fmt = fmts[i].format;
++    if (fmt == VK_FORMAT_UNDEFINED)
++        fmt = nf && fmts[0].format != VK_FORMAT_UNDEFINED ? fmts[0].format
++                                                          : VK_FORMAT_B8G8R8A8_UNORM;
++    /* Vsync: mailbox, each refresh showing the latest frame, as the SDL
++     * window's swap did with frames dropped in its slots -- and a present
++     * that never waits for the display while it holds the queue the
++     * renderer submits to. FIFO where there is no mailbox. Off: no waiting
++     * at all if the window can. */
++    vkGetPhysicalDeviceSurfacePresentModesKHR(V.phys, V.surf, &nm, modes);
++    for (i = 0; i < nm && !vsync; i++)
++        if (modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR)
++            mode = modes[i];
++    for (i = 0; i < nm && mode == VK_PRESENT_MODE_FIFO_KHR; i++)
++        if (modes[i] == VK_PRESENT_MODE_MAILBOX_KHR)
++            mode = modes[i];
++    ci.surface = V.surf;
++    ci.minImageCount = caps.minImageCount + 1;
++    if (caps.maxImageCount && ci.minImageCount > caps.maxImageCount)
++        ci.minImageCount = caps.maxImageCount;
++    if (ci.minImageCount > MAX_IMG)
++        ci.minImageCount = MAX_IMG;
++    ci.imageFormat = fmt;
++    ci.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
++    for (i = 0; i < nf; i++)
++        if (fmts[i].format == fmt) {
++            ci.imageColorSpace = fmts[i].colorSpace;
++            break;
++        }
++    ci.imageExtent.width = w;
++    ci.imageExtent.height = h;
++    ci.imageArrayLayers = 1;
++    ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
++                  | (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
++    ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    ci.preTransform = caps.currentTransform;
++    ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
++    if (!(caps.supportedCompositeAlpha & ci.compositeAlpha)) {
++        for (i = 0; i < 32; i++)
++            if (caps.supportedCompositeAlpha & (1u << i)) {
++                ci.compositeAlpha = (VkCompositeAlphaFlagBitsKHR)(1u << i);
++                break;
++            }
++    }
++    ci.presentMode = mode;
++    ci.clipped = VK_TRUE;
++    ci.oldSwapchain = old;
++    if (vkCreateSwapchainKHR(V.dev, &ci, NULL, &V.sc) != VK_SUCCESS) {
++        V.sc = old;
++        destroy_swapchain();
++        return 0;
++    }
++    for (i = 0; i < V.nimg; i++)
++        vkDestroyImageView(V.dev, V.views[i], NULL);
++    memset(V.views, 0, sizeof V.views);
++    if (old)
++        vkDestroySwapchainKHR(V.dev, old, NULL);
++    V.nimg = MAX_IMG;
++    vkGetSwapchainImagesKHR(V.dev, V.sc, &V.nimg, V.imgs);
++    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
++    vi.format = fmt;
++    vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    vi.subresourceRange.levelCount = vi.subresourceRange.layerCount = 1;
++    for (i = 0; i < V.nimg; i++) {
++        vi.image = V.imgs[i];
++        vkCreateImageView(V.dev, &vi, NULL, &V.views[i]);
++    }
++    if (fmt != V.pipe_fmt) {
++        for (i = 0; i < 2; i++)
++            if (V.pipe[i])
++                vkDestroyPipeline(V.dev, V.pipe[i], NULL);
++        V.pipe[0] = make_pipeline(fmt, 0);
++        V.pipe[1] = make_pipeline(fmt, 1);
++        V.pipe_fmt = fmt;
++    }
++    if (V.ext.width != w || V.ext.height != h || V.fmt != fmt || changed)
++        fprintf(stderr, "[VK] window: %ux%u, %s, vsync %s\n", w, h,
++                mode == VK_PRESENT_MODE_FIFO_KHR ? "fifo"
++                : mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : "immediate",
++                vsync ? "on" : "off");
++    V.fmt = fmt;
++    V.ext.width = w;
++    V.ext.height = h;
++    V.usage = ci.imageUsage;
++    return V.pipe[0] && V.pipe[1];
++}
++
++/* ── Drawing a frame ──────────────────────────────────────────────────── */
++
++static void barrier_all(VkCommandBuffer cb)
++{
++    VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
++    mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
++    mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
++}
++
++static void layout_to(VkCommandBuffer cb, VkImage im, VkImageLayout from, VkImageLayout to)
++{
++    VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
++    b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
++    b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++    b.oldLayout = from;
++    b.newLayout = to;
++    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    b.image = im;
++    b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    b.subresourceRange.levelCount = b.subresourceRange.layerCount = 1;
++    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
++}
++
++/* Upload room in this frame's buffer for `bytes`, after `at`. */
++static int up_room(Frame *f, VkDeviceSize bytes)
++{
++    if (f->up.size >= bytes)
++        return 1;
++    buf_free(&f->up);
++    return buf_make(&f->up, bytes + bytes / 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
++}
++
++/* pixels (w x h X8R8G8B8 in f->up at off) into *im, made at that size. */
++static int upload(VkCommandBuffer cb, VImg *im, uint32_t w, uint32_t h, VkDeviceSize off)
++{
++    VkBufferImageCopy r;
++
++    if (!im->image || im->w != w || im->h != h) {
++        int i;
++        /* The other frames may still read it; this one's fence was
++         * waited for, and is reset by now. */
++        for (i = 0; i < NFR; i++)
++            if (i != V.fi)
++                vkWaitForFences(V.dev, 1, &V.fr[i].fence, VK_TRUE, UINT64_MAX);
++        img_free(V.dev, im);
++        if (!img_make(V.dev, &V.memp, im, w, h,
++                      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
++            return 0;
++        layout_to(cb, im->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
++    }
++    memset(&r, 0, sizeof r);
++    r.bufferOffset = off;
++    r.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    r.imageSubresource.layerCount = 1;
++    r.imageExtent.width = w;
++    r.imageExtent.height = h;
++    r.imageExtent.depth = 1;
++    vkCmdCopyBufferToImage(cb, V.fr[V.fi].up.buf, im->image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
++    return 1;
++}
++
++static void bind_image(VkDescriptorSet set, VkImageView view, VkSampler s)
++{
++    VkDescriptorImageInfo ii;
++    VkWriteDescriptorSet w = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
++    ii.sampler = s;
++    ii.imageView = view;
++    ii.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
++    w.dstSet = set;
++    w.descriptorCount = 1;
++    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
++    w.pImageInfo = &ii;
++    vkUpdateDescriptorSets(V.dev, 1, &w, 0, NULL);
++}
++
++static void draw_quad(VkCommandBuffer cb, int x, int y, int w, int h, int pipe,
++                      VkDescriptorSet set)
++{
++    VkViewport vp;
++    VkRect2D sc;
++    float opaque = pipe == 0 ? 1.0f : 0.0f;
++    int x1 = x + w, y1 = y + h;
++
++    vp.x = (float)x;
++    vp.y = (float)y;
++    vp.width = (float)w;
++    vp.height = (float)h;
++    vp.minDepth = 0.0f;
++    vp.maxDepth = 1.0f;
++    /* The scissor stays inside the image; the viewport may not. */
++    if (x < 0) x = 0;
++    if (y < 0) y = 0;
++    if (x1 > (int)V.ext.width) x1 = (int)V.ext.width;
++    if (y1 > (int)V.ext.height) y1 = (int)V.ext.height;
++    if (x1 <= x || y1 <= y)
++        return;
++    sc.offset.x = x;
++    sc.offset.y = y;
++    sc.extent.width = (uint32_t)(x1 - x);
++    sc.extent.height = (uint32_t)(y1 - y);
++    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.pipe[pipe]);
++    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.pl, 0, 1, &set, 0, NULL);
++    vkCmdPushConstants(cb, V.pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof opaque, &opaque);
++    vkCmdSetViewport(cb, 0, 1, &vp);
++    vkCmdSetScissor(cb, 0, 1, &sc);
++    vkCmdDraw(cb, 3, 1, 0, 0);
++}
++
++static void save_shot(const char *path, uint32_t w, uint32_t h)
++{
++    SDL_Surface *sf = SDL_CreateRGBSurfaceWithFormatFrom(
++        V.shot.map, (int)w, (int)h, 32, (int)w * 4,
++        V.fmt == VK_FORMAT_R8G8B8A8_UNORM ? SDL_PIXELFORMAT_ABGR8888 : SDL_PIXELFORMAT_ARGB8888);
++    if (sf) {
++        SDL_SaveBMP(sf, path);
++        SDL_FreeSurface(sf);
++    }
++}
++
++/* One frame into the window: cpu (the CPU frame `cpu` is new, upload it),
++ * gpu (show the renderer's image `gpu`, else the last CPU frame). */
++static void draw(const CpuFrame *cpu, const VImg *gpu)
++{
++    Frame *f = &V.fr[V.fi];
++    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
++    VkRenderingAttachmentInfo ca = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
++    VkRenderingInfo ri = { VK_STRUCTURE_TYPE_RENDERING_INFO };
++    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
++    VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
++    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
++    XboxOverlay ov;
++    char shot[1024];
++    int have_ov, have_shot, dx, dy, dw, dh, page;
++    uint32_t idx, sw, sh;
++    VkDeviceSize ov_off = 0;
++    const VImg *src;
++    VkResult r;
++    long long cw, ch, ow, oh;
++
++    if ((V.sc_bad || !V.sc) && !make_swapchain())
++        return;
++    vkWaitForFences(V.dev, 1, &f->fence, VK_TRUE, UINT64_MAX);
++    r = vkAcquireNextImageKHR(V.dev, V.sc, UINT64_MAX, f->acquired, VK_NULL_HANDLE, &idx);
++    if (r == VK_ERROR_OUT_OF_DATE_KHR) {
++        V.sc_bad = 1;
++        SDL_LockMutex(V.m);
++        V.redraw = 1;
++        SDL_UnlockMutex(V.m);
++        return;
++    }
++    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR)
++        return;
++    if (r == VK_SUBOPTIMAL_KHR)
++        V.sc_bad = 1;
++    vkResetFences(V.dev, 1, &f->fence);
++    vkResetCommandBuffer(f->cb, 0);
++    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++    vkBeginCommandBuffer(f->cb, &bi);
++    /* What the renderer submitted before is done with and visible; what it
++     * submits after waits for this. */
++    barrier_all(f->cb);
++
++    if (cpu && cpu->px && up_room(f, (VkDeviceSize)cpu->w * cpu->h * 4)) {
++        memcpy(f->up.map, cpu->px, (size_t)cpu->w * cpu->h * 4);
++        if (upload(f->cb, &V.cpu_img, cpu->w, cpu->h, 0)) {
++            V.cpu_have = 1;
++            V.cpu_shape = cpu->own_shape;
++        }
++        ov_off = ((VkDeviceSize)cpu->w * cpu->h * 4 + 255) & ~(VkDeviceSize)255;
++    }
++    src = gpu ? gpu : V.cpu_have ? &V.cpu_img : NULL;
++
++    /* Where it goes: the largest rectangle of its shape, centred. */
++    ow = V.ext.width;
++    oh = V.ext.height;
++    page = src && !gpu && V.cpu_shape;    /* a page before the game */
++    if (page) {
++        cw = src->w;
++        ch = src->h;
++    } else {
++        cw = xbox_DisplayContentWidth(640, 480);
++        ch = 480;
++    }
++    if (ow * ch <= oh * cw) {
++        dw = (int)ow;
++        dh = (int)(ow * ch / cw);
++    } else {
++        dh = (int)oh;
++        dw = (int)(oh * cw / ch);
++    }
++    dx = (int)(ow - dw) / 2;
++    dy = (int)(oh - dh) / 2;
++    if (src && !page)
++        xbox_WindowSetOutputSize(dw, dh);
++
++    /* The overlay is the game's: none over a page before it. */
++    have_ov = src && !page && xbox_WindowOverlayPixels(dx, dy, dw, dh, &ov)
++              && ov.px && ov.w > 0 && ov.h > 0;
++    if (have_ov) {
++        VkDeviceSize need = ov_off + (VkDeviceSize)ov.w * ov.h * 4;
++        /* A larger buffer would lose the CPU frame copied into it. */
++        if (f->up.size >= need || (ov_off == 0 && up_room(f, need))) {
++            memcpy((uint8_t *)f->up.map + ov_off, ov.px, (size_t)ov.w * ov.h * 4);
++            have_ov = upload(f->cb, &V.ov_img, (uint32_t)ov.w, (uint32_t)ov.h, ov_off);
++        } else {
++            have_ov = 0;
++        }
++    }
++    if (src || have_ov)
++        barrier_all(f->cb);
++
++    layout_to(f->cb, V.imgs[idx], VK_IMAGE_LAYOUT_UNDEFINED,
++              VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++    ca.imageView = V.views[idx];
++    ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++    ca.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++    ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++    ca.clearValue.color.float32[3] = 1.0f;
++    ri.renderArea.extent = V.ext;
++    ri.layerCount = 1;
++    ri.colorAttachmentCount = 1;
++    ri.pColorAttachments = &ca;
++    vkCmdBeginRendering(f->cb, &ri);
++    if (src) {
++        /* Smaller than its rectangle: its pixels as they are; larger (the
++         * renderer above 640x480): filtered down. */
++        bind_image(f->set[0], src->view, (int)src->w > dw ? V.lin : V.near);
++        draw_quad(f->cb, dx, dy, dw, dh, 0, f->set[0]);
++    }
++    if (have_ov) {
++        int s = ov.scale > 0 ? ov.scale : 1;
++        bind_image(f->set[1], V.ov_img.view, V.near);
++        draw_quad(f->cb, ov.x, ov.y, ov.w * s, ov.h * s, 1, f->set[1]);
++    }
++    vkCmdEndRendering(f->cb);
++
++    sw = V.ext.width;
++    sh = V.ext.height;
++    have_shot = xbox_WindowShotPending(shot, sizeof shot)
++             && (V.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
++             && (V.fmt == VK_FORMAT_B8G8R8A8_UNORM || V.fmt == VK_FORMAT_R8G8B8A8_UNORM);
++    if (have_shot && V.shot.size < (VkDeviceSize)sw * sh * 4) {
++        buf_free(&V.shot);
++        have_shot = buf_make(&V.shot, (VkDeviceSize)sw * sh * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++    }
++    if (have_shot) {
++        VkBufferImageCopy rg;
++        layout_to(f->cb, V.imgs[idx], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++        memset(&rg, 0, sizeof rg);
++        rg.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++        rg.imageSubresource.layerCount = 1;
++        rg.imageExtent.width = sw;
++        rg.imageExtent.height = sh;
++        rg.imageExtent.depth = 1;
++        vkCmdCopyImageToBuffer(f->cb, V.imgs[idx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                               V.shot.buf, 1, &rg);
++        layout_to(f->cb, V.imgs[idx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                  VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
++    } else {
++        layout_to(f->cb, V.imgs[idx], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++                  VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
++    }
++    /* What the renderer submits next waits for this frame's reads. */
++    barrier_all(f->cb);
++    vkEndCommandBuffer(f->cb);
++
++    si.waitSemaphoreCount = 1;
++    si.pWaitSemaphores = &f->acquired;
++    si.pWaitDstStageMask = &wait_stage;
++    si.commandBufferCount = 1;
++    si.pCommandBuffers = &f->cb;
++    si.signalSemaphoreCount = 1;
++    si.pSignalSemaphores = &V.done[idx];
++    pi.waitSemaphoreCount = 1;
++    pi.pWaitSemaphores = &V.done[idx];
++    pi.swapchainCount = 1;
++    pi.pSwapchains = &V.sc;
++    pi.pImageIndices = &idx;
++    V.qlock(1);
++    r = vkQueueSubmit(V.q, 1, &si, f->fence);
++    if (r == VK_SUCCESS)
++        r = vkQueuePresentKHR(V.q, &pi);
++    V.qlock(0);
++    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)
++        V.sc_bad = 1;
++    if (have_shot) {
++        vkWaitForFences(V.dev, 1, &f->fence, VK_TRUE, UINT64_MAX);
++        save_shot(shot, sw, sh);
++    }
++    V.fi = (V.fi + 1) % NFR;
++}
++
++/* ── The present thread ───────────────────────────────────────────────── */
++
++static int present_thread(void *arg)
++{
++    (void)arg;
++    SDL_LockMutex(V.m);
++    for (;;) {
++        const CpuFrame *cpu = NULL;
++        const VImg *gpu = NULL;
++        int t;
++
++        while (!V.quit && !V.redraw && V.cpu_seq == V.cpu_taken && V.gpu_seq == V.gpu_taken
++               && !(V.usable && !V.attached) && V.vsync == V.sc_vsync)
++            SDL_CondWaitTimeout(V.c, V.m, 500);
++        if (V.quit)
++            break;
++        if (V.cpu_seq != V.cpu_taken) {
++            t = V.cf; V.cf = V.cr; V.cr = t;
++            V.cpu_taken = V.cpu_seq;
++            cpu = &V.cpu[V.cf];
++        }
++        if (V.gpu_seq != V.gpu_taken) {
++            t = V.gf; V.gf = V.gr; V.gr = t;
++            V.gpu_taken = V.gpu_seq;
++        }
++        V.src_gpu = V.gpu_stamp > V.cpu_stamp;
++        if (V.vsync != V.sc_vsync)
++            V.sc_bad = 1;
++        V.redraw = 0;
++        SDL_UnlockMutex(V.m);
++
++        if (device_ready()) {
++            /* The CPU frame again on a device that has not got it. */
++            if (V.reupload && !cpu && V.cpu_taken)
++                cpu = &V.cpu[V.cf];
++            V.reupload = 0;
++            if (V.src_gpu && V.attached && V.gpu[V.gf].image)
++                gpu = &V.gpu[V.gf];
++            draw(cpu, gpu);
++        } else {
++            V.sc_vsync = V.vsync;   /* nothing to retry until something changes */
++        }
++        SDL_LockMutex(V.m);
++    }
++    SDL_UnlockMutex(V.m);
++    return 0;
++}
++
++static void wake(void)
++{
++    SDL_CondSignal(V.c);
++}
++
++/* ── The renderer's side ──────────────────────────────────────────────── */
++
++void vkw_attach(VkPhysicalDevice phys, VkDevice dev, uint32_t qfam, VkQueue queue,
++                void (*lock)(int on))
++{
++    VkBool32 ok = VK_FALSE;
++
++    if (!V.m)
++        return;
++    SDL_LockMutex(V.m);
++    V.offered = 1;
++    V.o_phys = phys;
++    V.o_dev = dev;
++    V.o_qfam = qfam;
++    V.o_q = queue;
++    V.o_lock = lock ? lock : no_lock;
++    vkGetPhysicalDeviceMemoryProperties(phys, &V.o_memp);
++    if (V.surf && vkGetPhysicalDeviceSurfaceSupportKHR(phys, qfam, V.surf, &ok) == VK_SUCCESS
++        && ok)
++        V.usable = 1;
++    else
++        fprintf(stderr, "[VK] window: the renderer's device cannot show here; its frames"
++                " come through memory\n");
++    SDL_UnlockMutex(V.m);
++    wake();
++}
++
++int vkw_active(void)
++{
++    return V.usable && V.thread;
++}
++
++VkImage vkw_target(uint32_t w, uint32_t h, int *fresh)
++{
++    VImg *im;
++
++    *fresh = 0;
++    if (!vkw_active() || !w || !h)
++        return VK_NULL_HANDLE;
++    im = &V.gpu[V.gb];      /* the writer's alone */
++    if (!im->image || im->w != w || im->h != h) {
++        /* The present thread may still be reading it from a frame it
++         * submitted before: it goes once the queue is done. */
++        if (im->image) {
++            V.o_lock(1);
++            vkQueueWaitIdle(V.o_q);
++            V.o_lock(0);
++            img_free(V.o_dev, im);
++        }
++        if (!img_make(V.o_dev, &V.o_memp, im, w, h,
++                      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
++            return VK_NULL_HANDLE;
++        *fresh = 1;
++    }
++    return im->image;
++}
++
++void vkw_publish(void)
++{
++    int t;
++
++    SDL_LockMutex(V.m);
++    t = V.gr; V.gr = V.gb; V.gb = t;
++    V.gpu_seq++;
++    V.gpu_stamp = ++V.stamp;
++    SDL_UnlockMutex(V.m);
++    wake();
++}
++
++/* ── The window's side (XboxPresenter) ────────────────────────────────── */
++
++static unsigned p_window_flags(void)
++{
++    const char *e = getenv("RECOMP_PRESENT");
++    VkPhysicalDevice devs[16];
++    uint32_t n = 16, i;
++
++    if (e && !strcmp(e, "sdl"))
++        return 0;
++    if (!vkw_instance())
++        return 0;
++    if (vkEnumeratePhysicalDevices(V.inst, &n, devs) < 0)
++        return 0;
++    for (i = 0; i < n; i++) {
++        VkPhysicalDeviceProperties p;
++        vkGetPhysicalDeviceProperties(devs[i], &p);
++        if (p.apiVersion >= VK_API_VERSION_1_3)
++            return SDL_WINDOW_VULKAN;
++    }
++    return 0;
++}
++
++static int p_open(void *sdl_window, int vsync)
++{
++    SDL_Window *win = (SDL_Window *)sdl_window;
++    int i;
++
++    if (V.thread || !win || !(SDL_GetWindowFlags(win) & SDL_WINDOW_VULKAN) || !vkw_instance())
++        return 0;
++    if (!SDL_Vulkan_CreateSurface(win, V.inst, &V.surf)) {
++        fprintf(stderr, "[VK] window: no surface (%s)\n", SDL_GetError());
++        V.surf = VK_NULL_HANDLE;
++        return 0;
++    }
++    if (!V.m) {
++        V.m = SDL_CreateMutex();
++        V.c = SDL_CreateCond();
++        V.wm = SDL_CreateMutex();
++    }
++    V.win = win;
++    V.quit = 0;
++    V.vsync = vsync;
++    V.sc_vsync = -1;
++    V.cb = 0; V.cr = 1; V.cf = 2;
++    V.gb = 0; V.gr = 1; V.gf = 2;
++    SDL_Vulkan_GetDrawableSize(win, &V.dw, &V.dh);
++    /* The renderer's device, offered before the window was there. */
++    if (V.offered) {
++        VkBool32 ok = VK_FALSE;
++        V.usable = vkGetPhysicalDeviceSurfaceSupportKHR(V.o_phys, V.o_qfam, V.surf, &ok)
++                   == VK_SUCCESS && ok;
++    }
++    if (!V.usable && !own_device()) {
++        fprintf(stderr, "[VK] window: no device presents here\n");
++        vkDestroySurfaceKHR(V.inst, V.surf, NULL);
++        V.surf = VK_NULL_HANDLE;
++        return 0;
++    }
++    if (!device_ready()) {
++        drop_device();
++        vkDestroySurfaceKHR(V.inst, V.surf, NULL);
++        V.surf = VK_NULL_HANDLE;
++        return 0;
++    }
++    V.thread = SDL_CreateThread(present_thread, "present", NULL);
++    if (!V.thread) {
++        drop_device();
++        vkDestroySurfaceKHR(V.inst, V.surf, NULL);
++        V.surf = VK_NULL_HANDLE;
++        return 0;
++    }
++    for (i = 0; i < 3; i++)
++        V.cpu[i].own_shape = 0;
++    fprintf(stderr, "[VK] window: frames through Vulkan\n");
++    return 1;
++}
++
++static void p_close(void)
++{
++    if (!V.thread)
++        return;
++    SDL_LockMutex(V.m);
++    V.quit = 1;
++    SDL_UnlockMutex(V.m);
++    wake();
++    /* The renderer may be writing a frame image: they stay, as its device
++     * does, until the process ends. */
++    V.usable = 0;
++    SDL_WaitThread(V.thread, NULL);
++    V.thread = NULL;
++    drop_device();
++    V.attached = 0;
++    vkDestroySurfaceKHR(V.inst, V.surf, NULL);
++    V.surf = VK_NULL_HANDLE;
++    V.win = NULL;
++    V.cpu_seq = V.cpu_taken = V.gpu_seq = V.gpu_taken = 0;
++    V.stamp = V.cpu_stamp = V.gpu_stamp = 0;
++}
++
++static void p_resized(int w, int h)
++{
++    if (!V.thread)
++        return;
++    SDL_LockMutex(V.m);
++    if (w != V.dw || h != V.dh) {
++        V.dw = w;
++        V.dh = h;
++        V.sc_bad = 1;
++    }
++    V.redraw = 1;
++    SDL_UnlockMutex(V.m);
++    wake();
++}
++
++static void p_set_vsync(int on)
++{
++    if (!V.m)
++        return;
++    SDL_LockMutex(V.m);
++    V.vsync = on != 0;
++    SDL_UnlockMutex(V.m);
++    wake();
++}
++
++static void p_pixels(const void *px, uint32_t w, uint32_t h, uint32_t pitch,
++                     uint32_t bpp, int own_shape)
++{
++    CpuFrame *f;
++    size_t need = (size_t)w * h * 4;
++    uint32_t x, y;
++    int t;
++
++    if (!V.thread || !px || !w || !h || (bpp != 2 && bpp != 4))
++        return;
++    SDL_LockMutex(V.wm);
++    f = &V.cpu[V.cb];       /* the writer's alone */
++    if (f->cap < need) {
++        uint8_t *n = (uint8_t *)realloc(f->px, need);
++        if (!n) {
++            SDL_UnlockMutex(V.wm);
++            return;
++        }
++        f->px = n;
++        f->cap = need;
++    }
++    for (y = 0; y < h; y++) {
++        const uint8_t *s = (const uint8_t *)px + (size_t)y * pitch;
++        uint32_t *d = (uint32_t *)(f->px + (size_t)y * w * 4);
++        if (bpp == 4) {
++            memcpy(d, s, (size_t)w * 4);
++        } else {
++            for (x = 0; x < w; x++) {
++                uint32_t c = (uint32_t)s[2 * x] | (uint32_t)s[2 * x + 1] << 8;
++                uint32_t r = (c >> 11) & 31, g = (c >> 5) & 63, b = c & 31;
++                d[x] = 0xFF000000u | ((r << 3 | r >> 2) << 16) | ((g << 2 | g >> 4) << 8)
++                     | (b << 3 | b >> 2);
++            }
++        }
++    }
++    f->w = w;
++    f->h = h;
++    f->own_shape = own_shape;
++    SDL_LockMutex(V.m);
++    t = V.cr; V.cr = V.cb; V.cb = t;
++    V.cpu_seq++;
++    V.cpu_stamp = ++V.stamp;
++    SDL_UnlockMutex(V.m);
++    SDL_UnlockMutex(V.wm);
++    wake();
++}
++
++static const XboxPresenter k_presenter = {
++    p_window_flags, p_open, p_close, p_resized, p_set_vsync, p_pixels,
++};
++
++void nv2a_vk_window_install(void)
++{
++    xbox_WindowSetPresenter(&k_presenter);
++}
+diff --git a/src/vulkan/vk_window.h b/src/vulkan/vk_window.h
+new file mode 100644
+index 0000000..617fd2e
+--- /dev/null
++++ b/src/vulkan/vk_window.h
+@@ -0,0 +1,38 @@
++/*
++ * The framebuffer window's frames through Vulkan (vk_window.c): what the
++ * renderer (nv2a_vk.c) uses of it. The window's own side is the
++ * XboxPresenter it registers (video_player.h).
++ */
++#ifndef XBOXRECOMP_VK_WINDOW_H
++#define XBOXRECOMP_VK_WINDOW_H
++
++#include <stdint.h>
++#include <vulkan/vulkan.h>
++
++/* The one instance, with the window systems' surface extensions, made on
++ * first use; the renderer's device and the window's surface come from it.
++ * VK_NULL_HANDLE when there is no Vulkan. */
++VkInstance vkw_instance(void);
++
++/* The window's surface, VK_NULL_HANDLE while there is none. */
++VkSurfaceKHR vkw_surface(void);
++
++/* The renderer's device, offered once it is made: the window shows its
++ * frames on it from then on, if the queue family can present to the
++ * window. lock(1) / lock(0) around every use of the queue, from any thread.
++ * The device needs VK_KHR_swapchain. */
++void vkw_attach(VkPhysicalDevice phys, VkDevice dev, uint32_t qfam, VkQueue queue,
++                void (*lock)(int on));
++
++/* Whether the renderer's frames go to the window as images (vkw_target). */
++int vkw_active(void);
++
++/* The image the renderer's next frame goes into, w x h B8G8R8A8_UNORM, kept
++ * in VK_IMAGE_LAYOUT_GENERAL; *fresh when it was just made and is still in
++ * VK_IMAGE_LAYOUT_UNDEFINED. VK_NULL_HANDLE when frames do not go this way.
++ * The renderer's thread only, which then records what writes it, submits
++ * that and calls vkw_publish. */
++VkImage vkw_target(uint32_t w, uint32_t h, int *fresh);
++void vkw_publish(void);
++
++#endif

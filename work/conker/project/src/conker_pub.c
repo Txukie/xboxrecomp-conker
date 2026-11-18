@@ -16,8 +16,7 @@
  * (it can take several seconds after the pub does).
  *
  * At the top level B does nothing in the game. Here it asks "Do you want to
- * exit?" on the title showing, in the title's own lettering, with No picked;
- * left and right pick, A answers, B is No. Yes ends the process there and
+ * exit?", with No picked; left and right pick, A answers, B is No. Yes ends the process there and
  * then: nothing is left to write at the pub (the cfg is written on every
  * change, the game saves as it goes), and a full exit() would take guest
  * memory away from the GPU thread still running the frame.
@@ -27,10 +26,12 @@
  * string at +0x14, then x and y, the text starting at x; Xbox Live's "& Co"
  * is an item of its own), found by their strings when the question is
  * asked; Game 1..3 are save slot titles kept at 0x84B120 (the string at +8,
- * or for an empty slot at +0x2C4; centred). The question is put in their
- * place for as long as it is asked -- Options' moved up and left, as that
- * title sits low on the right and the question is wider and has two
- * lines.
+ * or for an empty slot at +0x2C4). They are blanked for as long as the
+ * question is asked, and the question is drawn over the picture, in the
+ * middle (conker_pub_overlay). It used to be put in the title's place, in
+ * the title's lettering: but each title has its own place in the pub's
+ * picture, as 3D text, so the question was cut off at the screen's edge on
+ * some, and moved to the middle it went behind whoever stood there.
  *
  * What the pub is doing: the level (0x7FA1F8) is the front end's, 0x1D, or
  * 0x46 while Xbox Live's pages show; the front end's state (0x776574) is 3
@@ -44,6 +45,7 @@
 #include <string.h>
 
 #include "conker_settings.h"
+#include "video_player.h"
 
 extern ptrdiff_t g_xbox_mem_offset;
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
@@ -202,7 +204,7 @@ int conker_pub_intro_skip(int a, uint64_t now)
 #define MAX_SWAPS 16
 static struct { uint32_t at, was, now; } s_swap[MAX_SWAPS];
 static int s_nswap;
-static uint32_t s_text, s_blank;        /* guest strings */
+static uint32_t s_blank;                /* guest string */
 
 static int wstr_is(uint32_t w, const char *s)
 {
@@ -232,26 +234,14 @@ static void swap(uint32_t at, uint32_t to)
     s_nswap++;
 }
 
-static uint32_t float_bits(float f)
-{
-    uint32_t u;
-    memcpy(&u, &f, sizeof u);
-    return u;
-}
-
-/* The text items showing NAME show TO instead, moved by DX, DY. */
-static void swap_items(const char *name, uint32_t to, float dx, float dy)
+/* The text items showing NAME show TO instead. */
+static void swap_items(const char *name, uint32_t to)
 {
     uint32_t a;
 
-    for (a = HEAP_LO; a < HEAP_HI && s_nswap + 3 <= MAX_SWAPS; a += 4)
-        if (G32(a) == TEXT_ITEM_VT && wstr_is(G32(a + 0x14), name)) {
+    for (a = HEAP_LO; a < HEAP_HI && s_nswap < MAX_SWAPS; a += 4)
+        if (G32(a) == TEXT_ITEM_VT && wstr_is(G32(a + 0x14), name))
             swap(a + 0x14, to);
-            if (dx != 0.0f || dy != 0.0f) {
-                swap(a + 0x18, float_bits(GF(a + 0x18) + dx));
-                swap(a + 0x1C, float_bits(GF(a + 0x1C) + dy));
-            }
-        }
 }
 
 static void restore(void)
@@ -263,37 +253,26 @@ static void restore(void)
     }
 }
 
-static void show_answer(void)
-{
-    char text[96];
-
-    snprintf(text, sizeof text, s_yes ? "%s\n   - %s -    %s" : "%s\n     %s    - %s -",
-             conker_tr("Do you want to exit?"), conker_tr("Yes"), conker_tr("No"));
-    put_wstr(s_text, text);
-}
-
 static int ask(int sel)
 {
     const char *const names[] = { conker_tr("Online"), conker_tr("Options"), conker_tr("Chapters") };
 
-    if (!s_text) {
-        s_text = xbox_HeapAlloc(192, 16);
+    if (!s_blank) {
         s_blank = xbox_HeapAlloc(16, 16);
-        if (!s_text || !s_blank)
+        if (!s_blank)
             return 0;
         put_wstr(s_blank, "");
     }
     s_yes = 0;
-    show_answer();
     s_nswap = 0;
     if (sel < GAME_1) {
-        swap_items(names[sel], s_text, sel == 1 ? -200.0f : 0.0f, sel == 1 ? 110.0f : 0.0f);
+        swap_items(names[sel], s_blank);
         if (sel == 0)
-            swap_items(conker_tr("& Co"), s_blank, 0.0f, 0.0f);
+            swap_items(conker_tr("& Co"), s_blank);
     } else if (sel <= GAME_1 + 2) {
         uint32_t title = G32(SLOT_TITLES + 4u * (uint32_t)(sel - GAME_1));
         if (title && G32(title + 0x2C4))   /* what its title shows (recomp_manual.c) */
-            swap(title + 0x2C4, s_text);
+            swap(title + 0x2C4, s_blank);
     }
     if (!s_nswap) {
         fprintf(stderr, "[PUB] no title to ask on (%d)\n", sel);
@@ -327,7 +306,6 @@ int conker_pub_pad(int left, int right, int a, int b)
     GF(IDLE_TIME) = 0.0f;
     if (left || right) {
         s_yes = !s_yes;
-        show_answer();
     } else if (b || (a && !s_yes)) {
         restore();
         s_asking = 0;
@@ -339,5 +317,92 @@ int conker_pub_pad(int left, int right, int a, int b)
         fflush(stderr);
         _Exit(0);
     }
+    return 1;
+}
+
+/* ── The question, over the picture ───────────────────────────────────── */
+
+/* The launcher's letters (conker_firstrun.c): 5x8, a byte a column. */
+const uint8_t *conker_font_glyph(int ch);
+int conker_font_next(const char **s);
+
+static int letters(const char *s)
+{
+    int n = 0;
+
+    while (conker_font_next(&s))
+        n++;
+    return n;
+}
+
+static void put_text(uint32_t *px, int tw, int x, int y, const char *s, uint32_t color)
+{
+    int ch, col, row;
+
+    for (; (ch = conker_font_next(&s)) != 0; x += 6) {
+        const uint8_t *g = conker_font_glyph(ch);
+        for (col = 0; col < 5; col++)
+            for (row = 0; row < 8; row++)
+                if (g[col] >> row & 1)
+                    px[(y + row) * tw + x + col] = color;
+    }
+}
+
+/* The window's layer while the question is up: the question and the two
+ * answers on a dark band, the picked one bright, in the middle of the
+ * frame's rectangle (x, y, w, h), about a fifteenth of its height a line.
+ * On the thread that shows the frames; s_asking and s_yes change on the
+ * pad's. */
+int conker_pub_overlay(int x, int y, int w, int h, XboxOverlay *ov)
+{
+    enum { PAD = 6, GAP = 8, LINE = 8 };
+    static uint32_t px[64 * 6 * 40];
+    const uint32_t band = 0xC0100C08u, bright = 0xFFFFE6A0u, dim = 0xFF8C7A58u, edge = 0xFF6E5A3Cu;
+    const char *q, *yes, *no;
+    int nq, ny, nn, tw, th, i, scale, ax;
+
+    if (!s_asking)
+        return 0;
+    q = conker_tr("Do you want to exit?");
+    yes = conker_tr("Yes");
+    no = conker_tr("No");
+    nq = letters(q);
+    ny = letters(yes);
+    nn = letters(no);
+    if (nq > 60)
+        nq = 60;
+    tw = (nq > ny + nn + 12 ? nq : ny + nn + 12) * 6 + 2 * PAD;
+    th = 2 * LINE + GAP + 2 * PAD;
+    if (tw * th > (int)(sizeof px / sizeof px[0]))
+        return 0;
+    for (i = 0; i < tw * th; i++)
+        px[i] = band;
+    for (i = 0; i < tw; i++)
+        px[i] = px[(th - 1) * tw + i] = edge;
+    for (i = 0; i < th; i++)
+        px[i * tw] = px[i * tw + tw - 1] = edge;
+    put_text(px, tw, (tw - letters(q) * 6) / 2, PAD, q, bright);
+    /* "- Yes -    No", the picked one bright between dashes */
+    ax = (tw - (ny + nn + 12) * 6) / 2;
+    if (s_yes) {
+        put_text(px, tw, ax, PAD + LINE + GAP, "-", bright);
+        put_text(px, tw, ax + (ny + 3) * 6, PAD + LINE + GAP, "-", bright);
+    } else {
+        put_text(px, tw, ax + (ny + 8) * 6, PAD + LINE + GAP, "-", bright);
+        put_text(px, tw, ax + (ny + nn + 11) * 6, PAD + LINE + GAP, "-", bright);
+    }
+    put_text(px, tw, ax + 2 * 6, PAD + LINE + GAP, yes, s_yes ? bright : dim);
+    put_text(px, tw, ax + (ny + 10) * 6, PAD + LINE + GAP, no, s_yes ? dim : bright);
+    scale = h / (th * 6);
+    if (scale < 1)
+        scale = 1;
+    while (scale > 1 && tw * scale > w * 9 / 10)
+        scale--;
+    ov->px = px;
+    ov->w = tw;
+    ov->h = th;
+    ov->x = x + (w - tw * scale) / 2;
+    ov->y = y + (h - th * scale) / 2;
+    ov->scale = scale;
     return 1;
 }

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 # The release version: the AppImage is named after it, and the executable
 # prints it.
-project(conker_recomp VERSION 0.6.0 LANGUAGES C)
+project(conker_recomp VERSION 0.7.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -312,6 +312,8 @@ if(TARGET conker_recomp AND WIN32)
             set(_sdl_readme "${_sdl_root}/README-SDL.txt")
         endif()
     endif()
+    # glslang's install prefix (fetch-deps.sh), for its license.
+    get_filename_component(_glslang_prefix "${XBOXRECOMP_GLSLANG_INCLUDE}" DIRECTORY)
     file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/windows-zip")
     add_custom_target(windows-zip
         COMMAND "${CMAKE_COMMAND}" -E rm -rf "${_zip_stage}"
@@ -320,6 +322,9 @@ if(TARGET conker_recomp AND WIN32)
                 "$<TARGET_FILE:SDL2::SDL2>" ${_sdl_readme}
                 "${CMAKE_CURRENT_SOURCE_DIR}/../packaging/windows/README.txt"
                 "${_zip_stage}/"
+        # Everything's license, in licenses/ (../packaging/collect-licenses.sh).
+        COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/../packaging/collect-licenses.sh"
+                "${_zip_stage}/licenses" windows "${_sdl_root}" "${_glslang_prefix}"
         COMMAND "${CMAKE_COMMAND}" -E rm -f "${CONKER_APPIMAGE_DIR}/${_zip_name}.zip"
         COMMAND "${CMAKE_COMMAND}" -E tar cf "${CONKER_APPIMAGE_DIR}/${_zip_name}.zip"
                 --format=zip "${_zip_name}"
